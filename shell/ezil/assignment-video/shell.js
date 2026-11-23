@@ -1,0 +1,231 @@
+import {checkAssignmentVideoEligibility,createAssignmentVideoTransport} from './transport.js';
+import { currentTabPicker, assignmentOsOrigin } from './current-tab.js';
+import { encodeTabSegments, seedFrame } from './tab-segments.js';
+const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const canonical=/^https:\/\/github\.ezil\.work\/default\/u-[0-9a-f]{16}-a-([0-9a-f-]{36})\.git$/;
+const initialEntry=globalThis.location?.href;
+const failure=code=>Object.assign(new Error(code),{code});
+let current;
+
+export function assignmentIntent(href,repoUrl) {
+    const candidate=canonical.exec(repoUrl)?.[1];
+    if(!uuid.test(candidate??''))return null;
+    let url;try{url=new URL(href);}catch{return null;}
+    if(!assignmentOsOrigin(url.origin) || url.pathname!=='/app/code' || url.username || url.password
+        || url.searchParams.getAll('assignment').length>1 || url.searchParams.getAll('repo').length!==1
+        || url.searchParams.get('repo')!==repoUrl)return null;
+    const hint=url.searchParams.get('assignment');return hint===null || hint===candidate ? candidate : null;
+}
+
+function buildGate(body) {
+    const panel=document.createElement('section');
+    panel.className='ezil-assignment-work-gate';panel.setAttribute('aria-label','Assignment workspace');
+    const card=document.createElement('div'),title=document.createElement('h2'),detail=document.createElement('p');
+    detail.setAttribute('role','status');card.append(title,detail);panel.append(card);body.append(panel);
+    return {set(heading,message){panel.hidden=false;title.textContent=heading;detail.textContent=message;},
+        action(label,fn){card.querySelector('button')?.remove();const el=document.createElement('button');el.type='button';
+            el.textContent=label;el.onclick=event=>{if(event.isTrusted)fn();};card.append(el);},
+        clear(){card.querySelector('button')?.remove();},reveal(){panel.hidden=true;},remove(){panel.remove();}};
+}
+
+async function retry(operation, codes, times=2) {
+    for(let i=0;;i++){try{return await operation();}catch(err){if(i+1>=times||!codes.includes(err.code))throw err;
+        await new Promise(resolve=>setTimeout(resolve,320*(i+1)));}}
+}
+
+export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare, computerProvider}) {
+    const win=globalThis.window, repo=project?.repoUrl;
+    if(!win || !assignmentOsOrigin(win.location.origin)){queueMicrotask(open);return null;}
+    const address=new URL(win.location.href);
+    const entry=address.searchParams.has('repo')||address.searchParams.has('assignment')?address.href:initialEntry;
+    const attemptId=assignmentIntent(entry,repo);
+    const explicit=address.pathname==='/app/code' && address.searchParams.has('assignment');
+    if(!canonical.test(repo) && !explicit){queueMicrotask(open);return null;}
+
+    const owner=actor(), ui=buildGate(body);
+    let disposePromise, disposed=false, locked=true, picker, activity, indicator;
+    const isOwner=()=>Boolean(owner) && actor()===owner;
+    const isHere=()=>!disposed && current===gate && isOwner() && win===win.top;
+    const samePhase=item=>isHere() && activity===item && !item.ended;
+    const recordingSource=item=>samePhase(item) && Boolean(item.source?.matches()) && !item.source.stream.getVideoTracks()[0].muted;
+    function lockedView(title,message) {
+        locked=true;park(true);ui.clear();ui.set(title,message);
+    }
+    function showIndicator(message) {
+        if(!indicator){
+            indicator=document.createElement('button');indicator.type='button';
+            indicator.className='ezil-assignment-recording-status';
+            indicator.setAttribute('aria-label','Stop sharing this assignment tab');
+            indicator.title='Stop sharing this assignment tab';
+            indicator.onclick=event=>{if(event.isTrusted && activity)void finish(activity,'sharing_stopped');};
+            document.body.append(indicator);
+        }
+        indicator.textContent=message+' · Stop';
+    }
+    function removeIndicator(){indicator?.remove();indicator=null;}
+    function check(item){if(!recordingSource(item))throw failure('source_lost');}
+    function displayConsent(message) {
+        lockedView('Record this assignment tab',message || 'Share only this EZiL OS tab to open the assignment. The job creator can review saved work even if you do not submit.');
+        if(message)ui.set('Record this assignment tab',message+' The job creator can review saved work even if you do not submit.');
+        ui.action('Share this OS tab and open assignment',share);
+    }
+    function showSignIn(){
+        lockedView('Sign in to EZiL OS','Return to this assignment after signing in.');
+        const dest='/app/code?'+new URLSearchParams({repo,assignment:attemptId});
+        ui.action('Sign in to EZiL OS',()=>win.location.assign('/auth/auth0/login?'+new URLSearchParams({returnUrl:dest})));
+    }
+    async function eligible(){
+        lockedView('Checking assignment','Verifying the assigned repository and OS session…');
+        try{
+            const result=await retry(()=>checkAssignmentVideoEligibility(attemptId),['media_unavailable','recording_unavailable']);
+            if(!isHere())return;
+            if(result.status!=='eligible' || result.attemptId!==attemptId || result.repositoryUrl!==repo)throw failure('assignment_mismatch');
+            if (win.location.origin === 'https://os.ezil.work') {
+                const provider = await computerProvider?.();
+                if (!isHere()) return;
+                if (provider !== 'cloudflare') {
+                    lockedView('Choose an assignment-ready computer',provider === 'aws-ec2'
+                        ? 'This AWS computer does not support assignment recording. Select a Cloudflare computer you own in EZiL OS, then reopen the assignment.'
+                        : 'EZiL OS could not verify this computer’s assignment support. Check its provider in Settings → System, then try again.');
+                    ui.action('Check this computer again',eligible);
+                    return;
+                }
+            }
+            picker??=currentTabPicker(win);
+            displayConsent();
+        }catch(e){
+            if(!isHere())return;
+            if(e.code==='identity_refresh_required'){showSignIn();return;}
+            const unsupported=e.message==='unsupported';
+            lockedView('Assignment unavailable',unsupported?'This browser cannot verify sharing of this OS tab.':'The assigned repository or recording service could not be verified.');
+            if(!unsupported)ui.action('Retry verification',eligible);
+        }
+    }
+    function share() {
+        if(!isHere()||!picker||activity)return;
+        const item={id:win.crypto.randomUUID(),expected:0};
+        activity=item;
+        // choose invokes the native picker synchronously inside the trusted user's action.
+        const selection=picker.choose();
+        lockedView('Share this OS tab','Choose this EZiL OS tab in your browser.');
+        item.starting=start(item,selection);
+    }
+    async function start(item,selection) {
+        try{
+            const source=await selection;
+            if(!samePhase(item)){source.stream.getTracks().forEach(t=>t.stop());return;}
+            item.source=source;
+            const track=source.stream.getVideoTracks()[0];
+            track.addEventListener('ended',()=>void finish(item,'sharing_stopped'),{once:true});
+            track.addEventListener('mute',()=>void finish(item,'connection_lost'),{once:true});
+            track.addEventListener('capturehandlechange',()=>{if(!recordingSource(item))void finish(item,'connection_lost');});
+            item.watch=setInterval(()=>{if(!recordingSource(item))void finish(item,'connection_lost');},1100);
+            showIndicator('Sharing');lockedView('Preparing assignment','Verifying the assigned repository…');
+            const result=await retry(()=>prepare(attemptId),['sandbox_starting','media_unavailable','assignment_open_unavailable'],3);
+            check(item);
+            const proof=result?.assignmentOpen, meta=result?.repository, name=repo.split('/').at(-1).slice(0,-4);
+            if(result.ok!==true||result.codePreviewUrl||result.url||proof?.attemptId!==attemptId||!/^[A-Za-z0-9_-]{48,1700}$/.test(proof.proof)
+                ||!meta?.id||typeof meta.workspaceFolder!=='string'||meta.checkoutFolder!==meta.workspaceFolder+'/'+name)
+                throw failure('assigned_checkout_unverified');
+            item.meta=meta;item.proof=proof.proof;
+            item.transport=createAssignmentVideoTransport({attemptId,repoOpenProof:item.proof,captureSessionId:item.id,consentVersion:4,
+                onStop:(why,at)=>void finish(item,why==='submitted'||why==='timeout'?why:'connection_lost',at)});
+            item.grant=await retry(()=>item.transport.begin(),['media_unavailable'],2);
+            check(item);
+            if(item.grant.captureSessionId!==item.id||item.grant.status!=='awaiting_frame'||!Number.isSafeInteger(item.grant.nextSequence))
+                throw failure('recording_phase_changed');
+            item.expected=item.grant.nextSequence;
+            const bytes=await seedFrame(source.stream,()=>recordingSource(item),
+                ()=>ui.set('Checking recording','Saving the first frame before opening your editor…'));
+            check(item);
+            const upload=part=>retry(()=>item.transport.upload(part),['upload_failed','media_unavailable'],2);
+            const ack=await upload({sequence:item.expected,startMs:0,endMs:1,mimeType:'video/webm',bytes});
+            check(item);
+            if(!ack.phaseReady || ack.captureSessionId!==item.id || ack.nextSequence!==item.expected+1 || !ack.firstFrameAt)
+                throw failure('seed_not_confirmed');
+            item.expected=ack.nextSequence;
+            const startAt=Date.parse(ack.startedAt), deadline=Date.parse(ack.deadlineAt), serverNow=Date.parse(ack.serverNow);
+            const offset=Number.isFinite(serverNow)?serverNow-Date.now():0;
+            if(!Number.isFinite(startAt)||!Number.isFinite(deadline)||deadline<=Date.now()+offset||deadline<=startAt||deadline-startAt>3600000)
+                throw failure('recording_closed');
+            item.recorder=await encodeTabSegments({win,stream:source.stream,matches:()=>recordingSource(item),windowStart:startAt,deadline,
+                firstSequence:item.expected,clockOffset:offset,upload:part=>{item.expected=Math.max(item.expected,part.sequence+1);return upload(part);},
+                cutoff:async()=>{const state=await item.transport.status();return state.stopRequestedAt||null;},
+                onFault:()=>void finish(item,'connection_lost'),onFrame:()=>{},
+                onAwaitFrame:()=>ui.set('Opening assigned editor','Recording is active. Checking your workspace…')});
+            check(item);
+            await retry(async()=>{
+                const state=await item.transport.status();
+                if(state.phaseReady!==true||state.workspaceUnlocked!==true||state.captureSessionId!==item.id||state.startedAt!==ack.startedAt
+                  ||state.deadlineAt!==ack.deadlineAt||!state.firstFrameAt)throw failure('seed_not_confirmed');
+            },['seed_not_confirmed','media_unavailable'],3);
+            check(item);
+            item.deadline=setTimeout(()=>void finish(item,'timeout',ack.deadlineAt),Math.max(0,deadline-Date.now()-offset));
+            item.allowMint=true;showIndicator('Recording');
+            const editor=new Promise((resolve,reject)=>{item.editor={resolve,reject};});
+            item.editorTimeout=setTimeout(()=>item.editor?.reject(failure('assigned_checkout_unverified')),80000);
+            open();await editor;
+        }catch(error){
+            if(activity!==item||item.ended)return;
+            const cause=error.code||error.message;
+            let message='Recording was interrupted. Accepted footage is preserved. Share this OS tab to resume.';
+            if(cause==='wrong_tab')message='Select this EZiL OS tab. The other source was discarded.';
+            if(error.name==='NotAllowedError')message='Sharing was declined. Share this OS tab to open your editor.';
+            if(cause==='repo_open_unsupported_provider')message='This computer does not support assignment recording. Select a Cloudflare computer you own in EZiL OS, then reopen the assignment.';
+            if(cause==='assigned_checkout_unverified')message='The assigned checkout could not be verified. Share this tab to try again.';
+            void finish(item,'connection_lost',null,message,cause==='identity_refresh_required'||cause==='IDENTITY_REFRESH_REQUIRED');
+        }finally{clearTimeout(item.editorTimeout);item.editor=null;}
+    }
+    function confirmed(frame,frameUrl,actualRoot){
+        const item=activity;if(!item?.allowMint||!item.editor||!recordingSource(item)||!frame.isConnected)return;
+        const url=new URL(frameUrl), folders=[item.meta.workspaceFolder,item.meta.checkoutFolder];
+        if(!folders.includes(actualRoot)||!folders.includes(url.searchParams.get('folder'))){item.editor.reject(failure('assigned_checkout_unverified'));return;}
+        locked=false;park(false);ui.reveal();item.editor.resolve();
+    }
+    function finish(item,reason='sharing_stopped',effectiveAt=null,message,signIn=false){
+        if(activity!==item)return Promise.resolve();
+        if(item.ending)return item.ending;
+        item.ended=true;item.allowMint=false;clearInterval(item.watch);clearTimeout(item.deadline);clearTimeout(item.editorTimeout);
+        item.editor?.reject(failure('workspace_locked'));
+        item.source?.stream.getTracks().forEach(t=>t.stop());
+        removeIndicator();lockedView('Sharing stopped','Checking saved assignment footage…');
+        item.ending=(async()=>{
+            let saved=true;
+            try{await item.starting;if(item.recorder)item.expected=(await item.recorder.stop(effectiveAt)).expectedSegments;}
+            catch{saved=false;}
+            try{
+                if(item.grant){
+                    if(reason==='submitted'||reason==='timeout')await item.transport.finalize({reason,expectedSegments:item.expected});
+                    else await retry(()=>item.transport.checkpoint(reason==='sharing_stopped'?'sharing_stopped':'connection_lost'),['media_unavailable']);
+                }
+            }catch{saved=false;}
+            finally{item.transport?.dispose();if(activity===item)activity=null;}
+            if(!isHere())return;
+            if(reason==='submitted'||reason==='timeout'){lockedView('Assignment closed',reason==='submitted'?'Assignment submitted. Recording ended.':'The assignment time has ended.');return;}
+            if(signIn){showSignIn();return;}
+            displayConsent(message||(saved?'Sharing stopped. Share this OS tab again to resume.':'Sharing was interrupted. Your recording may contain a gap.'));
+        })();
+        return item.ending;
+    }
+    function close(){
+        if(disposePromise)return disposePromise;
+        disposed=true;const item=activity;
+        win.removeEventListener('pagehide',pageHide);
+        disposePromise=(item?finish(item,'connection_lost'):Promise.resolve()).finally(()=>{
+            picker?.dispose();removeIndicator();ui.remove();if(current===gate)current=null;
+        });
+        return disposePromise;
+    }
+    function pageHide(){if(activity?.grant)activity.transport.checkpointOnExit('connection_lost');void close();}
+    const gate={repo,locked:()=>locked,confirm:confirmed,close,
+        access:()=>activity?.allowMint&&recordingSource(activity)?{attemptId,phase:'open',repoOpenProof:activity.proof,captureSessionId:activity.id}:null};
+    current=gate;
+    if(!attemptId||!isOwner()||win!==win.top){
+        lockedView('Open your assigned OS tab','Use the assignment link in Universe to open the verified workspace in its own OS tab.');
+    }else{win.addEventListener('pagehide',pageHide,{once:true});void eligible();}
+    return gate;
+}
+
+export function confirmAssignmentFolder(project,_receipt,frame,frameUrl,actualRoot){
+    if(current?.repo===project?.repoUrl)current.confirm(frame,frameUrl,actualRoot);
+}

@@ -1,3 +1,10 @@
+import { recordingAction } from '@/server/assignment-video/broker';
+import { assignmentAuthority } from '@/server/assignment-video/authority';
+import { uuid } from '@/server/assignment-video/contract';
+import { enrolledAttempt, makeChallenge, matchesEnrollment, readOpen, repoOpenSecret, sealOpen, workspaceIdentity } from '@/server/assignment-video/repo-open';
+import { z } from 'zod';
+import { expectedRepositoryURL } from '@/server/git/assignment-enrollment';
+import { isCrossOriginWrite } from '@/utils/request-origin';
 import { TRPCError } from '@trpc/server';
 import { repoOpenFailureResponse } from '@/server/feedback/repo-open-failure';
 
@@ -7,7 +14,7 @@ import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
 import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
 import {
-    REPO_OPEN_MAX_TIMEOUT_MS, REPO_OPEN_MIN_TIMEOUT_MS, REPO_OPEN_TRANSPORT_MARGIN_MS, requestRepoOpen, withRepositoryFolder,
+    matchesAck, REPO_OPEN_MAX_TIMEOUT_MS, REPO_OPEN_MIN_TIMEOUT_MS, REPO_OPEN_TRANSPORT_MARGIN_MS, requestRepoOpen, withRepositoryFolder,
 } from '@/server/lib/compute/repo-open';
 import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/shell/http';
 import {
@@ -57,6 +64,12 @@ import {
  * procedure's own zod schema rejects anything malformed as a 400.
  */
 export const maxDuration = 300;
+const assignmentPhase = z.discriminatedUnion('phase', [
+    z.object({phase:z.literal('prepare'),attemptId:uuid}).strict(),
+    z.object({phase:z.literal('open'),attemptId:uuid,captureSessionId:uuid,repoOpenProof:z.string().regex(/^[A-Za-z0-9_-]{48,1700}$/)}).strict(),
+]);
+const assignmentLocked = () => shellRefusal(409,'assignment_recording_required','Share the assignment tab and wait for the first recorded frame to open Code.');
+
 
 async function shellCaller(req: Request) {
     const headers = new Headers(req.headers);
@@ -85,7 +98,7 @@ export async function POST(req: Request) {
             return shellJson({ error: { code: 'BAD_REQUEST', message: 'Expected a JSON body.' } }, 400);
         }
 
-        const { computerId = '', intent, project, repository, codeFolder } = (body ?? {}) as {
+        const { computerId = '', intent, project, repository, codeFolder, assignment } = (body ?? {}) as {
             computerId?: string;
             /**
              * Phase B r9 (REVERSE-MOVE-CONTRACT §5.9, opt-in trigger): `'open'` on the r9 shell's Code mint. Forwarded
@@ -102,17 +115,21 @@ export async function POST(req: Request) {
              * root the server fixes (r32).
              */
             codeFolder?: unknown;
+            assignment?: unknown;
         };
 
         const hasProject = project !== undefined && project !== null;
         const hasRepository = repository !== undefined && repository !== null;
         // One target per open: a project and a repository address together is a malformed link, never a guess.
         if (hasProject && hasRepository) return shellRefusal(400, 'repo_url_invalid', "This link names two repositories. Open one at a time.");
+        if (assignment !== undefined && !hasRepository) return assignmentLocked();
         if (hasProject) {
             return await openProject(ctx as ProjectCtx, caller, { computerId, intent, project, startedAt, signal: req.signal });
         }
         if (hasRepository) {
-            return await openRepositoryUrl(ctx as ProjectCtx, caller, { computerId, intent, repository, startedAt, signal: req.signal });
+            return await openRepositoryUrl(ctx as ProjectCtx, caller, { computerId, intent, repository, startedAt, signal:req.signal, assignment,
+                allowAssignmentPreload: !ctx.delegation && intent === 'open' && req.headers.get('origin') === assignmentAuthority()?.os
+                    && req.headers.get('sec-fetch-site') === 'same-origin' && !isCrossOriginWrite(req) });
         }
 
         const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent, ...(codeFolder !== undefined ? { codeFolder } : {}) });
@@ -251,7 +268,7 @@ const repoUrlInvalid = () => shellRefusal(400, 'repo_url_invalid', "This isn't a
  * A standalone credential is sent only in the signed Worker body, then to the bundled CLI on private fd 3.
  */
 async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: {
-    computerId: string; intent: unknown; repository: unknown; startedAt: number; signal: AbortSignal;
+    computerId: string; intent: unknown; repository: unknown; startedAt: number; signal: AbortSignal; allowAssignmentPreload: boolean; assignment?:unknown;
 }) {
     const { computerId, intent, startedAt } = request;
     const { parseRepositoryUrl, repositoryIdFor, resolvePublicGitHub } = await import('@/server/git/repo-url');
@@ -273,7 +290,9 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     const deadline = AbortSignal.any([request.signal, AbortSignal.timeout(Math.max(1, left()))]);
 
     await caller.computer.get({ id: computerId });
-    if (isAws(await target(ctx, computerId)) && (parsed.host !== 'github.ezil.work' || !awsStandaloneGitEnabled())) return unsupportedProvider();
+    const selected = await target(ctx, computerId);
+    if (isAws(selected) && (request.assignment !== undefined || parsed.host !== 'github.ezil.work' || !awsStandaloneGitEnabled()))
+        return unsupportedProvider();
 
     // Only the parsed parts reach the resolver; it rebuilds the address on its literal github.com origin.
     const resolved = parsed.host === 'github.com' ? await resolvePublicGitHub({ host: parsed.host, owner: parsed.owner, name: parsed.name }, { signal: deadline }) : null;
@@ -318,8 +337,15 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     if (privatePacket instanceof Response) return privatePacket;
     if (!(await sameSession())) return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
 
+    const canonicalHint = parsed.canonicalURL.match(/-a-([0-9a-f-]{36})\.git$/)?.[1];
+    const authority = assignmentAuthority();
+    const reserved = identity && canonicalHint && uuid.safeParse(canonicalHint).success
+        && parsed.canonicalURL === expectedRepositoryURL(identity.subject,'a-' + canonicalHint);
+    const phase = assignmentPhase.safeParse(request.assignment);
+    if ((request.assignment !== undefined && !reserved) || (reserved && (!authority || !request.allowAssignmentPreload || !phase.success || phase.data.attemptId !== canonicalHint
+        || !privatePacket || privatePacket.git.scope !== 'write' || !repoOpenSecret()))) return assignmentLocked();
     const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown; computeProvider?: unknown; sandboxId?: unknown; generation?: unknown; leaseEpoch?: unknown };
-    if (!preview.ok || typeof preview.codePreviewUrl !== 'string') return shellJson(preview);
+    if (!preview.ok || typeof preview.codePreviewUrl !== 'string') return reserved ? assignmentLocked() : shellJson(preview);
     if (left() < REPO_OPEN_MIN_TIMEOUT_MS + REPO_OPEN_TRANSPORT_MARGIN_MS) return openTimedOut();
     if (!(await sameSession())) return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
     // A cold Code mint can consume a short credential. Refresh before the Worker call, never after an expired send.
@@ -343,6 +369,15 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     } else if (preview.computeProvider === 'aws-ec2') {
         return shellRefusal(409, 'repo_open_computer_changed', 'This computer changed while opening. Try again.');
     }
+    // Only a signed worker acknowledgement for this enrolled repository may authorize the assignment workspace.
+    if (reserved && isAws(controls)) return unsupportedProvider();
+    const signer = request.allowAssignmentPreload && authority && process.env.UNIVERSE_PROJECT_REPO_ORIGIN === authority.universe && !isAws(controls)
+        ? repoOpenSecret() : undefined;
+    const attemptId = signer && identity && privatePacket ? enrolledAttempt(identity, privatePacket, Date.now()) : undefined;
+    const enrolled = attemptId && identity && privatePacket
+        ? await recordingAction(identity,{action:'preflight',attemptId},{signal:deadline}).catch(() => null) : null;
+    const challenge = enrolled && privatePacket && attemptId && matchesEnrollment(enrolled, privatePacket, attemptId, Date.now())
+        ? makeChallenge(attemptId, privatePacket.repository.canonicalURL) : undefined;
     const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS,
         privatePacket ? Date.parse(privatePacket.git.expiresAt) - Date.now() - 15_000 : REPO_OPEN_MAX_TIMEOUT_MS);
     if (timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS) {
@@ -354,6 +389,7 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     const opened = await requestRepoOpen(config.workerUrl, process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '', controls,
         { userId: ctx.user.id, computerId }, { repositoryId, canonicalURL: parsed.canonicalURL,
             ref: privatePacket?.repository.ref ?? resolved!.ref,
+            ...(challenge ? {assignmentPreload:challenge} : {}),
             git: privatePacket ? { token: privatePacket.git.token, expiresAt: privatePacket.git.expiresAt, scope: privatePacket.git.scope } : null,
             ...(privatePacket ? { privatePacket, ...(identity?.gitAuthor ? { gitAuthor: identity.gitAuthor } : {}) } : {}), timeoutMs },
         { correlationId: newCorrelationId(), signal: deadline, awsStandaloneEnabled: awsStandaloneGitEnabled(),
@@ -363,6 +399,25 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
         return repoOpenFailureResponse(ctx.db, ctx.user.id, computerId, opened, "This repository's files could not be opened. Try again.");
     }
     const url = withRepositoryFolder(preview.codePreviewUrl, opened.folder);
-    return shellJson({ ...preview, codePreviewUrl: url, url, repository: { name: parsed.displayName, id: repositoryId } });
+    const now = Date.now();
+    if (!reserved) return shellJson({ ...preview, codePreviewUrl:url, url, repository:{name:parsed.displayName,id:repositoryId} });
+    if (!phase.success || !signer || !enrolled || !identity || !privatePacket || !attemptId || !challenge || !opened.checkoutFolder
+        || !matchesAck(challenge, opened.assignmentPreload) || !matchesEnrollment(enrolled, privatePacket, attemptId, now) || !(await sameSession()))
+        return shellRefusal(409,'assignment_checkout_unverified','The protected assignment checkout could not be verified. Retry opening the assignment.');
+    const repository = {name:parsed.displayName,id:repositoryId,checkoutFolder:opened.checkoutFolder,workspaceFolder:opened.folder};
+    const operation = phase.data;
+    if (operation.phase === 'prepare') {
+        const assignmentOpen = sealOpen(identity,enrolled,computerId,controls.sandboxName,challenge.eventId,now,signer);
+        return shellJson({ok:true,repository,assignmentOpen});
+    }
+    const proof = (() => { try { return readOpen(operation.repoOpenProof,identity,attemptId,now,signer); } catch { return null; } })();
+    if (!proof || proof.workspaceId !== workspaceIdentity(identity.userId,computerId,controls.sandboxName) || proof.repositoryUrl !== parsed.canonicalURL
+        || proof.providerId !== privatePacket.repository.id || proof.manifestSha256 !== enrolled.manifestSha256) return assignmentLocked();
+    const state = await recordingAction(identity,{action:'status',attemptId,captureSessionId:operation.captureSessionId},{signal:deadline}).catch(()=>null);
+    if (!state || state.captureSessionId !== operation.captureSessionId || state.repositoryOpenReceiptId !== proof.eventId || state.phaseReady !== true || state.workspaceUnlocked !== true
+        || state.status !== 'recording' || state.revoked !== false || state.stopRequestedAt !== null || typeof state.firstFrameAt !== 'string'
+        || typeof state.startedAt !== 'string' || typeof state.deadlineAt !== 'string' || Date.parse(state.deadlineAt) <= Date.now() || !(await sameSession())) return assignmentLocked();
+    return shellJson({...preview,codePreviewUrl:url,url,repository});
+
 }
 

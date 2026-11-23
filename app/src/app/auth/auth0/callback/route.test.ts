@@ -211,6 +211,12 @@ describe('Auth0 callback failure keeps only a vouched-for destination (auth reco
         expect(response.headers.get('location')).not.toContain('private');
         expectCleared(response);
     });
+    it.each(['/app/assignment-enrollment?attempt=2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a',
+        '/app/code?repo=https%3A%2F%2Fgithub.ezil.work%2Fdefault%2Fu-0123456789abcdef-a-2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a.git&assignment=2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a'
+    ])('returns a verified participant to their exact original OS assignment URL %s',async path=>{
+        await transactionFor(path);
+        expect((await GET(request())).headers.get('location')).toBe(origin+path);
+    });
     it('a verified retry of the same page lands on it', async () => {
         await transactionFor('/app/browser');
         const response = await GET(request());

@@ -59,6 +59,11 @@ describe('EZiL ID is the only sign-in', () => {
         expectNoOtherSignIn(html);
     });
 
+    it('keeps a single valid unbound assignment in the real login link',async()=>{
+        const url='/app/assignment-enrollment?attempt=2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a';
+        expect(await render({returnUrl:url})).toContain('/auth/auth0/login?'+new URLSearchParams({returnUrl:url}));
+        expect(await render({returnUrl:url+'&next=https://other.example/'})).toContain('/auth/auth0/login?returnUrl=%2Fos');
+    });
     it('carries a safe destination through EZiL ID', async () => {
         const html = await render({ returnUrl: '/os?computer=one' });
         expect(html).toContain('href="/auth/auth0/login?returnUrl=%2Fos%3Fcomputer%3Done"');

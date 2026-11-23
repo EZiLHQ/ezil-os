@@ -119,7 +119,7 @@ beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL, init: RequestInit = {}) => {
         const url = new URL(String(input));
         s.requests.push({ url, init });
-        if (url.origin === UNIVERSE) { s.order.push('universe'); return s.universe!(JSON.parse(String(init.body))); }
+        if (url.origin === UNIVERSE || (url.origin === 'https://universe-staging.ezil.work' || url.origin === 'https://universe.ezil.work')) { s.order.push('universe'); return s.universe!(JSON.parse(String(init.body))); }
         if (url.origin === WORKER) { s.order.push('worker'); return s.worker!(String(init.body)); }
         if (url.origin === 'https://github.com') { s.order.push('github'); return s.github!(url, init); }
         if (url.origin === 'https://github.ezil.work') { s.order.push('gateway'); return s.gateway!(JSON.parse(String(init.body)).scope); }
@@ -431,5 +431,88 @@ describe('standalone EZiL Git URL open', () => {
         expect(s.order.filter(event => event === 'gateway')).toHaveLength(2);
         const body = JSON.parse(String(s.requests.find(r => r.url.origin === WORKER)!.init.body));
         expect(Date.parse(body.privatePacket.git.expiresAt) - Date.now()).toBeGreaterThan(body.timeoutMs);
+    });
+});
+
+
+describe('the enrolled checkout signals the protected top-level shell only after the private preload acknowledges', () => {
+    it.each(['staging','production'])('binds the same-session owner, private 5679 and signed checkout on %s', async realm => {
+        const { expectedRepositoryURL } = await import('@/server/git/assignment-enrollment');
+        const { makeChallenge, readOpen } = await import('@/server/assignment-video/repo-open');
+        const attemptId = 'ecb246af-f1b8-4c72-8e6d-414c814de821';
+        const production = realm === 'production';
+        const origin = production ? 'https://os.ezil.work' : 'https://os-staging.ezil.work';
+        if (production) {
+            vi.stubEnv('BILLING_FUNDING_URL','https://ai.ezil.work');
+            vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED','1');
+        }
+        const subject = 'auth0|builder';
+        const repositoryUrl = expectedRepositoryURL(subject, 'a-' + attemptId);
+        const now = Date.now();
+        const signingKey = 'test-only-repo-open-key-material'.repeat(2);
+        const enrolled = {status:'eligible',attemptId,jobId:'9',repositoryUrl,ref:'refs/heads/main',
+            manifestSha256:makeChallenge(attemptId,repositoryUrl).manifestSha256, providerId:'fg1wtcrexaf7acl0',
+            windowStartedAt:new Date(now-12000).toISOString(), deadlineAt:new Date(now+3480000).toISOString(),
+            expiresAt:new Date(now+120000).toISOString()};
+        vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN',production ? 'https://universe.ezil.work' : 'https://universe-staging.ezil.work');
+        vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET',signingKey);
+        const captureSessionId = '00000000-0000-4000-8000-000000000099';
+        const recordingId = '00000000-0000-4000-8000-000000000098';
+        let ready = false;
+        let repositoryOpenReceiptId = recordingId;
+        let boundProvider = enrolled.providerId;
+        s.universe = () => Response.json(s.requests.at(-1)?.url.pathname.endsWith('/status')
+            ? {captureSessionId,recordingId,repositoryOpenReceiptId,status:'recording',revoked:false,stopRequestedAt:null,
+                startedAt:new Date(now-1000).toISOString(), deadlineAt:new Date(now+3400000).toISOString(),
+                firstFrameAt:ready ? new Date(now-1000).toISOString() : null,phaseReady:ready,workspaceUnlocked:ready}
+            : {...enrolled,providerId:boundProvider,windowStartedAt:null,deadlineAt:null});
+        s.gateway = scope => {const packet=standalonePacket(scope);packet.repository.canonicalURL=repositoryUrl;return Response.json(packet);};
+        let ack: 'good'|'missing'|'wrong'|'wrong-folder' = 'good';
+        s.worker = body => {
+            const request = JSON.parse(body), challenge = request.assignmentPreload;
+            const folder = '/workspace/projects/'+request.repositoryId;
+            return Response.json({ok:true,folder,checkoutFolder:folder+'/'+(ack === 'wrong-folder' ? 'repository' : repositoryUrl.split('/').at(-1)!.slice(0,-4)),
+                ...(challenge && ack !== 'missing' ? {assignmentPreload:{eventId:challenge.eventId,nonce:ack === 'wrong' ? '1'.repeat(64) : challenge.nonce,
+                    port:5679,status:'acknowledged'}} : {})});
+        };
+        const open = (assignment?: object) => POST(new Request(origin+'/api/shell/code-preview-url',{method:'POST',
+            headers:{origin,host:new URL(origin).host,'sec-fetch-site':'same-origin','content-type':'application/json'},
+            body:JSON.stringify({computerId:COMPUTER,intent:'open',repository:{url:repositoryUrl},assignment})}));
+        const prep = {attemptId,phase:'prepare'};
+        const locked = async (response: Response) => {
+            expect(response.status).toBe(409);
+            expect(await response.text()).not.toContain('preview-bootstrap');
+        };
+        await locked(await open());
+        const first = await open(prep);
+        expect(first.status).toBe(200);
+        const body = await first.json();
+        expect(body.codePreviewUrl).toBeUndefined();
+        expect(body.url).toBeUndefined();
+        expect(body.repository.checkoutFolder).toBe(body.repository.workspaceFolder+'/'+repositoryUrl.split('/').at(-1)!.slice(0,-4));
+        const proof = body.assignmentOpen;
+        expect(proof).toMatchObject({attemptId,deadlineAt:null,windowStartedAt:null});
+        const actor = {userId:USER,issuer:'https://id.ezil.work/',subject,sessionId:s.sessionId,expiresAt:now+600000};
+        expect(readOpen(proof.proof,actor,attemptId,Date.now(),signingKey)).toMatchObject({repositoryUrl,providerId:enrolled.providerId,manifestSha256:enrolled.manifestSha256});
+        const enter = {attemptId,phase:'open',repoOpenProof:proof.proof,captureSessionId};
+        await locked(await open(enter));
+        ready=true;
+        await locked(await open({...enter,repoOpenProof:'A'.repeat(80)}));
+        await locked(await open({...enter,captureSessionId:recordingId}));
+        await locked(await open(enter));
+        repositoryOpenReceiptId=readOpen(proof.proof,actor,attemptId,Date.now(),signingKey).eventId;
+        const confirmed=await open(enter);
+        expect(confirmed.status).toBe(200);
+        const unlocked=await confirmed.json();
+        expect(new URL(unlocked.codePreviewUrl).searchParams.get('folder')).toBe(body.repository.workspaceFolder);
+        expect(unlocked.repository).toEqual(body.repository);
+        for (const response of ['missing','wrong','wrong-folder'] as const) {
+            ack=response;
+            await locked(await open(prep));
+            await locked(await open(enter));
+        }
+        ack='good';
+        boundProvider='different';
+        await locked(await open(prep));
     });
 });

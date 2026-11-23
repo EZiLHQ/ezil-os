@@ -8,6 +8,8 @@ import { env } from '@/env';
 import { bootPayloadScript, buildShellBootPayload } from '@/server/shell/boot-payload';
 import { shellFeaturesFor } from '@/server/shell/features';
 import { Routes, getReturnUrlQueryParam, returnUrlFor, shellAppRoute } from '@/utils/constants';
+import { AssignmentSignInNotice } from '../assignment/work-return/sign-in-notice';
+import { embeddedCodeAttempt } from '@/utils/assignment-work-auth';
 import { BootWatchdog } from './boot-watchdog';
 import { HydrationSignal } from './hydration-signal';
 
@@ -121,6 +123,11 @@ export default async function Page({ params: routeParams, searchParams }: {
     const ctx = await createTRPCContext({ headers: heads });
 
     if (!ctx.user) {
+        if (appId === 'code' && heads.get('sec-fetch-dest') === 'iframe') {
+            const attempt = embeddedCodeAttempt(params);
+            if (attempt && (await import('@/server/git/assignment-enrollment')).assignmentEnrollmentEnabled())
+                return <AssignmentSignInNotice attemptId={attempt} />;
+        }
         // Same gate as `src/app/computers/layout.tsx` and
         // `src/app/computer/layout.tsx`. The pathname is known here (`/os`,
         // or `/app/<id>` for an allowlisted id), so it is used directly rather

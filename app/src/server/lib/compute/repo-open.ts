@@ -24,6 +24,17 @@ import type { PrivateGitPacket } from '@/server/git/private-packet';
 import { isGitAuthor, type GitAuthor } from '@/server/git/author';
 import { isCorrelationId } from '@/server/feedback/failure-shapes';
 
+export type PreloadChallenge = {eventId:string; nonce:string; attemptId:string; manifestSha256:string};
+export type PreloadAck = {eventId:string; nonce:string; port:5679; status:'acknowledged'};
+
+export function matchesAck(challenge: PreloadChallenge | undefined, value: unknown): value is PreloadAck {
+    if (!challenge || !value || typeof value !== 'object') return false;
+    const copy = value as Partial<PreloadAck>;
+    return Object.keys(copy).sort().join(',') === 'eventId,nonce,port,status'
+        && copy.eventId === challenge.eventId && copy.nonce === challenge.nonce && copy.port === 5679 && copy.status === 'acknowledged';
+}
+
+
 export interface RepoOpenRequest {
     repositoryId: string;
     canonicalURL: string;
@@ -35,6 +46,7 @@ export interface RepoOpenRequest {
     git: { token: string; expiresAt: string; scope?: 'read' | 'write' } | null;
     /** Standalone EZiL Git CLI v2 authorization. Its repository.id is the provider ID, not repositoryId. */
     privatePacket?: PrivateGitPacket;
+    assignmentPreload?: PreloadChallenge;
     /** Commit attribution from this session's verified EZiL ID claims; never part of the gateway grant packet. */
     gitAuthor?: GitAuthor;
     /** Reconnect this checkout's credentials and author without cloning/fetching or changing its files. */
@@ -44,7 +56,7 @@ export interface RepoOpenRequest {
 }
 
 export type RepoOpenResult =
-    | { ok: true; folder: string; head?: string }
+    | { ok: true; folder: string; head?: string; checkoutFolder?: string; assignmentPreload?: PreloadAck }
     | { ok: false; errorCode: 'repo_open_unsupported_provider' | 'repo_open_failed';
         refusalReason?: string; correlationId?: string; httpStatus?: number };
 
@@ -143,7 +155,8 @@ export async function requestRepoOpen(
         const body = request.privatePacket
             ? JSON.stringify({ repositoryId: request.repositoryId, privatePacket: request.privatePacket,
                 ...(request.gitAuthor ? { gitAuthor: request.gitAuthor } : {}),
-                ...(request.refreshOnly ? { refreshOnly: true } : {}), timeoutMs: request.timeoutMs })
+                ...(request.refreshOnly ? { refreshOnly: true } : {}),
+                ...(!aws && !request.refreshOnly && request.assignmentPreload ? { assignmentPreload: request.assignmentPreload } : {}), timeoutMs: request.timeoutMs })
             : JSON.stringify({
                 repositoryId: request.repositoryId, canonicalURL: request.canonicalURL, ref: request.ref,
                 ...(request.git ? { git: { token: request.git.token, expiresAt: request.git.expiresAt, ...(request.git.scope ? { scope: request.git.scope } : {}) } } : {}),
@@ -167,7 +180,7 @@ export async function requestRepoOpen(
                 ...(deps.correlationId ? { [CORRELATION_HEADER]: deps.correlationId } : {}) },
         });
         const text = await response.text();
-        let value: { ok?: unknown; folder?: unknown; head?: unknown; status?: unknown; error?: unknown; errorCode?: unknown; diagnosticReason?: unknown } = {};
+        let value: { ok?: unknown; folder?: unknown; head?: unknown; checkoutFolder?: unknown; assignmentPreload?: unknown; status?: unknown; error?: unknown; errorCode?: unknown; diagnosticReason?: unknown } = {};
         try { if (text.length <= RESPONSE_MAX_BYTES) value = JSON.parse(text) ?? {}; } catch { /* not JSON: refused below */ }
         const code = value.errorCode ?? value.error;
         if (code === 'repo_open_unsupported_provider') return { ok: false, errorCode: 'repo_open_unsupported_provider' };
@@ -178,7 +191,11 @@ export async function requestRepoOpen(
             || value.folder !== `/workspace/projects/${request.repositoryId}`)) return failed(response.status, 'aws_result_invalid');
         if (!isRepositoryFolder(value.folder, request.repositoryId)) return failed(response.status, 'invalid_folder');
         const head = typeof value.head === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value.head) ? value.head : undefined;
-        return { ok: true, folder: value.folder, ...(head ? { head } : {}) };
+        const ack = !aws && matchesAck(request.assignmentPreload, value.assignmentPreload) ? value.assignmentPreload : undefined;
+        const canonicalName = request.canonicalURL.slice(request.canonicalURL.lastIndexOf('/') + 1, -4);
+        const checkoutFolder = ack && value.checkoutFolder === value.folder + '/' + canonicalName ? value.checkoutFolder as string : undefined;
+        return { ok: true, folder: value.folder, ...(head ? { head } : {}),
+            ...(ack && checkoutFolder ? {assignmentPreload:ack, checkoutFolder} : {}) };
     } catch (err) {
         const name = err instanceof Error ? err.name : '';
         return failed(null, name === 'TimeoutError' ? 'timeout' : name === 'AbortError' ? 'aborted' : 'transport');
