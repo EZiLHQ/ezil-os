@@ -21,7 +21,7 @@ class PrivateAssignmentPreloadTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.checkout = Path(self.temp.name) / "projects" / REPO / "repository"
+        self.checkout = Path(self.temp.name) / "projects" / REPO / URL.rsplit("/",1)[1][:-4]
         self.marker = self.checkout / ".ezil" / "assignment.json"
         self.marker.parent.mkdir(parents=True)
         self.git("init", "--initial-branch=main")
@@ -72,6 +72,25 @@ class PrivateAssignmentPreloadTest(unittest.TestCase):
             with socket.socket() as verifier:
                 verifier.settimeout(0.2)
                 self.assertNotEqual(verifier.connect_ex(("127.0.0.1", PORT)), 0)
+
+    def test_terminal_settings_are_bound_to_actual_child_without_interpreting_repo_configuration(self):
+        hostile = self.checkout / ".vscode"
+        hostile.mkdir()
+        (hostile / "settings.json").write_text('{"terminal.integrated.cwd":"/"}')
+        self.assertEqual(self.invoke().returncode, 0)
+        outer = self.checkout.parent / ".vscode" / "settings.json"
+        self.assertEqual(json.loads(outer.read_bytes()), {"terminal.integrated.cwd": str(self.checkout),
+                                                        "terminal.integrated.splitCwd": "initial"})
+        self.assertEqual(self.invoke().returncode, 0)
+        outer.chmod(0o600)
+        outer.write_text('{"user":"must survive"}')
+        self.denies()
+        self.assertEqual(outer.read_text(), '{"user":"must survive"}')
+
+    def test_stale_placeholder_for_a_different_layout_cannot_confirm(self):
+        old = self.checkout.with_name("repository")
+        self.checkout.rename(old)
+        self.denies(old)
 
     def test_foreign_listener_cannot_ack_and_receives_no_connection(self):
         with socket.socket() as foreign:
@@ -124,7 +143,7 @@ class PrivateAssignmentPreloadTest(unittest.TestCase):
         projects = self.checkout.parent.parent
         other = projects.with_name("alias")
         other.symlink_to(projects, target_is_directory=True)
-        self.denies(other / REPO / "repository")
+        self.denies(other / REPO / URL.rsplit("/",1)[1][:-4])
 
     def test_other_branch_does_not_notify(self):
         self.git("checkout", "-b", "different")

@@ -2881,11 +2881,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     const deps = this.repoOpenDeps();
     // An EZiL Git open with a scope also installs push access for `grantSubject` (`./repo-grant.ts`).
     const answer = await repoOpenThenGrant(deps, request, root, grantSubject);
-    if (!preload || !answer.ok || answer.status === 'created') return answer;
+    if (!preload || !answer.ok || !answer.checkoutFolder || answer.status === 'created') return answer;
+    const checkout = answer.checkoutFolder;
     const acknowledged = await this.withRuntimeMutation(async () => {
       if (Date.now() - started + ASSIGNMENT_PRELOAD_TIMEOUT_MS >= request.timeoutMs
         || !this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) return false;
-      return notifyAssignmentPreload(deps.exec, answer.folder, preload);
+      return notifyAssignmentPreload(deps.exec, checkout, preload);
     }).catch(() => false);
     return acknowledged ? { ...answer, assignmentPreloadAcknowledged: true } : answer;
   }
@@ -5672,7 +5673,8 @@ async function handleRepoOpen(request: Request, env: Env, sandboxName: string): 
   const assignmentPreload = assignment && answer.assignmentPreloadAcknowledged === true
     ? { eventId: assignment.witness.eventId, nonce: assignment.nonce, port: ASSIGNMENT_PRELOAD_PORT, status: 'acknowledged' }
     : undefined;
-  return json({ ok: true, folder: answer.folder, head: answer.head, status: answer.status, assignmentPreload });
+  return json({ ok: true, folder: answer.folder, head: answer.head, status: answer.status, assignmentPreload,
+    ...(assignmentPreload && answer.checkoutFolder ? {checkoutFolder:answer.checkoutFolder} : {}) });
 }
 
 /**

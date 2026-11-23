@@ -1,4 +1,4 @@
-import { repoOpenRemotesFor, REPO_OPEN_NESTED_DIR, type RepoOpenExec, type RepoOpenRequest } from './repo-open';
+import { repoOpenRemotesFor, type RepoOpenExec, type RepoOpenRequest } from './repo-open';
 import { ASSIGNMENT_PRELOAD_B64 } from './repo-open-runtime.generated';
 
 export const ASSIGNMENT_PRELOAD_PORT = 5679;
@@ -75,11 +75,12 @@ function shq(value: string): string {
 
 /** A signed open's optional, one-shot notification in the already-running computer. */
 export async function notifyAssignmentPreload(
-  exec: RepoOpenExec, folder: string, witness: AssignmentPreloadWitness,
+  exec: RepoOpenExec, checkout: string, witness: AssignmentPreloadWitness,
 ): Promise<boolean> {
   const loader = `import base64;exec(compile(base64.b64decode('${ASSIGNMENT_PRELOAD_B64}'),'assignment-preload.py','exec'))`;
-  const repositoryPath = `${folder}/${REPO_OPEN_NESTED_DIR}`;
-  const command = `python3 -I -c ${shq(loader)} ${shq(repositoryPath)} ${shq(JSON.stringify(witness))}`;
+  const basename = witness.canonicalURL.slice(witness.canonicalURL.lastIndexOf('/') + 1, -4);
+  if (!checkout.endsWith('/projects/' + witness.repositoryId + '/' + basename)) return false;
+  const command = `python3 -I -c ${shq(loader)} ${shq(checkout)} ${shq(JSON.stringify(witness))}`;
   try {
     const result = await exec(command, { env: {}, timeout: ASSIGNMENT_PRELOAD_TIMEOUT_MS, origin: 'internal' });
     return result.exitCode === 0 && result.stdout?.trim() === 'ezil-assignment-preload:ack';
