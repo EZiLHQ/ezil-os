@@ -265,14 +265,15 @@ describe('staging assignment repo-open preload', () => {
     repositoryId: folderId, privatePacket: packet(), assignmentPreload: challenge, ...patch,
   });
   const folder = `/workspace/projects/${folderId}`;
+  const checkoutFolder = folder + '/' + canonicalURL.split('/').at(-1)!.slice(0,-4);
 
   it('only a matching signed assignment checkout can return the correlated empty-of-credentials ack', async () => {
     const worker = await loadWorker();
-    const { binding, calls } = fakeNamespace({ ok: true, folder, status: 'cloned', assignmentPreloadAcknowledged: true });
+    const { binding, calls } = fakeNamespace({ ok: true, folder, checkoutFolder, status: 'cloned', assignmentPreloadAcknowledged: true });
     const res = await worker.fetch(await signed({ signBody: body() }), env(binding, stage));
     expect(res.status).toBe(200);
     const text = await res.text();
-    expect(JSON.parse(text)).toEqual({ ok: true, folder, status: 'cloned',
+    expect(JSON.parse(text)).toEqual({ ok: true, folder, checkoutFolder, status: 'cloned',
       assignmentPreload: { eventId, nonce, port: 5679, status: 'acknowledged' } });
     expect(text).not.toContain(gitPassword);
     expect(calls[0]?.preload).toEqual({ eventId, attemptId, ownerSha256, canonicalURL, repositoryId: folderId, ref, manifestSha256 });

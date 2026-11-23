@@ -1,4 +1,6 @@
 """One trusted, short-lived assignment repo-open notification inside the computer."""
+import ctypes
+import errno
 import hashlib
 import hmac
 import http.client
@@ -37,10 +39,62 @@ def read_regular(parent, name, limit):
         return data
 
 
+def terminal_settings(checkout):
+    # Only the platform wrapper gets settings. A repository cannot supply a terminal profile, task or executable.
+    return (json.dumps({"terminal.integrated.cwd": checkout,
+                        "terminal.integrated.splitCwd": "initial"}, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def bind_terminal(wrapper_fd, projects_fd, checkout):
+    expected = terminal_settings(checkout)
+
+    def verify():
+        fd = os.open(".vscode", DIR_FLAGS, dir_fd=wrapper_fd)
+        try:
+            return (set(os.listdir(fd)) == {"settings.json"} and
+                    read_regular(fd, "settings.json", 2048) == expected)
+        finally:
+            os.close(fd)
+
+    try:
+        return verify()
+    except FileNotFoundError:
+        pass
+    # Assemble on the same filesystem. Publish the complete directory with NOREPLACE, preserving any existing files.
+    name = ".assignment-settings-" + secrets.token_hex(16)
+    os.mkdir(name, 0o700, dir_fd=projects_fd)
+    fd = os.open(name, DIR_FLAGS, dir_fd=projects_fd)
+    try:
+        output = os.open("settings.json", os.O_WRONLY | os.O_EXCL | os.O_CREAT | os.O_NOFOLLOW, 0o444, dir_fd=fd)
+        with os.fdopen(output, "wb") as handle:
+            handle.write(expected)
+        rename = ctypes.CDLL(None, use_errno=True).renameat2
+        if rename(projects_fd, os.fsencode(name), wrapper_fd, b".vscode", 1) == 0:
+            return True
+        if ctypes.get_errno() != errno.EEXIST:
+            return False
+        return verify()
+    finally:
+        os.close(fd)
+        try:
+            temporary = os.open(name, DIR_FLAGS, dir_fd=projects_fd)
+        except FileNotFoundError:
+            temporary = None
+        if temporary is not None:
+            try:
+                os.unlink("settings.json", dir_fd=temporary)
+            finally:
+                os.close(temporary)
+            os.rmdir(name, dir_fd=projects_fd)
+
+
 def checked_marker(path, witness):
     parts = path.split("/")
+    basename = f'u-{witness["ownerSha256"][:16]}-a-{witness["attemptId"]}'
+    if witness["canonicalURL"] != f"https://github.ezil.work/default/{basename}.git":
+        return False
     if (not path.startswith("/") or any(part in ("", ".", "..") for part in parts[1:])
-            or parts[-3:] != ["projects", witness["repositoryId"], "repository"]):
+            or parts[-3:] != ["projects", witness["repositoryId"], basename]):
         return False
 
     with ExitStack() as stack:
@@ -50,8 +104,11 @@ def checked_marker(path, witness):
             return fd
 
         root = directory("/")
-        for part in parts[1:]:
+        for part in parts[1:-3]:
             root = directory(part, root)
+        projects = directory(parts[-3], root)
+        wrapper = directory(parts[-2], projects)
+        root = directory(parts[-1], wrapper)
 
         git = directory(".git", root)
         head = read_regular(git, "HEAD", 128)
@@ -83,7 +140,7 @@ def checked_marker(path, witness):
                 and marker["repositoryUrl"] == witness["canonicalURL"]
                 and marker["consentVersion"] == 3
                 and isinstance(marker["notice"], str) and bool(marker["notice"])
-                and marker["preload"] == DECLARATION)
+                and marker["preload"] == DECLARATION and bind_terminal(wrapper, projects, path))
 
 
 class PrivateListener(HTTPServer):
