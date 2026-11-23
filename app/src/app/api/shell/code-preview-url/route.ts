@@ -1,6 +1,7 @@
 import { recordingAction } from '@/server/assignment-video/broker';
 import { assignmentAuthority } from '@/server/assignment-video/authority';
-import { uuid } from '@/server/assignment-video/contract';
+import { BrokerError, uuid } from '@/server/assignment-video/contract';
+import { failureFields } from '@/server/lib/failure-diagnostics';
 import { enrolledAttempt, makeChallenge, matchesEnrollment, readOpen, repoOpenSecret, sealOpen, workspaceIdentity } from '@/server/assignment-video/repo-open';
 import { z } from 'zod';
 import { expectedRepositoryURL } from '@/server/git/assignment-enrollment';
@@ -69,6 +70,48 @@ const assignmentPhase = z.discriminatedUnion('phase', [
     z.object({phase:z.literal('open'),attemptId:uuid,captureSessionId:uuid,repoOpenProof:z.string().regex(/^[A-Za-z0-9_-]{48,1700}$/)}).strict(),
 ]);
 const assignmentLocked = () => shellRefusal(409,'assignment_recording_required','Share the assignment tab and wait for the first recorded frame to open Code.');
+/**
+ * Universe could not be asked (a transport failure, a timeout or a 5xx), as distinct from a Universe answer. Retryable:
+ * the shell's wake loop re-asks once and the assignment gate's prepare retries it, so a blip never reads as a refusal.
+ */
+const assignmentUnavailable = () => shellRefusal(503,'assignment_open_unavailable','Universe could not verify this assignment just now. Try again.');
+const assignmentIdentity = () => shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
+type UniverseCall<T> = { ok: true; value: T } | { ok: false; kind: 'unavailable' | 'identity' | 'refused' };
+/** A Universe call through the broker, classified: a failed call is not an answer, and an identity lapse is neither. */
+async function universeCall<T>(call: () => Promise<T>): Promise<UniverseCall<T>> {
+    try { return { ok: true, value: await call() }; }
+    catch (error) {
+        if (!(error instanceof BrokerError)) return { ok: false, kind: 'unavailable' };
+        if (error.code === 'identity_refresh_required') return { ok: false, kind: 'identity' };
+        // `media_unavailable`: no answer (network, timeout, 5xx). `invalid_payload`: an unreadable 5xx-class body.
+        if (error.code === 'media_unavailable' || error.code === 'invalid_payload') return { ok: false, kind: 'unavailable' };
+        return { ok: false, kind: 'refused' };
+    }
+}
+const shellCode = /^[a-z][a-z0-9_]{0,63}$/;
+/**
+ * A not-ready Code mint (`sandbox_starting`, a billing refusal, a move) for a reserved assignment repository: the fields
+ * the shell's wake loop reads (`session.js#pendingOrRefused` and `failureFields`) and nothing else. Never a URL, a
+ * token or an assignment capability, so the wake loop can wait out a cold computer without the gate learning anything.
+ */
+function assignmentNotReady(preview: Record<string, unknown>) {
+    const answer: Record<string, unknown> = { ok: false };
+    for (const key of ['errorCode', 'error'] as const) {
+        const value = preview[key];
+        if (typeof value === 'string' && shellCode.test(value)) answer[key] = value;
+    }
+    if (typeof preview.retryable === 'boolean') answer.retryable = preview.retryable;
+    if (typeof preview.retryAfterMs === 'number' && Number.isSafeInteger(preview.retryAfterMs) && preview.retryAfterMs >= 0)
+        answer.retryAfterMs = preview.retryAfterMs;
+    for (const key of ['provider', 'computeProvider'] as const) {
+        const value = preview[key];
+        if (typeof value === 'string' && /^[a-z0-9-]{1,40}$/.test(value)) answer[key] = value;
+    }
+    if (typeof preview.capacityAttemptId === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(preview.capacityAttemptId))
+        answer.capacityAttemptId = preview.capacityAttemptId;
+    for (const [key, value] of Object.entries(preview)) if (/^compute[A-Z][A-Za-z]{1,40}$/.test(key) && value === true) answer[key] = true;
+    return shellJson({ ...answer, ...failureFields({ reason: preview.reason, correlationId: preview.correlationId }) });
+}
 
 
 async function shellCaller(req: Request) {
@@ -345,7 +388,10 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     if ((request.assignment !== undefined && !reserved) || (reserved && (!authority || !request.allowAssignmentPreload || !phase.success || phase.data.attemptId !== canonicalHint
         || !privatePacket || privatePacket.git.scope !== 'write' || !repoOpenSecret()))) return assignmentLocked();
     const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown; computeProvider?: unknown; sandboxId?: unknown; generation?: unknown; leaseEpoch?: unknown };
-    if (!preview.ok || typeof preview.codePreviewUrl !== 'string') return reserved ? assignmentLocked() : shellJson(preview);
+    // A not-ready answer goes back as a not-ready answer (rule 6 of `openProject`), so the shell's wake loop waits out a
+    // cold computer. For a reserved assignment repository only its allow-listed wake fields; Universe is not asked.
+    if (!preview.ok) return reserved ? assignmentNotReady(preview as Record<string, unknown>) : shellJson(preview);
+    if (typeof preview.codePreviewUrl !== 'string') return reserved ? assignmentLocked() : shellJson(preview);
     if (left() < REPO_OPEN_MIN_TIMEOUT_MS + REPO_OPEN_TRANSPORT_MARGIN_MS) return openTimedOut();
     if (!(await sameSession())) return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
     // A cold Code mint can consume a short credential. Refresh before the Worker call, never after an expired send.
@@ -374,8 +420,13 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     const signer = request.allowAssignmentPreload && authority && process.env.UNIVERSE_PROJECT_REPO_ORIGIN === authority.universe && !isAws(controls)
         ? repoOpenSecret() : undefined;
     const attemptId = signer && identity && privatePacket ? enrolledAttempt(identity, privatePacket, Date.now()) : undefined;
-    const enrolled = attemptId && identity && privatePacket
-        ? await recordingAction(identity,{action:'preflight',attemptId},{signal:deadline}).catch(() => null) : null;
+    const preflight = attemptId && identity && privatePacket
+        ? await universeCall(() => recordingAction(identity,{action:'preflight',attemptId},{signal:deadline})) : null;
+    // A reserved checkout is never cloned on a failed Universe call: no answer is not a refusal (retryable), and a
+    // lapsed EZiL ID is a sign-in. Universe's own refusal keeps today's path (`assignment_checkout_unverified`).
+    if (reserved && preflight && !preflight.ok && preflight.kind === 'unavailable') return assignmentUnavailable();
+    if (reserved && preflight && !preflight.ok && preflight.kind === 'identity') return assignmentIdentity();
+    const enrolled = preflight?.ok ? preflight.value : null;
     const challenge = enrolled && privatePacket && attemptId && matchesEnrollment(enrolled, privatePacket, attemptId, Date.now())
         ? makeChallenge(attemptId, privatePacket.repository.canonicalURL) : undefined;
     const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS,
@@ -413,7 +464,10 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     const proof = (() => { try { return readOpen(operation.repoOpenProof,identity,attemptId,now,signer); } catch { return null; } })();
     if (!proof || proof.workspaceId !== workspaceIdentity(identity.userId,computerId,controls.sandboxName) || proof.repositoryUrl !== parsed.canonicalURL
         || proof.providerId !== privatePacket.repository.id || proof.manifestSha256 !== enrolled.manifestSha256) return assignmentLocked();
-    const state = await recordingAction(identity,{action:'status',attemptId,captureSessionId:operation.captureSessionId},{signal:deadline}).catch(()=>null);
+    const status = await universeCall(() => recordingAction(identity,{action:'status',attemptId,captureSessionId:operation.captureSessionId},{signal:deadline}));
+    if (!status.ok && status.kind === 'unavailable') return assignmentUnavailable();
+    if (!status.ok && status.kind === 'identity') return assignmentIdentity();
+    const state = status.ok ? status.value : null;
     if (!state || state.captureSessionId !== operation.captureSessionId || state.repositoryOpenReceiptId !== proof.eventId || state.phaseReady !== true || state.workspaceUnlocked !== true
         || state.status !== 'recording' || state.revoked !== false || state.stopRequestedAt !== null || typeof state.firstFrameAt !== 'string'
         || typeof state.startedAt !== 'string' || typeof state.deadlineAt !== 'string' || Date.parse(state.deadlineAt) <= Date.now() || !(await sameSession())) return assignmentLocked();

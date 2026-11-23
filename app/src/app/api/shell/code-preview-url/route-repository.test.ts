@@ -516,3 +516,115 @@ describe('the enrolled checkout signals the protected top-level shell only after
         await locked(await open(prep));
     });
 });
+
+describe('a reserved assignment repository whose computer or Universe is not ready yet', () => {
+    const attemptId = 'ecb246af-f1b8-4c72-8e6d-414c814de821';
+    const subject = 'auth0|builder';
+    const origin = 'https://os.ezil.work';
+    const signingKey = 'test-only-repo-open-key-material'.repeat(2);
+    const captureSessionId = '00000000-0000-4000-8000-000000000099';
+    const recordingId = '00000000-0000-4000-8000-000000000098';
+    async function enrolledFixture() {
+        const { expectedRepositoryURL } = await import('@/server/git/assignment-enrollment');
+        const { makeChallenge } = await import('@/server/assignment-video/repo-open');
+        vi.stubEnv('BILLING_FUNDING_URL', 'https://ai.ezil.work');
+        vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED', '1');
+        vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', 'https://universe.ezil.work');
+        vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET', signingKey);
+        const repositoryUrl = expectedRepositoryURL(subject, 'a-' + attemptId);
+        const now = Date.now();
+        const enrolled = { status: 'eligible', attemptId, jobId: '9', repositoryUrl, ref: 'refs/heads/main',
+            manifestSha256: makeChallenge(attemptId, repositoryUrl).manifestSha256, providerId: 'fg1wtcrexaf7acl0',
+            windowStartedAt: null, deadlineAt: null, expiresAt: new Date(now + 120000).toISOString() };
+        const universe = { preflight: () => Response.json(enrolled) as Response, status: () => Response.json({}) as Response };
+        s.universe = () => (s.requests.at(-1)?.url.pathname.endsWith('/status') ? universe.status : universe.preflight)();
+        s.gateway = scope => { const packet = standalonePacket(scope); packet.repository.canonicalURL = repositoryUrl; return Response.json(packet); };
+        s.worker = body => {
+            const request = JSON.parse(body), challenge = request.assignmentPreload;
+            const folder = '/workspace/projects/' + request.repositoryId;
+            return Response.json({ ok: true, folder, checkoutFolder: folder + '/' + repositoryUrl.split('/').at(-1)!.slice(0, -4),
+                ...(challenge ? { assignmentPreload: { eventId: challenge.eventId, nonce: challenge.nonce, port: 5679, status: 'acknowledged' } } : {}) });
+        };
+        const open = (assignment?: object) => POST(new Request(origin + '/api/shell/code-preview-url', { method: 'POST',
+            headers: { origin, host: new URL(origin).host, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+            body: JSON.stringify({ computerId: COMPUTER, intent: 'open', repository: { url: repositoryUrl }, assignment }) }));
+        return { open, universe, prep: { attemptId, phase: 'prepare' }, now };
+    }
+
+    it('a cold computer answers its wake fields only (no Universe, no Worker, no URL, no capability), so the wake loop waits', async () => {
+        const { open, prep } = await enrolledFixture();
+        s.preview = { ok: false, errorCode: 'sandbox_starting', error: 'sandbox_starting', retryable: true, retryAfterMs: 2000,
+            provider: 'cloudflare-guacamole', computeProvider: 'cloudflare', computeLaunching: true, computePreparing: 'yes',
+            reason: 'sandbox_starting', correlationId: 'srv_0123456789ab',
+            codePreviewUrl: `https://code-${SANDBOX}.preview.example/preview-bootstrap?token=t`, url: MINTED, sandboxId: SANDBOX,
+            assignmentOpen: { attemptId, proof: 'p'.repeat(60) }, repository: { id: 'x', checkoutFolder: '/w/x', workspaceFolder: '/w' } };
+        const response = await open(prep);
+        expect(response.status).toBe(200);
+        await expectNoSecrets(response);
+        const text = await response.clone().text();
+        expect(await response.json()).toEqual({ ok: false, errorCode: 'sandbox_starting', error: 'sandbox_starting', retryable: true,
+            retryAfterMs: 2000, provider: 'cloudflare-guacamole', computeProvider: 'cloudflare', computeLaunching: true,
+            reason: 'sandbox_starting', correlationId: 'srv_0123456789ab' });
+        for (const leak of ['preview-bootstrap', 'https://', SANDBOX, 'proof', 'assignmentOpen', 'workspaceFolder']) expect(text).not.toContain(leak);
+        expect(s.order).toContain('codePreviewUrl');
+        expect(s.order).not.toContain('universe');
+        expect(s.order).not.toContain('worker');
+    });
+
+    it('a billing refusal passes through the same way; a free-text worker error never does; ok without a URL stays locked', async () => {
+        const { open, prep } = await enrolledFixture();
+        s.preview = { ok: false, error: 'billing_concurrent_limit', errorCode: 'billing_concurrent_limit', billingRefusal: 'concurrent_limit',
+            provider: 'cloudflare-guacamole' };
+        expect(await (await open(prep)).json()).toEqual({ ok: false, error: 'billing_concurrent_limit', errorCode: 'billing_concurrent_limit',
+            provider: 'cloudflare-guacamole' });
+        s.preview = { ok: false, errorCode: 'sandbox_starting', error: `Desktop ${WORKER}/sandbox/${SANDBOX} is still starting`,
+            reason: 'https://worker.example', correlationId: 'not a correlation id' };
+        expect(await (await open(prep)).json()).toEqual({ ok: false, errorCode: 'sandbox_starting' });
+        s.preview = { ok: true };
+        const locked = await open(prep);
+        expect(locked.status).toBe(409);
+        expect((await locked.json()).error.code).toBe('assignment_recording_required');
+        expect(s.order).not.toContain('worker');
+    });
+
+    it('a failed Universe preflight is the retryable assignment_open_unavailable before any clone; a Universe refusal is not', async () => {
+        const { open, prep, universe } = await enrolledFixture();
+        for (const answer of [() => { throw new TypeError('fetch failed'); }, () => new Response('upstream', { status: 502 }),
+            () => new Response('{', { status: 200, headers: { 'content-type': 'application/json' } })]) {
+            universe.preflight = answer as () => Response;
+            s.order = [];
+            const response = await open(prep);
+            expect(response.status).toBe(503);
+            expect((await response.json()).error.code).toBe('assignment_open_unavailable');
+            expect(s.order).toContain('universe');
+            expect(s.order).not.toContain('worker');
+        }
+        universe.preflight = () => new Response(null, { status: 404 });
+        s.order = [];
+        const refused = await open(prep);
+        expect(refused.status).toBe(409);
+        expect((await refused.json()).error.code).toBe('assignment_checkout_unverified');
+    });
+
+    it('an open-phase status blip is assignment_open_unavailable; a paused phase stays assignment_recording_required', async () => {
+        const { open, prep, universe, now } = await enrolledFixture();
+        const { readOpen } = await import('@/server/assignment-video/repo-open');
+        const prepared = await open(prep);
+        expect(prepared.status).toBe(200);
+        const proof = (await prepared.json()).assignmentOpen.proof;
+        const actor = { userId: USER, issuer: 'https://id.ezil.work/', subject, sessionId: s.sessionId, expiresAt: now + 600000 };
+        const receipt = readOpen(proof, actor, attemptId, Date.now(), signingKey).eventId;
+        const enter = { attemptId, phase: 'open', repoOpenProof: proof, captureSessionId };
+        universe.status = () => { throw new TypeError('fetch failed'); };
+        let response = await open(enter);
+        expect(response.status).toBe(503);
+        expect(await response.clone().text()).not.toContain('preview-bootstrap');
+        expect((await response.json()).error.code).toBe('assignment_open_unavailable');
+        universe.status = () => Response.json({ captureSessionId, recordingId, repositoryOpenReceiptId: receipt, status: 'paused', revoked: false,
+            stopRequestedAt: null, startedAt: new Date(now - 1000).toISOString(), deadlineAt: new Date(now + 3400000).toISOString(),
+            firstFrameAt: new Date(now - 1000).toISOString(), phaseReady: false, workspaceUnlocked: false });
+        response = await open(enter);
+        expect(response.status).toBe(409);
+        expect((await response.json()).error.code).toBe('assignment_recording_required');
+    });
+});
