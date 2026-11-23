@@ -1378,6 +1378,13 @@ await settle(4);
             "Projects can't open on this computer yet"],
         ['502 project_repo_identity_unavailable', { status: 502, payload: { error: { code: 'BAD_GATEWAY', message: 'project_repo_identity_unavailable' } } },
             "Couldn't open this project's repository"],
+        // A reserved assignment repository: the route's two refusals are terminal; a failed Universe call keeps its retry.
+        ['409 assignment_recording_required', { status: 409, payload: { error: { code: 'assignment_recording_required', message: 'x' } } },
+            'Open this assignment from its recorded tab'],
+        ['409 assignment_checkout_unverified', { status: 409, payload: { error: { code: 'assignment_checkout_unverified', message: 'x' } } },
+            "Couldn't verify the assignment checkout"],
+        ['503 assignment_open_unavailable', { status: 503, payload: { error: { code: 'assignment_open_unavailable', message: 'x' } } },
+            "Couldn't reach Universe"],
     ];
     for ( const [name, answer, title] of refusals ) {
         codeMintAnswer = () => answer;
@@ -1387,7 +1394,8 @@ await settle(4);
         await tick(2000); // past session.js RETRY_DELAY_MS (1.5 s): a silent re-ask would have landed
         w = codeWin();
         const asked = mints(from).length;
-        const expectAsks = /project_repo_/.test(name) ? 2 : 1; // a generic failed open keeps its one silent retry
+        // A generic failed open, and a failed Universe call, keep their one silent retry.
+        const expectAsks = /project_repo_|assignment_open_unavailable/.test(name) ? 2 : 1;
         push(`8f 🔴 ${name}: "${title}", asked ${expectAsks === 1 ? 'exactly once' : 'with its one retry'}, frame untouched, no sign-in`,
             spinnerKind(w) === 'failed' && spinnerTitle(w) === title && asked === expectAsks && frameSrc(w) === 'about:blank' && submits.length === 0,
             `${spinnerKind(w)} "${spinnerTitle(w)}" asks=${asked} src=${frameSrc(w)} submits=${submits.length}`);

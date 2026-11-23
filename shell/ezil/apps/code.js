@@ -198,6 +198,12 @@ const PROJECT_REFUSALS = {
     repo_url_moved: 'repo_url_moved',
     repo_url_empty: 'repo_url_empty',
     repo_url_unavailable: 'repo_url_unavailable',
+    // A reserved assignment repository (`../assignment-video/shell.js`). The first two are the route's refusals and are
+    // terminal (`session.js` TERMINAL_ERROR_CODES); the server's `assignment_checkout_unverified` is the gate's
+    // `assigned_checkout_unverified`. `assignment_open_unavailable` is a failed Universe call: retryable.
+    assignment_recording_required: 'assignment_recording_required',
+    assignment_checkout_unverified: 'assigned_checkout_unverified',
+    assignment_open_unavailable: 'assignment_open_unavailable',
 };
 const PROJECT_FAILURE_COPY = {
     project_not_authorized: {
@@ -244,6 +250,18 @@ const PROJECT_FAILURE_COPY = {
     repo_url_unavailable: {
         title: "Couldn't reach this repository",
         body: 'Something went wrong while checking the repository. Try again in a moment.',
+    },
+    assignment_recording_required: {
+        title: 'Open this assignment from its recorded tab',
+        body: 'Code opens an assignment repository only while this EZiL OS tab is shared and recording. Open the assignment from Universe, then share this tab.',
+    },
+    assigned_checkout_unverified: {
+        title: "Couldn't verify the assignment checkout",
+        body: 'The protected assignment checkout could not be verified. Share this OS tab again to retry.',
+    },
+    assignment_open_unavailable: {
+        title: "Couldn't reach Universe",
+        body: "EZiL OS couldn't check this assignment with Universe just now. Try again in a moment.",
     },
 };
 /** A repository address as `../app-link.js` accepts it: https only; the server decides what it may name. */
@@ -1735,12 +1753,21 @@ export async function openCodeWindow (ctx = {}) {
                 const result = await response.json();
                 return result?.ok === true ? result.info?.provider : null;
             },
-            async prepare(attemptId) {
+            async prepare(attemptId, {signal}={}) {
                 if (!stillHere()) throw Object.assign(new Error('closed'),{code:'workspace_disconnected'});
-                mint_ctl?.abort(); mint_ctl = new AbortController();
-                const result = await mintCodePreviewUrl(computer.id,mint_ctl.signal,requestedProject,null,{attemptId,phase:'prepare'});
+                // A share that already ended never starts (or aborts) a mint: the next share may own `mint_ctl` by now.
+                if (signal?.aborted) throw Object.assign(new Error('cancelled'),{code:'cancelled'});
+                mint_ctl?.abort();
+                const ctl = mint_ctl = new AbortController();
+                // The gate's stop reaches this call's mint only, never a later share's.
+                const cancel = () => ctl.abort();
+                signal?.addEventListener('abort',cancel,{once:true});
+                let result;
+                try { result = await mintCodePreviewUrl(computer.id,ctl.signal,requestedProject,null,{attemptId,phase:'prepare'}); }
+                finally { signal?.removeEventListener('abort',cancel); if (mint_ctl === ctl) mint_ctl = null; }
                 if(!stillHere())throw Object.assign(new Error('closed'),{code:'workspace_disconnected'});
-                if (!result.ok) throw Object.assign(new Error('prepare_failed'),{code:result.errorCode});
+                if (!result.ok) throw Object.assign(new Error('prepare_failed'),{code:result.errorCode,
+                    ...failureFields({reason:result.reason,correlationId:result.correlationId})});
                 return result;
             },
             open:()=>{if (stillHere()) void start_boot();}});
