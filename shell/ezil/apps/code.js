@@ -1063,6 +1063,9 @@ export async function openCodeWindow (ctx = {}) {
 
         if ( ! res.ok ) {
             last_failure = res;
+            // An assignment's open-phase mint failed: the gate says so now, with the real cause, instead of waiting out
+            // its editor timeout behind this panel (which it covers). A cancelled mint is a stop, never a failure.
+            if ( res.errorCode !== 'cancelled' ) assignmentGate?.fail(res);
             if (nativeFailureCopy) Object.assign(nativeFailureCopy, editorFailureCopy(res.errorCode));
             // `code_preview_unavailable` is the one code that means "this
             // deployment/container cannot serve code-server at all" — the

@@ -1,5 +1,16 @@
 import {createVP8Muxer} from './vp8-webm.js';
 
+/**
+ * `play()` on a capture track can stay pending (an ended or stopped share). Bounded like the frame wait after it, so a
+ * share can never hang on it: it rejects `no_current_frame`, the same as a tab that presents no frame.
+ */
+export function playWithin(video, ms, timers = globalThis) {
+    let timer;
+    return Promise.race([Promise.resolve().then(() => video.play()),
+        new Promise((_, reject) => { timer = timers.setTimeout(() => reject(new Error('no_current_frame')), ms); })])
+        .finally(() => timers.clearTimeout(timer));
+}
+
 export async function encodeTabSegments({win, stream, matches, windowStart, deadline, upload, cutoff, onFault, onFrame, onAwaitFrame, firstSequence=0, clockOffset=0}) {
     const video = win.document.createElement('video');
     video.muted = true;
@@ -12,7 +23,7 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
     const canvas = win.document.createElement('canvas');
     const ctx = canvas.getContext('2d', {alpha:false});
     try {
-        await video.play();
+        await playWithin(video, 4500, win);
         // Wait for a compositor frame presented after authorization. Never encode the pre-armed track's cached image.
         await new Promise((resolve, reject) => {
             const timeout = win.setTimeout(() => reject(new Error('no_current_frame')), 4500);
@@ -28,8 +39,8 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
         function open(start) {
             const mux = createVP8Muxer(canvas.width, canvas.height);
             const encoder = new win.VideoEncoder({output: chunk => {
-                try { mux.addVideoChunk(chunk); } catch { fault(); }
-            }, error: fault});
+                try { mux.addVideoChunk(chunk); } catch { fault('mux_failed'); }
+            }, error: () => fault('encoder_error')});
             encoder.configure(config);
             return {mux, encoder, start};
         }
@@ -47,16 +58,17 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
             if (pendingUpload) throw new Error('upload_backpressure');
             const old = segment;
             segment = undefined;
-            pendingUpload = seal(old, end).catch(err => { fault(); throw err; })
+            pendingUpload = seal(old, end).catch(err => { fault('upload_failed'); throw err; })
                 .finally(() => { pendingUpload = undefined; });
             // Promise is also explicitly joined at Stop.
             pendingUpload.catch(() => {});
         }
-        function fault() {
+        // `cause`: why the recorder stopped itself, for the gate's diagnostics (a code, never a message).
+        function fault(cause) {
             if (!active) return;
             active = false;
             win.clearTimeout(timer);
-            onFault();
+            onFault(cause);
         }
         function sample() {
             if (!active) return;
@@ -80,7 +92,7 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
         }
         function tick() {
             try { sample(); }
-            catch { fault(); return; }
+            catch (err) { fault(/^[a-z_]{1,40}$/.test(err?.message ?? '') ? err.message : 'sample_failed'); return; }
             if (active) timer = win.setTimeout(tick, 1001);
         }
         sample();
@@ -118,7 +130,7 @@ export async function seedFrame(stream,valid,onWaiting) {
     video.srcObject=stream; video.muted=true; video.playsInline=true;
     let encoder;
     try {
-        await video.play();
+        await playWithin(video,8000);
         await new Promise((resolve,reject)=>{
             const timeout=setTimeout(()=>reject(new Error('no_current_frame')),8000);
             video.requestVideoFrameCallback(()=>{clearTimeout(timeout);resolve();});
