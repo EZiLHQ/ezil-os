@@ -105,18 +105,28 @@ CREATE TRIGGER ezil_interview_events_retention_delete BEFORE DELETE ON public.ez
     FOR EACH ROW EXECUTE FUNCTION public.ezil_interview_events_retention_delete();
 
 -- ── An insert is refused unless the interview is `started`, with the two transition exceptions (contract §7.2) ──────
---    consent.accepted only inside registered->consented; interview.finished only inside ->finished; all else started.
+--    consent.accepted only inside registered->consented, as the first event (OS seq 1); interview.finished only
+--    inside ->finished, once, and only for an interview that reached consented; all else started.
 CREATE OR REPLACE FUNCTION public.ezil_interview_events_insert_state() RETURNS trigger
     LANGUAGE plpgsql AS $$
-DECLARE cur text;
+DECLARE cur text; consented timestamptz;
 BEGIN
-    SELECT state INTO cur FROM public.ezil_interviews WHERE interview_id = NEW.interview_id;
+    SELECT state, consented_at INTO cur, consented FROM public.ezil_interviews WHERE interview_id = NEW.interview_id;
     IF cur IS NULL THEN
         RAISE EXCEPTION 'ezil_interview_events insert for unknown interview %', NEW.interview_id;
     ELSIF NEW.type = 'consent.accepted' THEN
         IF cur <> 'consented' THEN RAISE EXCEPTION 'consent.accepted only during registered->consented (state %)', cur; END IF;
+        IF EXISTS (SELECT 1 FROM public.ezil_interview_events WHERE interview_id = NEW.interview_id) THEN
+            RAISE EXCEPTION 'consent.accepted only as the first event of interview %', NEW.interview_id;
+        END IF;
     ELSIF NEW.type = 'interview.finished' THEN
         IF cur <> 'finished' THEN RAISE EXCEPTION 'interview.finished only during ->finished (state %)', cur; END IF;
+        IF consented IS NULL THEN
+            RAISE EXCEPTION 'interview.finished only for an interview that reached consented (%)', NEW.interview_id;
+        END IF;
+        IF EXISTS (SELECT 1 FROM public.ezil_interview_events WHERE interview_id = NEW.interview_id AND type = 'interview.finished') THEN
+            RAISE EXCEPTION 'interview.finished only once for interview %', NEW.interview_id;
+        END IF;
     ELSIF cur <> 'started' THEN
         RAISE EXCEPTION 'event % only while started (state %)', NEW.type, cur;
     END IF;

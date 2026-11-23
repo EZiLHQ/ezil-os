@@ -108,13 +108,19 @@ describe.skipIf(!MODULE)('interview evidence on offline PostgreSQL', () => {
         await expect(rawInsert(reg.interviewId, 92, 'consent.accepted')).rejects.toThrow(/consent\.accepted only during registered->consented \(state registered\)/);
         expect(await countEvents(reg.interviewId)).toBe(0);
 
-        // consented: ordinary events still refused; interview.finished refused (only inside ->finished);
-        // consent.accepted ACCEPTED — the positive control for the registered->consented transition event.
+        // consented: ordinary events still refused; interview.finished refused (only inside ->finished); a second
+        // consent.accepted refused (review N13: only as the first event, OS seq 1, so only by the transition).
         const con = await mk('consented'); // consent.accepted is already seq 1
         await expect(rawInsert(con.interviewId, 90, 'session.heartbeat')).rejects.toThrow(/session\.heartbeat only while started \(state consented\)/);
         await expect(rawInsert(con.interviewId, 92, 'interview.finished')).rejects.toThrow(/interview\.finished only during ->finished \(state consented\)/);
-        await rawInsert(con.interviewId, 91, 'consent.accepted');
-        expect(await countEvents(con.interviewId)).toBe(2);
+        await expect(rawInsert(con.interviewId, 91, 'consent.accepted')).rejects.toThrow(/consent\.accepted only as the first event/);
+        expect(await countEvents(con.interviewId)).toBe(1);
+        // Positive control for the registered->consented transition event: a consented interview with no event yet.
+        const bare = await mk('registered');
+        await db.execute(sql`UPDATE ezil_interviews SET state = 'consented', os_user_id = ${OS_USER}::uuid, ezil_id_subject = ${OWNER},
+            notice_sha256 = ${NOTICE_SHA256}, consented_at = now() WHERE interview_id = ${bare.interviewId}::uuid`);
+        await rawInsert(bare.interviewId, 1, 'consent.accepted');
+        expect(await countEvents(bare.interviewId)).toBe(1);
 
         // started: ordinary events ACCEPTED (positive control); BOTH transition events are refused here.
         const started = await mk('started'); // consent.accepted (1), interview.started (2)
@@ -124,12 +130,22 @@ describe.skipIf(!MODULE)('interview evidence on offline PostgreSQL', () => {
         await expect(rawInsert(started.interviewId, 93, 'interview.finished')).rejects.toThrow(/interview\.finished only during ->finished \(state started\)/);
         expect(await countEvents(started.interviewId)).toBe(4);
 
-        // finished: ordinary events refused; interview.finished ACCEPTED — positive control for the ->finished event.
+        // finished: ordinary events refused; a second interview.finished refused (review N13: once).
         const fin = await mk('finished'); // consent.accepted (1), interview.started (2), interview.finished (3)
         await expect(rawInsert(fin.interviewId, 90, 'session.heartbeat')).rejects.toThrow(/session\.heartbeat only while started \(state finished\)/);
         await expect(rawInsert(fin.interviewId, 91, 'agent.turn_end')).rejects.toThrow(/agent\.turn_end only while started \(state finished\)/);
-        await rawInsert(fin.interviewId, 92, 'interview.finished');
-        expect(await countEvents(fin.interviewId)).toBe(4);
+        await expect(rawInsert(fin.interviewId, 92, 'interview.finished')).rejects.toThrow(/interview\.finished only once/);
+        expect(await countEvents(fin.interviewId)).toBe(3);
+        // An interview finished straight from registered never reached consented: no interview.finished (N13).
+        const never = await mk('registered');
+        expect((await adminFinish(db, { gateOn: true, authz: 'ok', interviewId: never.interviewId, now })).status).toBe(200);
+        await expect(rawInsert(never.interviewId, 1, 'interview.finished')).rejects.toThrow(/interview\.finished only for an interview that reached consented/);
+        expect(await countEvents(never.interviewId)).toBe(0);
+        // Positive control for the ->finished event: a started interview moved to finished with no event yet.
+        const open = await mk('started'); // consent.accepted (1), interview.started (2)
+        await db.execute(sql`UPDATE ezil_interviews SET state = 'finished', finished_at = now() WHERE interview_id = ${open.interviewId}::uuid`);
+        await rawInsert(open.interviewId, 3, 'interview.finished');
+        expect(await countEvents(open.interviewId)).toBe(3);
     });
 
     it('A3: another EZiL ID gets 404 repo_not_found from status and leaves zero rows', async () => {
