@@ -10,6 +10,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,6 +24,7 @@ import {
 	lastUserText,
 	loadContract,
 	main as timelineMain,
+	mapPushRef,
 	MergeError,
 	mergeEvidence,
 	renderMarkdown,
@@ -1120,5 +1122,84 @@ describe("interview.mjs: the gateway operator cookie (review B1)", () => {
 		const help = await run(["--help"]);
 		assert.match(help.stdout, /EZIL_AI_OPERATOR_COOKIE .*__Host-ezil-op/s);
 		assert.match(help.stdout, /sign in again right before finish and export/);
+	});
+});
+
+describe("git.push refs the schema refuses (review N8, erratum E10)", () => {
+	const { schema } = loadContract();
+	const PATTERN = new RegExp(schema.$defs["data:git.push"].properties.ref.pattern);
+	/** E10's decoding: `..` and two uppercase hex digits is one byte; git never puts `..` in a ref. */
+	const unmap = (ref) => {
+		const name = ref.slice("refs/heads/".length);
+		const bytes = [];
+		for (let i = 0; i < name.length;) {
+			if (name.startsWith("..", i) && /^[0-9A-F]{2}$/.test(name.slice(i + 2, i + 4))) { bytes.push(parseInt(name.slice(i + 2, i + 4), 16)); i += 4; }
+			else bytes.push(name.charCodeAt(i++));
+		}
+		return `refs/heads/${Buffer.from(bytes).toString("utf8")}`;
+	};
+
+	test("a ref inside the pattern is unchanged; one outside is escaped byte by byte, reversibly, into the pattern", () => {
+		for (const ref of ["refs/heads/main", "refs/heads/feature/x_y-1.2", `refs/heads/${"a".repeat(240)}`]) assert.equal(mapPushRef(ref, PATTERN), ref);
+		const cases = {
+			"refs/heads/fix#12": "refs/heads/fix..2312",
+			"refs/heads/a+b": "refs/heads/a..2Bb",
+			"refs/heads/café": "refs/heads/caf..C3..A9",
+			"refs/heads/a.#": "refs/heads/a...23",
+			"refs/heads/x@{y}": "refs/heads/x..40..7By..7D",
+			"refs/heads/日本": "refs/heads/..E6..97..A5..E6..9C..AC",
+		};
+		for (const [ref, mapped] of Object.entries(cases)) {
+			assert.equal(PATTERN.test(ref), false, `${ref} is outside the pattern`);
+			assert.equal(mapPushRef(ref, PATTERN), mapped);
+			assert.ok(PATTERN.test(mapped), mapped);
+			assert.equal(unmap(mapped), ref, "decodes back");
+		}
+		assert.equal(new Set(Object.values(cases)).size, Object.keys(cases).length);
+	});
+
+	test("a result still outside the pattern (too long) is the sha256 form; other values pass through", () => {
+		for (const ref of [`refs/heads/${"a".repeat(241)}`, `refs/heads/${"é".repeat(40)}`]) {
+			const mapped = mapPushRef(ref, PATTERN);
+			assert.equal(mapped, `refs/heads/..sha256.${createHash("sha256").update(ref, "utf8").digest("hex")}`);
+			assert.ok(PATTERN.test(mapped));
+		}
+		assert.notEqual(mapPushRef(`refs/heads/${"a".repeat(241)}`, PATTERN), mapPushRef(`refs/heads/${"a".repeat(242)}`, PATTERN));
+		// Not a branch ref, or not a string: left for validation to report.
+		for (const ref of ["refs/tags/v#1", "main", null, 7]) assert.equal(mapPushRef(ref, PATTERN), ref);
+	});
+
+	test("export maps Works' pushed refs before validating, so the timeline is valid; the sources are not mutated", async () => {
+		const split = evidenceFrom(VALID.events, VALID.identity);
+		const works = clone(split.works);
+		const push = works.events.find((e) => e.type === "git.push");
+		assert.ok(push, "the vector has a git.push");
+		push.data.ref = "refs/heads/fix#12";
+		const second = { ...clone(push), seq: works.events.length + 1, data: { ...clone(push.data), ref: "refs/heads/café" } };
+		works.events.push(second);
+		const raw = clone(works);
+		// Negative control: the same events unmapped fail the schema.
+		const unmapped = clone(VALID);
+		unmapped.events.find((e) => e.type === "git.push").data.ref = "refs/heads/fix#12";
+		assert.ok(validateTimeline(unmapped).some((line) => /\.ref: pattern/.test(line)));
+
+		const merged = mergeEvidence({ works, os: split.os, gateway: split.gateway }, { now: () => new Date(VALID.generatedAt) });
+		assert.deepEqual(works, raw, "the Works response is not mutated");
+		assert.deepEqual(merged.events.filter((e) => e.type === "git.push").map((e) => e.data.ref), ["refs/heads/fix..2312", "refs/heads/caf..C3..A9"]);
+		assert.deepEqual(validateTimeline(merged), []);
+
+		const out = join(scratch, "export-refs");
+		const fetch = stubFetch({
+			[`GET ${ORIGIN.works}/v1/ops/qa/interview-repositories/${ID}/evidence`]: { status: 200, body: { ...split.works, events: split.works.events.map((e) => (e.type === "git.push" ? { ...e, data: { ...e.data, ref: "refs/heads/fix#12" } } : e)) } },
+			[`GET ${ORIGIN.os}/api/admin/interviews/${ID}/events`]: { status: 200, body: split.os },
+			[`GET ${ORIGIN.gateway}/v1/admin/interviews/${ID}/events`]: { status: 200, body: split.gateway },
+		});
+		const r = await run(["export", "--interview", ID, "--out", out], { fetch });
+		assert.equal(r.code, 0, r.stderr);
+		assert.match(r.stdout, /timeline valid/);
+		const written = readFileSync(join(out, "timeline.json"), "utf8");
+		assert.equal(JSON.parse(written).events.find((e) => e.type === "git.push").data.ref, "refs/heads/fix..2312");
+		assert.equal(validateFile(written).code, 0, "validate exits 0 on the export");
+		assert.match(readFileSync(join(out, "timeline.md"), "utf8"), /refs\/heads\/fix\.\.2312/);
 	});
 });

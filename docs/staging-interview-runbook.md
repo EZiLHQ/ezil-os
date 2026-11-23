@@ -161,6 +161,11 @@ list of 18 types, the source/type pairing, gapless `seq` per source, ordering, `
 counts and `pushTestRuns === 0`. The `jq` line (acceptance A1) prints `true` only when the export contains all 18
 types; a short dry run (no push, no AI request) legitimately fails it.
 
+A pushed branch name outside `[A-Za-z0-9._/-]` (for example `fix#12` or `café`), or one over 240 characters, appears
+escaped in the timeline (contract erratum E10): `refs/heads/fix..2312`, where each `..XX` is one UTF-8 byte in hex. An
+over-long name appears as `refs/heads/..sha256.<hex>`. The candidate may use any name git accepts. To keep the timeline
+readable, suggest names in `[A-Za-z0-9._/-]`.
+
 Observations are agent turns that overlapped a recorded hidden tab, blurred window or presence idle over 5 minutes.
 They say what was recorded at the same time and nothing about attention; a gap in the record means unknown, not away.
 

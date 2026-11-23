@@ -297,3 +297,17 @@ vectors (`version` 1.0.1) carry the added refusal codes.
   telemetry row's), the same instant `prompt.captured` uses for that request, and the consent window is applied to
   that same instant. `computer.opened` records that the open gate allowed an open; it is written before the mint
   and grant, so a later failure of that open still leaves the event.
+
+## Erratum E10 (2026-11-23, ws1-fixb, after the WS1 review): pushed branch names
+
+- **E10 (§3 `git.push.ref`, §9 merge).** Works records a pushed branch name as git gave it. Git allows names the
+  schema's `ref` pattern `^refs/heads/[A-Za-z0-9._/-]{1,240}$` refuses: `#`, `+`, `@`, non-ASCII, or over 240
+  characters. The CLI's merge maps such a ref, and only such a ref, before it validates. The ref is written as:
+  - `refs/heads/`, then the branch name with each UTF-8 byte outside `[A-Za-z0-9._/-]` replaced by `..` and its two
+    uppercase hex digits. So `fix#12` is `refs/heads/fix..2312` and `café` is `refs/heads/caf..C3..A9`. Git never
+    allows `..` in a ref, so a mapped name cannot equal a pushed one, and each `..XX` decodes back to its byte;
+  - if that is still outside the pattern (too long), `refs/heads/..sha256.` and the lowercase hex sha256 of the
+    original ref's UTF-8 bytes.
+
+  A ref inside the pattern is unchanged. Works, its evidence response, the schema, the vectors and `validate` are
+  unchanged, so a timeline with an unmapped ref is still invalid.

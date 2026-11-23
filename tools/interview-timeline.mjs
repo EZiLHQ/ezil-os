@@ -16,6 +16,7 @@
  * The validator implements exactly the JSON Schema subset that file uses and
  * throws on any other keyword, so schema drift cannot silently pass.
  */
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -288,6 +289,27 @@ export function validateTimeline(timeline) {
 
 export class MergeError extends Error {}
 
+const BRANCH_PREFIX = "refs/heads/";
+const REF_BYTE_OK = /^[A-Za-z0-9._/-]$/;
+
+/**
+ * Erratum E10: Works records a pushed branch name as git gave it, and git allows names the schema's
+ * `git.push.ref` pattern refuses (`#`, `+`, non-ASCII, over 240 characters). Such a ref, and only such a ref, is
+ * mapped into the pattern: each UTF-8 byte of the branch name outside `[A-Za-z0-9._/-]` becomes `..` and its two
+ * uppercase hex digits. Git never allows `..` in a ref, so a mapped name cannot equal a pushed one and decodes
+ * back. A result still outside the pattern (too long) becomes `refs/heads/..sha256.` and the hex sha256 of the ref.
+ */
+export function mapPushRef(ref, pattern) {
+	if (typeof ref !== "string" || !ref.startsWith(BRANCH_PREFIX) || pattern.test(ref)) return ref;
+	let name = "";
+	for (const byte of Buffer.from(ref.slice(BRANCH_PREFIX.length), "utf8")) {
+		const char = String.fromCharCode(byte);
+		name += REF_BYTE_OK.test(char) ? char : `..${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+	}
+	const mapped = `${BRANCH_PREFIX}${name}`;
+	return pattern.test(mapped) ? mapped : `${BRANCH_PREFIX}..sha256.${createHash("sha256").update(ref, "utf8").digest("hex")}`;
+}
+
 /**
  * Merge the three evidence responses into a timeline.
  *
@@ -296,10 +318,11 @@ export class MergeError extends Error {}
  *   gateway: section 8   {v, interviewId, consent, events}, or null when the
  *            gateway has no consent record for the interview (404)
  *
- * Seq numbers are the sources' own and are never reassigned.
+ * Seq numbers are the sources' own and are never reassigned. A `git.push.ref` the
+ * schema refuses is mapped into it (erratum E10, mapPushRef); nothing else changes.
  */
 export function mergeEvidence({ works, os, gateway }, { now = () => new Date() } = {}) {
-	const { vectors } = loadContract();
+	const { schema, vectors } = loadContract();
 	for (const [name, body] of [["works", works], ["os", os]]) {
 		if (!isObject(body) || !Array.isArray(body.events)) throw new MergeError(`${name} evidence response has no events array`);
 	}
@@ -315,7 +338,13 @@ export function mergeEvidence({ works, os, gateway }, { now = () => new Date() }
 	if (gateway?.consent && gateway.consent.authUserId !== os.identity.osUserId) {
 		throw new MergeError("gateway consent authUserId differs from the identity's osUserId");
 	}
-	const events = [...works.events, ...os.events, ...(gateway?.events ?? [])]
+	const refPattern = new RegExp(schema.$defs["data:git.push"].properties.ref.pattern);
+	const worksEvents = works.events.map((e) => {
+		if (!isObject(e) || e.type !== "git.push" || !isObject(e.data)) return e;
+		const ref = mapPushRef(e.data.ref, refPattern);
+		return ref === e.data.ref ? e : { ...e, data: { ...e.data, ref } };
+	});
+	const events = [...worksEvents, ...os.events, ...(gateway?.events ?? [])]
 		.sort(compareEvents);
 	const count = (source) => events.filter((e) => e.source === source).length;
 	return {
