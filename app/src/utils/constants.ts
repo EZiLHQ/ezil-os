@@ -148,7 +148,7 @@ export function safeReturnUrl(value: string | string[] | undefined | null): stri
     // Case 3 — one of this app's return pages: kept byte for byte, query and
     // hash included. The query is data: `path=src/main.ts` keeps its `/`
     // (see `returnUrlFor`) and `%2F` there is ordinary encoding.
-    if (isReturnPath(path) || workReturnAttempt(raw)) return raw;
+    if (isReturnPath(path) || workReturnAttempt(raw) || workReturnAttempt(raw, '/app/assignment-enrollment')) return raw;
     // Case 4 — a rejected `/app` path (`/app`, `/app/`, `/app/unknown`,
     // `/app/Code`, `/app/../x`, `/app/%2e%2e/x`, `/app/code%2fx`,
     // `/app/code/x`): the person was on their way into the OS.

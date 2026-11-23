@@ -1,13 +1,12 @@
 import {createVP8Muxer} from './vp8-webm.js';
 
-// Only called after server receipt + begin. No track, canvas or recorder belongs to a repository iframe.
-export async function encodeTabSegments({win, stream, matches, windowStart, deadline, upload, cutoff, onFault, onFrame, onAwaitFrame}) {
+export async function encodeTabSegments({win, stream, matches, windowStart, deadline, upload, cutoff, onFault, onFrame, onAwaitFrame, firstSequence=0, clockOffset=0}) {
     const video = win.document.createElement('video');
     video.muted = true;
     video.playsInline = true;
     video.srcObject = stream;
-    let active = true, timer, segment, pendingUpload, sequence = 0, last = null, stopped;
-    const wall = Date.now(), mono = win.performance.now();
+    let active = true, timer, segment, pendingUpload, sequence = firstSequence, last = null, stopped;
+    const wall = Date.now()+clockOffset, mono = win.performance.now();
     const time = () => Math.floor(wall + win.performance.now() - mono - windowStart);
     const limit = deadline - windowStart;
     const canvas = win.document.createElement('canvas');
@@ -66,7 +65,7 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
                 || t < 0 || t >= limit || (last !== null && t-last > 2700))
                 throw new Error('source_lost');
             if (last !== null && t-last < 1000) return;
-            if (segment && t-segment.start >= 12000) rotate(t);
+            if (segment && t-segment.start >= (sequence === firstSequence ? 3500 : 11000)) rotate(t);
             if (!segment) segment = open(t);
             if (segment.encoder.encodeQueueSize > 2) throw new Error('encoder_backpressure');
             // Drawing the browser-issued tab track preserves the composited Code, Settings and Browser pixels.
@@ -112,4 +111,34 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
         if (segment?.encoder.state !== 'closed') segment?.encoder.close();
         throw err;
     }
+}
+
+export async function seedFrame(stream,valid,onWaiting) {
+    const video=document.createElement('video');
+    video.srcObject=stream; video.muted=true; video.playsInline=true;
+    let encoder;
+    try {
+        await video.play();
+        await new Promise((resolve,reject)=>{
+            const timeout=setTimeout(()=>reject(new Error('no_current_frame')),8000);
+            video.requestVideoFrameCallback(()=>{clearTimeout(timeout);resolve();});
+            onWaiting();
+        });
+        if (!valid() || !video.videoWidth || !video.videoHeight) throw new Error('source_lost');
+        const scale=Math.min(1,640/video.videoWidth,480/video.videoHeight);
+        const canvas=document.createElement('canvas');
+        canvas.width=Math.max(2,2*Math.floor(video.videoWidth*scale/2)); canvas.height=Math.max(2,2*Math.floor(video.videoHeight*scale/2));
+        const ctx=canvas.getContext('2d',{alpha:false}); ctx.drawImage(video,0,0,canvas.width,canvas.height);
+        const mux=createVP8Muxer(canvas.width,canvas.height);
+        let failed=false;
+        encoder=new VideoEncoder({output(chunk){try{mux.addVideoChunk(chunk);}catch{failed=true;}},error(){failed=true;}});
+        encoder.configure({codec:'vp8',width:canvas.width,height:canvas.height,bitrate:450000,framerate:1,latencyMode:'realtime'});
+        const frame=new VideoFrame(canvas,{timestamp:0});
+        try{encoder.encode(frame,{keyFrame:true});}finally{frame.close();}
+        await encoder.flush();
+        if(failed || !valid()) throw new Error('source_lost');
+        const bytes=mux.finalize(1);
+        if (!bytes.byteLength || bytes.byteLength>1024*1024) throw new Error('invalid_seed');
+        return bytes;
+    } finally { if(encoder && encoder.state!=='closed')encoder.close();video.pause();video.srcObject=null; }
 }

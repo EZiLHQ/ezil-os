@@ -1,5 +1,6 @@
 // The browser owns the selection. A distinct, random handle binds it to this particular document.
 export const STAGING_OS = 'https://os-staging.ezil.work';
+const currentHandles=new WeakMap();
 const options = {
     audio: false,
     video: {displaySurface: 'browser', cursor: 'always', frameRate: {ideal: 1, max: 1}},
@@ -23,11 +24,15 @@ export function currentTabPicker(win) {
         throw new Error('unsupported');
     const handle = win.crypto.randomUUID();
     devices.setCaptureHandleConfig({exposeOrigin:true, handle, permittedOrigins:[STAGING_OS]});
+    currentHandles.set(win,handle);
     let closed = false;
     function dispose() {
         if (closed) return;
         closed = true;
-        devices.setCaptureHandleConfig({exposeOrigin:false, handle:'', permittedOrigins:[]});
+        if(currentHandles.get(win)===handle){
+            currentHandles.delete(win);
+            devices.setCaptureHandleConfig({exposeOrigin:false, handle:'', permittedOrigins:[]});
+        }
     }
     // Call without an intervening await from the participant's trusted button click.
     async function choose() {

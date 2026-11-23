@@ -318,7 +318,12 @@ function projectReturnUrl (project) {
     const params = project.repoUrl ? [['repo', project.repoUrl]] : [['project', project.projectId], ['repo', project.repoId]];
     if ( project.path ) params.push(['path', project.path]);
     try {
-        const computers = new URLSearchParams(window.location.search).getAll('computer');
+        const query = new URLSearchParams(window.location.search);
+        const assignment = query.get('assignment');
+        if (assignment && query.get('repo') === project.repoUrl && project.repoUrl?.endsWith('-a-'+assignment+'.git')
+            && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(assignment))
+            params.push(['assignment',assignment]);
+        const computers = query.getAll('computer');
         if ( computers.length === 1 ) params.push(['computer', computers[0]]);
     } catch { /* no page computer */ }
     return appUrl('code', params);

@@ -2,8 +2,8 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const codeRepo = /^https:\/\/github\.ezil\.work\/default\/u-[0-9a-f]{16}-a-([0-9a-f-]{36})\.git$/;
 export const workReturnPath = '/assignment/work-return';
 
-export function workReturnAttempt(destination: string): string | null {
-    const prefix = workReturnPath + '?attempt=';
+export function workReturnAttempt(destination: string, path: typeof workReturnPath | '/app/assignment-enrollment' = workReturnPath): string | null {
+    const prefix = path + '?attempt=';
     if (!destination.startsWith(prefix)) return null;
     const attempt = destination.slice(prefix.length);
     return uuid.test(attempt) && attempt.length === 36 ? attempt : null;

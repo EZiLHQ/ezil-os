@@ -5,7 +5,7 @@ const id='2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a';
 const repo='https://github.ezil.work/default/u-0123456789abcdef-a-'+id+'.git';
 class Element{
     children=[];hidden=false;isConnected=true;
-    setAttribute(){} append(...children){this.children.push(...children);} querySelector(){return null;}
+    setAttribute(name,value){this[name]=value;} append(...children){this.children.push(...children);} querySelector(){return null;}
     remove(){this.isConnected=false;}
 }
 function fixture(url,project,who='owner'){
@@ -35,59 +35,45 @@ test('ordinary repository continues through the normal Code launch without media
     const f=fixture('https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(ordinary),{repoUrl:ordinary});
     await Promise.resolve();assert.equal(f.gate,null);assert.deepEqual(f.counts(),[1,0]);assert.deepEqual(f.locks,[]);
 });
-test('a share stopped during private checkout cannot later call begin or unlock the editor',async(t)=>{
-    const protocol='ezil.assignment.work/v2', universe='https://universe-staging.ezil.work';
-    const phase='2d5fd5d2-ad3e-47ea-9a95-60eb51bce329', replies=[], actions=[];
-    const requests=[];
+test('embedded OS never activates even a valid canonical assignment',async(t)=>{
+    const fetch=t.mock.method(globalThis,'fetch',async()=>{throw Error('unexpected network');});
+    const f=fixture('https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id,{repoUrl:repo});
+    await new Promise(r=>setImmediate(r));
+    assert.equal(f.gate.locked(),true);assert.equal(fetch.mock.callCount(),0);assert.deepEqual(f.counts(),[0,0]);
+    await f.gate.close();
+});
+test('the native Stop during a delayed private checkout cannot later start media or release Code',async(t)=>{
+    const requests=[],elements=[];
     t.mock.method(globalThis,'fetch',async(_path,options)=>{
         const body=JSON.parse(options.body);requests.push(body.action);
         return Response.json({status:'eligible',attemptId:id,repositoryUrl:repo,expiresAt:new Date(Date.now()+60000).toISOString()});
     });
-    let message,completeCheckout,preparing,opened=0;
-    const checkoutStarted=new Promise(resolve=>{preparing=resolve;});
-    const checkout=new Promise(resolve=>{completeCheckout=resolve;});
-    const top={postMessage(data){actions.push(data.type);}};
-    const win={location:new URL('https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id),
-        top,parent:top,addEventListener(type,fn){if(type==='message')message=fn;},removeEventListener(){}};
-    Object.assign(globalThis,{window:win,document:{createElement:()=>new Element()}});
-    const gate=openWithAssignmentConsent({project:{repoUrl:repo},computerId:'fixture',actor:()=>'owner',body:new Element(),
-        park(){},open(){opened++;},prepare(){preparing();return checkout;}});
-    const port={postMessage(data){replies.push(data);},start(){},close(){}};
-    const discover={source:top,origin:universe,data:{type:'discover',protocol,challenge:phase,attemptId:id}};
+    let handle,resolveCheckout,releasePreparing,opened=0;
+    const preparing=new Promise(r=>releasePreparing=r);
+    const checkout=new Promise(r=>resolveCheckout=r);
+    class Track{
+        readyState='live';muted=false;listeners={};
+        getCaptureHandle(){return {origin:'https://os-staging.ezil.work',handle};}
+        getSettings(){return {displaySurface:'browser'};}
+        addEventListener(n,f){this.listeners[n]=f;} stop(){this.readyState='ended';}
+    }
+    const track=new Track(),stream={getTracks:()=>[track],getVideoTracks:()=>[track],getAudioTracks:()=>[]};
+    const body=new Element(),doc={body,createElement(tag){const e=new Element();e.tag=tag;elements.push(e);return e;}};
+    const win={location:new URL('https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id),crypto:globalThis.crypto,
+        isSecureContext:true,document:doc,addEventListener(){},removeEventListener(){},MediaStreamTrack:Track,VideoFrame:class{},VideoEncoder:class{},
+        navigator:{mediaDevices:{setCaptureHandleConfig(config){handle=config.handle;},getDisplayMedia:async()=>stream}}};
+    win.top=win;win.parent=win;Object.assign(globalThis,{window:win,document:doc});
+    const gate=openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>'owner',computerId:'fixture',body:new Element(),
+        park(){},open(){opened++;},prepare(){releasePreparing();return checkout;}});
     try{
-        await new Promise(resolve=>setImmediate(resolve));message(discover);
-        assert.deepEqual(actions,['available']);
-        message({...discover,data:{...discover.data,type:'bind'},ports:[port]});
-        const data={protocol,attemptId:id,captureSessionId:phase};
-        port.onmessage({data:{...data,type:'request',method:'begin',id:1,consentVersion:4}});
-        await checkoutStarted;
-        port.onmessage({data:{...data,type:'lock'}});
-        const workspaceFolder='/workspace',checkoutFolder=workspaceFolder+'/'+repo.split('/').at(-1).slice(0,-4);
-        completeCheckout({ok:true,repository:{id:'test',workspaceFolder,checkoutFolder},assignmentOpen:{attemptId:id,proof:'x'.repeat(60)}});
-        await new Promise(resolve=>setImmediate(resolve));
-        assert.equal(replies.find(v=>v.id===1)?.ok,false);
-        assert.deepEqual(requests,['preflight']);assert.equal(opened,0);
-        assert.equal(gate.access(),null);assert.equal(gate.locked(),true);
-    }finally{await gate.close();}
-});
-test('an expired embedded OS session replies only to the exact Universe discovery without offering a port or Code',async(t)=>{
-    const universe='https://universe-staging.ezil.work', protocol='ezil.assignment.work/v2', replies=[];
-    t.mock.method(globalThis,'fetch',async()=>Response.json({error:{code:'UNAUTHORIZED',reason:'session_missing'}},{status:401}));
-    const top={postMessage(data,origin){replies.push({data,origin});}};
-    let handle,opens=0;
-    const win={top,parent:top,location:new URL('https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id),
-        addEventListener(type,fn){if(type==='message')handle=fn;},removeEventListener(){}};
-    Object.assign(globalThis,{window:win,document:{createElement:()=>new Element()}});
-    const gate=openWithAssignmentConsent({project:{repoUrl:repo},computerId:'fixture',actor:()=>'owner',
-        body:new Element(),park(){},open(){opens++;},prepare(){throw Error('unexpected prepare');}});
-    const data={protocol,type:'discover',challenge:id,attemptId:id};
-    try {
         await new Promise(r=>setImmediate(r));
-        handle({origin:'https://evil.example',source:top,data});handle({origin:universe,source:{},data});
-        handle({origin:universe,source:top,data:{...data,attemptId:'wrong'}});
-        assert.equal(replies.length,0);
-        handle({origin:universe,source:top,data});
-        assert.deepEqual(replies,[{origin:universe,data:{...data,type:'authentication_required'}}]);
-        assert.equal(gate.access(),null);assert.equal(gate.locked(),true);assert.equal(opens,0);
+        const button=elements.find(e=>e.textContent==='Share this OS tab and open assignment');
+        assert.ok(button);button.onclick({isTrusted:false});await Promise.resolve();assert.deepEqual(requests,['preflight']);
+        button.onclick({isTrusted:true});await preparing;
+        track.listeners.ended();assert.equal(gate.locked(),true);
+        const workspaceFolder='/workspace',checkoutFolder=workspaceFolder+'/'+repo.split('/').at(-1).slice(0,-4);
+        resolveCheckout({ok:true,repository:{id:'test',workspaceFolder,checkoutFolder},assignmentOpen:{attemptId:id,proof:'x'.repeat(60)}});
+        await new Promise(r=>setImmediate(r));
+        assert.equal(track.readyState,'ended');assert.deepEqual(requests,['preflight']);assert.equal(opened,0);assert.equal(gate.access(),null);
     }finally{await gate.close();}
 });
