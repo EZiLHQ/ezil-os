@@ -1,4 +1,4 @@
-import { repoOpenRemotesFor, type RepoOpenExec, type RepoOpenRequest } from './repo-open';
+import { OS_PRODUCTION_AI_GATEWAY_ORIGIN, repoOpenRemotesFor, type RepoOpenExec, type RepoOpenRequest } from './repo-open';
 import { ASSIGNMENT_PRELOAD_B64 } from './repo-open-runtime.generated';
 
 export const ASSIGNMENT_PRELOAD_PORT = 5679;
@@ -34,12 +34,17 @@ async function sha256(input: string): Promise<string> {
 
 /** Call only after the normal sandbox-bound, signed v2 route authenticates the request bytes. */
 export async function authorizeAssignmentPreload(
-  input: unknown, request: RepoOpenRequest, env: { EZIL_AI_GATEWAY_URL?: unknown },
+  input: unknown, request: RepoOpenRequest, env: { EZIL_AI_GATEWAY_URL?: unknown; EZIL_PRODUCTION_ASSIGNMENT_PRELOAD?: string }, controlOrigin: string,
 ): Promise<{ witness: AssignmentPreloadWitness; nonce: string } | null> {
   const packet = request.privatePacket;
+  const enabled = env.EZIL_PRODUCTION_ASSIGNMENT_PRELOAD === '1'
+    ? controlOrigin === 'https://api-desktop.ezil.org' &&
+      (env.EZIL_AI_GATEWAY_URL === OS_PRODUCTION_AI_GATEWAY_ORIGIN ||
+       env.EZIL_AI_GATEWAY_URL === OS_PRODUCTION_AI_GATEWAY_ORIGIN + '/')
+    : repoOpenRemotesFor(env).stagingGitQa === true;
   if (!input || typeof input !== 'object' || Array.isArray(input)
     || Object.keys(input).sort().join(',') !== 'attemptId,eventId,manifestSha256,nonce'
-    || !repoOpenRemotesFor(env).stagingGitQa || !packet || packet.git.scope !== 'write'
+    || !enabled || !packet || packet.git.scope !== 'write'
     || request.refreshOnly || request.ref !== 'refs/heads/main') return null;
 
   const { eventId, attemptId, nonce, manifestSha256 } = input as Record<string, unknown>;

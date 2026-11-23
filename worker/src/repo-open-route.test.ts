@@ -280,6 +280,23 @@ describe('staging assignment repo-open preload', () => {
     expect(JSON.stringify(calls[0]?.preload)).not.toContain(nonce);
   });
 
+  it('production opt-in binds the authenticated control host, production gateway and canonical owner packet', async () => {
+    const worker = await loadWorker();
+    const production = { EZIL_AI_GATEWAY_URL: 'https://ai.ezil.work', EZIL_PRODUCTION_ASSIGNMENT_PRELOAD: '1' };
+    const desk = 'https://api-desktop.ezil.org';
+    for (const [settings, origin, allowed] of [
+      [production, desk, true], [{ ...production, EZIL_PRODUCTION_ASSIGNMENT_PRELOAD:'0' }, desk, false],
+      [{ ...production, EZIL_AI_GATEWAY_URL:'https://ai-staging.ezil.work' }, desk, false],
+      [production, 'https://api-desktop-staging.ezil.work', false],
+    ] as const) {
+      const { binding, calls } = fakeNamespace({ ok:true, folder, checkoutFolder, status:'cloned', assignmentPreloadAcknowledged:true });
+      const res = await worker.fetch(await signed({ signBody:body(), url:origin + PATH }), env(binding,settings));
+      const response = await res.json() as { assignmentPreload?: unknown };
+      expect(!!response.assignmentPreload).toBe(allowed);
+      expect(!!calls[0]?.preload).toBe(allowed);
+    }
+  });
+
   it('keeps Code open when the runtime has no loopback ack; no inferred receipt from a repo or a port', async () => {
     const worker = await loadWorker();
     const { binding, calls } = fakeNamespace({ ok: true, folder, status: 'fetched' });

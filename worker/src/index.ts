@@ -125,6 +125,7 @@ import { WORKER_DESKTOP_READY_TIMEOUT_MS } from './preview-timeouts';
 export { ContainerProxy } from '@cloudflare/sandbox';
 
 interface Env extends SandboxEnv {
+  EZIL_PRODUCTION_ASSIGNMENT_PRELOAD?: string;
   /** Approved bare preview zone; unset preserves production's ezil.org routing. */
   SANDBOX_PREVIEW_ZONE_ROOT?: string;
   /** AWS computers (GW-4): routing and the tunnel API are off unless this is 1/true/on. */
@@ -5643,7 +5644,7 @@ async function handleRepoOpen(request: Request, env: Env, sandboxName: string): 
   if (!root) {
     return json({ ok: false, error: 'repo_open_workspace_unavailable' }, repoOpenStatus('repo_open_workspace_unavailable'));
   }
-  const assignment = await authorizeAssignmentPreload(preload, parsed.request, env);
+  const assignment = await authorizeAssignmentPreload(preload, parsed.request, env, new URL(request.url).origin);
   let answer: RepoOpenAnswer;
   try {
     // The subject binds this computer's push access for the repository to the v2 claims' user (`./repo-grant.ts`).
