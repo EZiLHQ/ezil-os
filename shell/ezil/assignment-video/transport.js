@@ -1,14 +1,16 @@
-// Same-origin control for the participant-selected top-level OS tab. The opened checkout receives no control capability.
+// Same-origin OS control for the participant-selected Universe work tab. The opened checkout receives no control capability.
 const path = '/api/shell/assignment-video';
 const bucket = 'https://ezil-universe-staging-assignment-media-452630323510-aps1.s3.ap-south-1.amazonaws.com';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const failure = (code) => Object.assign(new Error(code), {code});
 
 async function callControl(attemptId, action, fields, fetcher) {
-    const response = await fetcher(path, {method: 'POST', credentials: 'same-origin', cache: 'no-store',
+    let response;
+    try { response = await fetcher(path, {method: 'POST', credentials: 'same-origin', cache: 'no-store',
         redirect: 'error', signal: AbortSignal.timeout(18000),
         headers: {'Content-Type':'application/json', 'X-Ezil-Assignment-Video':'1'},
-        body: JSON.stringify({action,attemptId,...fields})});
+        body: JSON.stringify({action,attemptId,...fields})}); }
+    catch {throw failure('media_unavailable');}
     let data;
     try { data = await response.json(); } catch { throw failure('recording_unavailable'); }
     if (!response.ok) {
@@ -73,7 +75,7 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
             || (recording && recording.recordingId !== data.recordingId)) throw failure('recording_changed');
         recording = data;
         clearTimers();
-        expiry = setTimeout(() => stop('timeout', data.deadlineAt), Math.min(3600000, deadline-clock()));
+        expiry = setTimeout(() => stop(provisional?'unavailable':'timeout', data.deadlineAt), Math.min(3600000, deadline-clock()));
         poll = setTimeout(watch, pollMs);
         return data;
     }
@@ -91,18 +93,20 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         if (address.origin !== bucket || address.username || address.password || address.hash
             || !address.pathname.endsWith('/'+attemptId+'/'+recording.recordingId+'/segments/'+sequence+'/'+sha256+'.webm'))
             throw failure('invalid_upload_target');
-        const put = await fetcher(address.href, {method:'PUT', credentials:'omit', redirect:'error', referrerPolicy:'no-referrer',
-            cache:'no-store', signal:AbortSignal.timeout(30000), headers:signed.headers, body:blob});
+        let put;
+        try{put = await fetcher(address.href, {method:'PUT', credentials:'omit', redirect:'error', referrerPolicy:'no-referrer',
+            cache:'no-store', signal:AbortSignal.timeout(30000), headers:signed.headers, body:blob});}catch{throw failure('upload_failed');}
         // A retried conditional PUT may report precondition failure after the first succeeded. Confirm authenticates its bytes.
         if (!put.ok && put.status !== 412) throw failure('upload_failed');
         const result = await control('confirm', {sequence});
         if (!result.confirmed || result.recordingId !== recording.recordingId || result.sequence !== sequence)
             throw failure('upload_unconfirmed');
         if (result.phaseReady && captureSessionId && result.captureSessionId === captureSessionId) {
-            const end = Date.parse(result.deadlineAt);
-            if (!Number.isFinite(end) || end <= clock() || end-clock() > 3600000+1500) throw failure('recording_changed');
+            const end=Date.parse(result.deadlineAt),serverNow=Date.parse(result.serverNow);
+            const remaining=end-(Number.isFinite(serverNow)?serverNow:clock());
+            if (!Number.isFinite(end) || remaining<=0 || remaining>3600000+1500) throw failure('recording_changed');
             recording={...recording,startedAt:result.startedAt,deadlineAt:result.deadlineAt};
-            clearTimeout(expiry); expiry=setTimeout(()=>stop('timeout',recording.deadlineAt),end-clock());
+            clearTimeout(expiry); expiry=setTimeout(()=>stop('timeout',recording.deadlineAt),remaining);
         }
         return result;
     }

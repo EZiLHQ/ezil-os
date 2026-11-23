@@ -85,7 +85,7 @@ export function openWithAssignmentConsent({project,computerId,actor,open,body,pa
             port=ev.ports[0];port.onmessage=onPort;port.start();send('ready');challenge=null;
         }
     }
-    function assertActive(id,drain=false){if(!(drain?sameOwner():valid())||!active||active.id!==id||active.ending)throw failure('recording_phase_changed');return active;}
+    function assertActive(id,drain=false){if(!(drain?sameOwner():valid())||!active||active.id!==id||active.ending||(!drain && active.shareEnded))throw failure('recording_phase_changed');return active;}
     function startIdleWatch(){
         clearInterval(watch);pulseAt=Date.now();watch=setInterval(()=>{
             if(!active||active.ending)return;
@@ -129,7 +129,7 @@ export function openWithAssignmentConsent({project,computerId,actor,open,body,pa
                 throw failure('assigned_checkout_unverified');
             item.proof=proof.proof;item.meta=meta;
             item.transport=createAssignmentVideoTransport({attemptId,repoOpenProof:proof.proof,captureSessionId:item.id,consentVersion:4,
-                onStop:(reason,effectiveAt)=>{if(active!==item)return;lock();send('pause',{reason,effectiveAt});}});
+                onStop:(reason,effectiveAt)=>{if(active!==item)return;item.shareEnded=true;item.allowMint=false;lock();item.onWorkbench?.reject(failure('workspace_locked'));send('pause',{reason,effectiveAt});}});
             item.grant=await retry(()=>item.transport.begin(),['media_unavailable','workspace_timeout'],2);
             assertActive(item.id);
             if(item.grant.captureSessionId!==item.id||item.grant.status!=='awaiting_frame')throw failure('recording_phase_changed');
@@ -170,7 +170,7 @@ export function openWithAssignmentConsent({project,computerId,actor,open,body,pa
         const d=ev.data;
         if(d?.protocol!==protocol||d.attemptId!==attemptId)return;
         if(d.type==='pulse'){if(active?.id===d.captureSessionId)pulseAt=Date.now();return;}
-        if(d.type==='lock'&&active?.id===d.captureSessionId){lock();active.allowMint=false;active.onWorkbench?.reject(failure('workspace_locked'));return;}
+        if(d.type==='lock'&&active?.id===d.captureSessionId){active.shareEnded=true;active.allowMint=false;lock();active.onWorkbench?.reject(failure('workspace_locked'));return;}
         if(d.type==='cancel'&&active?.id===d.captureSessionId){void end(active,'connection_lost',active.expected).catch(()=>{});return;}
         if(d.type!=='request'||!Number.isSafeInteger(d.id)||d.id<=0)return;
         const run=async()=>{

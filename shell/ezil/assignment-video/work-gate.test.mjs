@@ -33,3 +33,38 @@ test('ordinary repository continues through the normal Code launch without media
     const f=fixture('https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(ordinary),{repoUrl:ordinary});
     await Promise.resolve();assert.equal(f.gate,null);assert.deepEqual(f.counts(),[1,0]);assert.deepEqual(f.locks,[]);
 });
+test('a share stopped during private checkout cannot later call begin or unlock the editor',async(t)=>{
+    const protocol='ezil.assignment.work/v2', universe='https://universe-staging.ezil.work';
+    const phase='2d5fd5d2-ad3e-47ea-9a95-60eb51bce329', replies=[], actions=[];
+    const requests=[];
+    t.mock.method(globalThis,'fetch',async(_path,options)=>{
+        const body=JSON.parse(options.body);requests.push(body.action);
+        return Response.json({status:'eligible',attemptId:id,repositoryUrl:repo,expiresAt:new Date(Date.now()+60000).toISOString()});
+    });
+    let message,completeCheckout,preparing,opened=0;
+    const checkoutStarted=new Promise(resolve=>{preparing=resolve;});
+    const checkout=new Promise(resolve=>{completeCheckout=resolve;});
+    const top={postMessage(data){actions.push(data.type);}};
+    const win={location:new URL('https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id),
+        top,parent:top,addEventListener(type,fn){if(type==='message')message=fn;},removeEventListener(){}};
+    Object.assign(globalThis,{window:win,document:{createElement:()=>new Element()}});
+    const gate=openWithAssignmentConsent({project:{repoUrl:repo},computerId:'fixture',actor:()=>'owner',body:new Element(),
+        park(){},open(){opened++;},prepare(){preparing();return checkout;}});
+    const port={postMessage(data){replies.push(data);},start(){},close(){}};
+    const discover={source:top,origin:universe,data:{type:'discover',protocol,challenge:phase,attemptId:id}};
+    try{
+        await new Promise(resolve=>setImmediate(resolve));message(discover);
+        assert.deepEqual(actions,['available']);
+        message({...discover,data:{...discover.data,type:'bind'},ports:[port]});
+        const data={protocol,attemptId:id,captureSessionId:phase};
+        port.onmessage({data:{...data,type:'request',method:'begin',id:1,consentVersion:4}});
+        await checkoutStarted;
+        port.onmessage({data:{...data,type:'lock'}});
+        const workspaceFolder='/workspace',checkoutFolder=workspaceFolder+'/'+repo.split('/').at(-1).slice(0,-4);
+        completeCheckout({ok:true,repository:{id:'test',workspaceFolder,checkoutFolder},assignmentOpen:{attemptId:id,proof:'x'.repeat(60)}});
+        await new Promise(resolve=>setImmediate(resolve));
+        assert.equal(replies.find(v=>v.id===1)?.ok,false);
+        assert.deepEqual(requests,['preflight']);assert.equal(opened,0);
+        assert.equal(gate.access(),null);assert.equal(gate.locked(),true);
+    }finally{await gate.close();}
+});
