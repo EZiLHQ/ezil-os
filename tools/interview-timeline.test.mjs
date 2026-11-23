@@ -806,45 +806,103 @@ describe("interview.mjs start", () => {
 });
 
 describe("interview.mjs finish", () => {
+	const osStatus = `GET ${ORIGIN.os}/api/admin/interviews/${ID}`;
+	const gatewayEvents = `GET ${ORIGIN.gateway}/v1/admin/interviews/${ID}/events`;
+	const worksEvidence = `GET ${ORIGIN.works}/v1/ops/qa/interview-repositories/${ID}/evidence`;
+	const preflight = [osStatus, gatewayEvents, worksEvidence];
 	const osFinish = `POST ${ORIGIN.os}/api/admin/interviews/${ID}/finish`;
 	const revoke = `POST ${ORIGIN.gateway}/v1/admin/interview-capture-consents/${ID}/revoke`;
 	const worksFinish = `POST ${ORIGIN.works}/v1/ops/qa/interview-repositories/${ID}/finish`;
+	const split = evidenceFrom(VALID.events, VALID.identity);
 	const routes = () => ({
+		[osStatus]: { status: 200, body: { ...IDENTITY_CONSENTED, state: "started" } },
+		[gatewayEvents]: { status: 200, body: split.gateway },
+		[worksEvidence]: { status: 200, body: split.works },
 		[osFinish]: { status: 200, body: { state: "finished" } },
 		[revoke]: { status: 200, body: { revokedAt: "2026-11-22T09:45:01.000Z" } },
 		[worksFinish]: { status: 200, body: { frozenAt: "2026-11-22T09:45:02.000Z" } },
 	});
+	const writes = (fetch) => fetch.calls.filter((c) => c.method !== "GET").map((c) => c.key);
 
-	test("runs OS finish, gateway revoke, Works finish in that order, and is safe to repeat", async () => {
+	test("proves all three credentials read-only, then runs OS finish, gateway revoke, Works finish in that order, and is safe to repeat", async () => {
 		for (let pass = 1; pass <= 2; pass++) {
 			const fetch = stubFetch(routes());
 			const r = await run(["finish", "--interview", ID], { fetch });
 			assert.equal(r.code, 0, `pass ${pass}: ${r.stderr}`);
-			assert.deepEqual(fetch.calls.map((c) => c.key), [osFinish, revoke, worksFinish]);
-			assert.ok(fetch.calls[1].body.reason.length > 0);
-			assert.ok(fetch.calls[1].headers["idempotency-key"]);
+			assert.deepEqual(fetch.calls.map((c) => c.key), [...preflight, osFinish, revoke, worksFinish]);
+			assert.ok(fetch.calls[4].body.reason.length > 0);
+			assert.ok(fetch.calls[4].headers["idempotency-key"]);
+			assert.match(r.stdout, /preflight: works, os and gateway credentials accepted/);
 			assert.match(r.stdout, /works: repository frozen at 2026-11-22T09:45:02\.000Z/);
 		}
 	});
 
-	test("no gateway consent (404 not_found) is not an error; Works finish still runs", async () => {
-		const r = stubFetch({ ...routes(), [revoke]: { status: 404, body: { error: { code: "not_found" } } } });
+	test("no gateway consent (404 not_found) passes the preflight and is not an error; Works finish still runs", async () => {
+		const notFound = { status: 404, body: { error: { code: "not_found" } } };
+		const r = stubFetch({ ...routes(), [gatewayEvents]: notFound, [revoke]: notFound });
 		const out = await run(["finish", "--interview", ID], { fetch: r });
 		assert.equal(out.code, 0, out.stderr);
 		assert.match(out.stdout, /gateway: no consent to revoke/);
-		assert.deepEqual(r.calls.map((c) => c.key), [osFinish, revoke, worksFinish]);
+		assert.deepEqual(r.calls.map((c) => c.key), [...preflight, osFinish, revoke, worksFinish]);
 	});
 
-	test("a failing step stops the later steps (OS failure: no revoke, no Works finish)", async () => {
-		const fetch = stubFetch({ ...routes(), [osFinish]: { status: 404, body: { error: { code: "not_found" } } } });
+	test("review N1: an expired operator session is refused by the preflight, before OS finish or anything else is written", async () => {
+		// The stub gateway knows only COOKIE's session, so another value is the 401 an expired session gets.
+		const fetch = stubFetch(routes());
+		const r = await run(["finish", "--interview", ID], { env: { ...ENV, EZIL_AI_OPERATOR_COOKIE: "__Host-ezil-op=expired-session" }, fetch });
+		assert.equal(r.code, 1);
+		assert.deepEqual(fetch.calls.map((c) => c.key), preflight, "only the three reads ran");
+		assert.deepEqual(writes(fetch), []);
+		assert.match(r.stderr, /finish preflight: refused by gateway 401 invalid_operator_session \(EZIL_AI_OPERATOR_COOKIE\); nothing was finished/);
+	});
+
+	test("the preflight names every refused credential, not only the first", async () => {
+		const expired = { status: 401, body: { error: { code: "unauthorized" } } };
+		const fetch = stubFetch({ ...routes(), [osStatus]: expired, [worksEvidence]: expired });
+		const r = await run(["finish", "--interview", ID], { env: { ...ENV, EZIL_AI_OPERATOR_COOKIE: "__Host-ezil-op=expired-session" }, fetch });
+		assert.equal(r.code, 1);
+		assert.deepEqual(writes(fetch), []);
+		assert.match(r.stderr, /refused by os 401 unauthorized \(EZIL_OS_ADMIN_TOKEN\), gateway 401 invalid_operator_session \(EZIL_AI_OPERATOR_COOKIE\), works 401 unauthorized \(EZIL_WORKS_QA_TOKEN\)/);
+		// A gateway 404 other than not_found is not taken as proof.
+		const other = stubFetch({ ...routes(), [gatewayEvents]: { status: 404, body: { error: { code: "route_missing" } } } });
+		const o = await run(["finish", "--interview", ID], { fetch: other });
+		assert.equal(o.code, 1);
+		assert.deepEqual(writes(other), []);
+	});
+
+	test("an OS finish failure stops before the revoke and the Works finish", async () => {
+		const fetch = stubFetch({ ...routes(), [osFinish]: { status: 409, body: { error: { code: "interview_state" } } } });
 		const out = await run(["finish", "--interview", ID], { fetch });
 		assert.equal(out.code, 1);
-		assert.match(out.stderr, /os finish: refused 404 not_found/);
-		assert.deepEqual(fetch.calls.map((c) => c.key), [osFinish]);
-		const forbidden = stubFetch({ ...routes(), [revoke]: { status: 403, body: { error: { code: "forbidden" } } } });
-		const f = await run(["finish", "--interview", ID], { fetch: forbidden });
-		assert.equal(f.code, 1);
-		assert.deepEqual(forbidden.calls.map((c) => c.key), [osFinish, revoke]);
+		assert.match(out.stderr, /os finish: refused 409 interview_state/);
+		assert.deepEqual(writes(fetch), [osFinish]);
+	});
+
+	test("review N1: after OS finish, a refused revoke still freezes Works, and each outcome is reported", async () => {
+		// The session expires between the preflight and the revoke.
+		const fetch = stubFetch({ ...routes(), [revoke]: { status: 401, body: { error: { code: "invalid_operator_session" } } } });
+		const r = await run(["finish", "--interview", ID], { fetch });
+		assert.equal(r.code, 1);
+		assert.deepEqual(writes(fetch), [osFinish, revoke, worksFinish]);
+		assert.match(r.stdout, /os: finished/);
+		assert.match(r.stderr, /gateway revoke: refused 401 invalid_operator_session/);
+		assert.match(r.stdout, /works: repository frozen at 2026-11-22T09:45:02\.000Z/);
+		assert.match(r.stderr, /finish incomplete: gateway revoke failed; every step is idempotent, so rerun finish/);
+	});
+
+	test("review N1: a refused Works finish after the revoke is reported too; both failing names both", async () => {
+		const unavailable = { status: 503, body: { error: { code: "unavailable" } } };
+		const fetch = stubFetch({ ...routes(), [worksFinish]: unavailable });
+		const r = await run(["finish", "--interview", ID], { fetch });
+		assert.equal(r.code, 1);
+		assert.match(r.stdout, /gateway: consent revoked/);
+		assert.match(r.stderr, /works finish: refused 503 unavailable/);
+		assert.match(r.stderr, /finish incomplete: works finish failed/);
+		const both = stubFetch({ ...routes(), [revoke]: unavailable, [worksFinish]: unavailable });
+		const b = await run(["finish", "--interview", ID], { fetch: both });
+		assert.equal(b.code, 1);
+		assert.deepEqual(writes(both), [osFinish, revoke, worksFinish]);
+		assert.match(b.stderr, /finish incomplete: gateway revoke and works finish failed/);
 	});
 });
 
@@ -913,7 +971,15 @@ describe("interview.mjs credentials", () => {
 				[`POST ${ORIGIN.os}/api/admin/interviews`]: { status: 201, body: {} },
 			}],
 			[["start", "--interview", ID], { [`GET ${ORIGIN.os}/api/admin/interviews/${ID}`]: echo(OS_TOKEN) }],
-			[["finish", "--interview", ID], { [`POST ${ORIGIN.os}/api/admin/interviews/${ID}/finish`]: { status: 200, body: {} }, [`POST ${ORIGIN.gateway}/v1/admin/interview-capture-consents/${ID}/revoke`]: echo(COOKIE) }],
+			// finish, past the preflight, ending in a revoke refusal that echoes every credential.
+			[["finish", "--interview", ID], {
+				[`GET ${ORIGIN.os}/api/admin/interviews/${ID}`]: { status: 200, body: IDENTITY_CONSENTED },
+				[`GET ${ORIGIN.gateway}/v1/admin/interviews/${ID}/events`]: { status: 200, body: split.gateway },
+				[`GET ${ORIGIN.works}/v1/ops/qa/interview-repositories/${ID}/evidence`]: { status: 200, body: split.works },
+				[`POST ${ORIGIN.os}/api/admin/interviews/${ID}/finish`]: { status: 200, body: {} },
+				[`POST ${ORIGIN.gateway}/v1/admin/interview-capture-consents/${ID}/revoke`]: echo(COOKIE),
+				[`POST ${ORIGIN.works}/v1/ops/qa/interview-repositories/${ID}/finish`]: echo(WORKS_TOKEN),
+			}],
 			[["export", "--interview", ID, "--out", out], {
 				[`GET ${ORIGIN.works}/v1/ops/qa/interview-repositories/${ID}/evidence`]: { status: 200, body: split.works },
 				[`GET ${ORIGIN.os}/api/admin/interviews/${ID}/events`]: { status: 200, body: split.os },

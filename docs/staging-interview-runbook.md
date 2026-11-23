@@ -105,10 +105,22 @@ candidate's computer opens only once the interview is `started`.
 node tools/interview.mjs finish --interview 7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13
 ```
 
-OS finish, then gateway revoke, then Works finish (the repository becomes read-only). Every step is idempotent, so
+**Sign in again at `https://ai-staging.ezil.work` right before `finish`** and export the new
+`EZIL_AI_OPERATOR_COOKIE`. The operator session lasts 1 hour from sign-in and does not renew, so the one from `start` has
+usually expired by now. The OS admin token also lasts about an hour; renew it the same way if it is older.
+
+The command first proves all three credentials with one read each: OS status, gateway events, Works evidence. A gateway
+404 `not_found` counts as accepted (no consent, or the gate off, both come after authentication). If any credential is
+refused, it names every refused one, for example `finish preflight: refused by gateway 401 invalid_operator_session
+(EZIL_AI_OPERATOR_COOKIE); nothing was finished`, and exits 1 with nothing written.
+
+Then OS finish, gateway revoke and Works finish (the repository becomes read-only). If OS finish fails, nothing else runs.
+After OS finish, the revoke and the Works finish are both attempted whatever the other answers. Each outcome is printed,
+and if either failed the command ends with `finish incomplete: ... failed` and exit 1. Every step is idempotent, so
 repeat the command after any failure. A gateway with no consent record is reported and skipped. Expected output:
 
 ```text
+preflight: works, os and gateway credentials accepted
 os: finished
 gateway: consent revoked
 works: repository frozen at 2026-11-22T09:45:02.000Z
@@ -120,6 +132,7 @@ works: repository frozen at 2026-11-22T09:45:02.000Z
 node tools/interview.mjs export --interview 7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13 --out ./interview-1121
 ```
 
+Use a fresh operator cookie here too: sign in again at ai-staging if the last sign-in is close to an hour old.
 Fetches the Works, OS and gateway evidence, merges it in `(at, works < os < gateway, seq)` order, validates it, and
 writes `timeline.json` (`ezil.interview.timeline.v1`) and `timeline.md`. Expected output:
 

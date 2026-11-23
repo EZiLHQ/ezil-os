@@ -375,21 +375,62 @@ async function start(ctx, io, opts) {
 	return 0;
 }
 
+/**
+ * Read-only proof that all three credentials work before finish writes anything, so an expired one (the
+ * gateway operator session lasts 1 h and does not renew) cannot leave OS finished with capture still active
+ * and the repository still writable. Every refusal is reported, not only the first.
+ */
+async function finishPreflight(ctx, io, id) {
+	const probes = [
+		["os", `/api/admin/interviews/${id}`, (res) => res.ok],
+		// The gateway route revoke shares admin() with; a 404 not_found (no consent, or the gate off) comes after
+		// the operator session is accepted (erratum E6), so it proves the cookie too.
+		["gateway", `/v1/admin/interviews/${id}/events`, (res) => res.ok || (res.status === 404 && refusalCode(res.body) === "not_found")],
+		["works", `${WORKS_BASE}/${id}/evidence`, (res) => res.ok],
+	];
+	const refused = [];
+	for (const [service, path, accepted] of probes) {
+		const res = await call(ctx, service, "GET", path);
+		if (!accepted(res)) refused.push(`${service} ${res.status} ${refusalCode(res.body)} (${CREDENTIAL_ENV[service]})`);
+	}
+	if (refused.length > 0) {
+		throw new StepError(`finish preflight: refused by ${refused.join(", ")}; nothing was finished. Renew the named credentials and rerun finish`);
+	}
+	io.say("preflight: works, os and gateway credentials accepted");
+}
+
 async function finish(ctx, io, opts) {
 	const id = interviewIdOf(opts);
+	await finishPreflight(ctx, io, id);
 	accept("os finish", await call(ctx, "os", "POST", `/api/admin/interviews/${id}/finish`));
 	io.say("os: finished");
-	const revoke = await call(ctx, "gateway", "POST", `/v1/admin/interview-capture-consents/${id}/revoke`, {
-		headers: { "idempotency-key": keyFor(`interview-capture-revoke:${id}`) },
-		body: { reason: "RUN-1121 interview finished" },
+	// After OS finish, the revoke and the Works freeze are each attempted whatever the other answers.
+	const failed = [];
+	const attempt = async (label, step) => {
+		try {
+			await step();
+		} catch (err) {
+			if (!(err instanceof StepError)) throw err;
+			io.warn(err.message);
+			failed.push(label);
+		}
+	};
+	await attempt("gateway revoke", async () => {
+		const revoke = await call(ctx, "gateway", "POST", `/v1/admin/interview-capture-consents/${id}/revoke`, {
+			headers: { "idempotency-key": keyFor(`interview-capture-revoke:${id}`) },
+			body: { reason: "RUN-1121 interview finished" },
+		});
+		if (revoke.status === 404 && refusalCode(revoke.body) === "not_found") io.say("gateway: no consent to revoke");
+		else {
+			accept("gateway revoke", revoke);
+			io.say("gateway: consent revoked");
+		}
 	});
-	if (revoke.status === 404 && refusalCode(revoke.body) === "not_found") io.say("gateway: no consent to revoke");
-	else {
-		accept("gateway revoke", revoke);
-		io.say("gateway: consent revoked");
-	}
-	const frozen = accept("works finish", await call(ctx, "works", "POST", `${WORKS_BASE}/${id}/finish`));
-	io.say(`works: repository frozen${typeof frozen?.frozenAt === "string" ? ` at ${frozen.frozenAt}` : ""}`);
+	await attempt("works finish", async () => {
+		const frozen = accept("works finish", await call(ctx, "works", "POST", `${WORKS_BASE}/${id}/finish`));
+		io.say(`works: repository frozen${typeof frozen?.frozenAt === "string" ? ` at ${frozen.frozenAt}` : ""}`);
+	});
+	if (failed.length > 0) throw new StepError(`finish incomplete: ${failed.join(" and ")} failed; every step is idempotent, so rerun finish`);
 	return 0;
 }
 
