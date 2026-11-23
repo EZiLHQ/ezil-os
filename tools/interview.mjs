@@ -442,7 +442,11 @@ async function exportTimeline(ctx, io, opts) {
 	const gatewayRes = await call(ctx, "gateway", "GET", `/v1/admin/interviews/${id}/events`);
 	let gateway = null;
 	if (gatewayRes.status === 404 && refusalCode(gatewayRes.body) === "not_found") io.warn("gateway: no consent record for this interview; recording 0 gateway events");
-	else gateway = accept("gateway events", gatewayRes);
+	else {
+		gateway = accept("gateway events", gatewayRes);
+		// The gateway streams this answer; a stream that ended early reads as no body. Only a 404 means no record.
+		if (gateway === null || typeof gateway !== "object") throw new StepError("gateway events: the answer is not complete JSON (the stream ended early?); rerun export");
+	}
 	let timeline;
 	try {
 		timeline = mergeEvidence({ works, os, gateway }, { now: ctx.now });

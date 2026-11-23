@@ -938,6 +938,22 @@ describe("interview.mjs export", () => {
 		assert.equal(JSON.parse(readFileSync(join(out, "timeline.json"), "utf8")).sources.gateway.count, 0);
 	});
 
+	test("review N9: a 200 gateway answer that is not complete JSON (a stream cut short) fails the export; nothing is written", async () => {
+		const out = join(scratch, "export-cut");
+		const text = JSON.stringify(split.gateway);
+		const cut = async (url, init) => {
+			if (url.startsWith(`${ORIGIN.gateway}/`)) {
+				assert.equal(gatewayOperatorRefusal(init.headers), null);
+				return new Response(text.slice(0, text.length - 40), { status: 200 });
+			}
+			return stubFetch(exportRoutes())(url, init);
+		};
+		const r = await run(["export", "--interview", ID, "--out", out], { fetch: cut });
+		assert.equal(r.code, 1);
+		assert.match(r.stderr, /gateway events: the answer is not complete JSON/);
+		assert.throws(() => readdirSync(out), /ENOENT/);
+	});
+
 	test("pushTestRuns above 0 is written but the export fails with the validator's message", async () => {
 		const out = join(scratch, "export-pushtests");
 		const routes = exportRoutes();
