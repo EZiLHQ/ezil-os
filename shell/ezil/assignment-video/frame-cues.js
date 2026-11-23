@@ -5,7 +5,8 @@ const frameBindings = new Map();
 let heartbeat;
 
 export function bindFrameClickCues(iframe, origin, binding, computerId) {
-    if (location.origin !== 'https://os-staging.ezil.work' || window !== window.top || !binding || !computerId) return () => {};
+    const universeWorkspace=window.parent===window.top && location.ancestorOrigins?.[0]==='https://universe-staging.ezil.work';
+    if (location.origin!=='https://os-staging.ezil.work' || (window!==window.top && !universeWorkspace) || !binding || !computerId) return () => {};
     const previous = frameBindings.get(iframe);
     if (previous?.binding === binding && previous.origin === origin && previous.computerId === computerId) return previous.detach;
     previous?.detach();

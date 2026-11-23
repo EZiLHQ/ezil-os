@@ -48,3 +48,24 @@ test('refuses a foreign domain before transmitting any bytes',async()=>{
   try {await t.begin();await assert.rejects(t.upload(part),/invalid_upload_target/);assert.ok(!calls.some(x=>x.kind==='put'));}
   finally{t.dispose();}
 });
+
+test('version four provisional phase has no countdown, checkpoints without finalizing, and carries the exact capture scope',async()=>{
+    const phase='00000000-0000-4000-8000-000000000009',calls=[];
+    const deadline=new Date(Date.now()+50000).toISOString(), start=new Date().toISOString();
+    const base={recordingId,captureSessionId:phase,revoked:false,stopRequestedAt:null};
+    const fetcher=async(_url,options)=>{
+        const body=JSON.parse(options.body);calls.push(body);
+        if(body.action==='preflight')return Response.json({attemptId,status:'eligible',expiresAt:deadline,windowStartedAt:null,deadlineAt:null});
+        if(body.action==='begin')return Response.json({...base,status:'awaiting_frame',startedAt:null,deadlineAt:null,authorizationExpiresAt:deadline,nextSequence:17});
+        if(body.action==='checkpoint')return Response.json({...base,status:'paused',startedAt:start,deadlineAt:deadline});
+        return Response.json({...base,status:'awaiting_frame',startedAt:null,deadlineAt:null});
+    };
+    const t=createAssignmentVideoTransport({attemptId,repoOpenProof:'p'.repeat(80),consentVersion:4,captureSessionId:phase,fetcher});
+    try {
+        const initial=await t.begin();assert.equal(initial.startedAt,null);assert.equal(initial.nextSequence,17);
+        await t.status();await t.checkpoint('sharing_stopped');
+        assert.equal(calls.find(c=>c.action==='begin').consentVersion,4);
+        assert.ok(calls.filter(c=>c.action!=='preflight').every(c=>c.captureSessionId===phase));
+        assert.deepEqual(calls.map(c=>c.action),['preflight','begin','status','checkpoint']);
+    }finally{t.dispose();}
+});

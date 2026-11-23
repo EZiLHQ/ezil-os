@@ -302,7 +302,12 @@ function opensRepository (url, project, data) {
     if ( typeof id !== 'string' || ! PROJECT_UUID.test(id) ) return false;
     try {
         const folders = new URL(url).searchParams.getAll('folder');
-        return folders.length === 1 && folders[0].endsWith(`/projects/${id}`);
+        if (folders.length !== 1) return false;
+        if (folders[0].endsWith(`/projects/${id}`)) return true;
+        const workspace = data?.repository?.workspaceFolder, checkout = data?.repository?.checkoutFolder;
+        const name = project.repoUrl?.split('/').at(-1)?.replace(/\.git$/, '');
+        return typeof workspace === 'string' && workspace.endsWith(`/projects/${id}`) && name
+            && checkout === workspace+'/'+name && folders[0] === checkout;
     } catch {
         return false;
     }
@@ -443,7 +448,7 @@ const CODE_UNREACHABLE_COPY = {
  * @returns {Promise<{ok: true, url: string, expiresAt?: number, repository?: string|null, repositoryFolder?: string|null}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-async function mintCodePreviewUrl (computerId, signal, project = null, folder = null, onUpdate) {
+async function mintCodePreviewUrl (computerId, signal, project = null, folder = null, onUpdate, assignment) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
     }
@@ -460,7 +465,7 @@ async function mintCodePreviewUrl (computerId, signal, project = null, folder = 
     // computer 0.23 s after the stop. `signal` is the window's, aborted on close;
     // Stop also reaches it through `session.cancelComputerOpens`.
     return session.cancellableWake(computerId, 'codePreviewUrl', async (s) => {
-        const result = await mintCodePreviewUrlOnce(computerId, s, project, folder);
+        const result = await mintCodePreviewUrlOnce(computerId, s, project, folder, assignment);
         if (!s.aborted && result.computeUpdating === true) onUpdate?.(result.updateMilestone);
         return result;
     }, { signal });
@@ -474,7 +479,7 @@ function mintSignal (cancel) {
 }
 
 /** One `POST /api/shell/code-preview-url`. The loop that may call it more than once is above. */
-async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = null) {
+async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = null, assignment) {
     const started = await session.ensureLocalDesktop(computerId);
     if ( ! started.ok ) return started;
     const endpoint = session.payload()?.desktopState?.endpoints?.codePreviewUrl
@@ -495,7 +500,7 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
             // only an ask that says so may start moving a held computer's files. An older server ignores the field.
             // Lane O2: the project rides along only when there is one, as its two ids and nothing else.
             // A repository address rides as `{url}` and nothing else; the server decides what it names.
-            body: JSON.stringify(project?.repoUrl ? { computerId, intent: 'open', repository: { url: project.repoUrl } }
+            body: JSON.stringify(project?.repoUrl ? { computerId, intent: 'open', repository: { url: project.repoUrl }, ...(assignment ? {assignment} : {}) }
                 : project ? { computerId, intent: 'open', project: { projectId: project.projectId, repoId: project.repoId } }
                     : { computerId, intent: 'open', ...(folder_ask ? { codeFolder: folder_ask } : {}) }),
             signal: mintSignal(cancel),
@@ -554,6 +559,11 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
         return pending.errorCode === 'sandbox_starting' && pending.computeProvider === 'aws-ec2' && data?.computeUpdating === true
             ? { ...pending, computeUpdating: true,
                 updateMilestone: computerUpdateMilestone(data.computeUpdateStage, data.computeUpdatePercent) } : pending;
+    }
+    if (assignment?.phase === 'prepare') {
+        if (data.codePreviewUrl || data.url || !data.assignmentOpen || !data.repository)
+            return {ok:false,errorCode:'assigned_checkout_unverified'};
+        return {ok:true,assignmentOpen:data.assignmentOpen,repository:data.repository};
     }
     if ( typeof data.codePreviewUrl !== 'string' || data.codePreviewUrl === '' ) {
         // Reported success with nothing to show. Loud, not silent — same rule
@@ -689,6 +699,8 @@ export async function openCodeWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    let assignmentGate;
+    let assignmentGeneration=0;
     const lifecycleOwner = session.payload()?.user?.id;
     const lifecycle = nativeSurface ? null : watchCodeLifecycle({
         scope: { userId: lifecycleOwner, computerId: computer.id }, iframe: el_iframe,
@@ -954,8 +966,8 @@ export async function openCodeWindow (ctx = {}) {
         el_state.hidden = true;
         delete el_state.dataset.state;
         return_probe_retry = null;
-        el_iframe.inert = false;
-        el_iframe.removeAttribute('aria-hidden');
+        el_iframe.inert = assignmentGate?.locked() === true;
+        if (!el_iframe.inert) el_iframe.removeAttribute('aria-hidden');
     };
     const show_state = (kind) => {
         if ( disposed ) return;
@@ -987,6 +999,8 @@ export async function openCodeWindow (ctx = {}) {
     const show_unavailable = () => { hide_state(); progress.el.hidden = true; el_unavailable.hidden = false; };
 
     async function start_boot () {
+        const assignment = assignmentGate?.access();
+        if (assignmentGate && !assignment) return;
         last_failure = null;
         last_progress = null; generic_timeout = null;
         if ( disposed ) return;
@@ -1046,7 +1060,7 @@ export async function openCodeWindow (ctx = {}) {
                 updating = true;
                 // A transient wake response or an older milestone must not reset this open's progress.
                 if (milestone && (!updateMilestone || milestone.percent > updateMilestone.percent)) updateMilestone = milestone;
-            }));
+            }, assignment));
 
         if ( disposed || my_attempt !== attempt ) return;
         updating = false;
@@ -1267,8 +1281,8 @@ export async function openCodeWindow (ctx = {}) {
                         // answers while the frame still shows that page cannot re-arm the automatic reopen.
                         onRoot: (root, how) => {
                             resetOriginRecovery();
-                            if (how.mintDriven && !how.fallback && root.kind === 'folder' && root.path === repository_folder) {
-                                confirmAssignmentFolder(project, assignment_open, el_iframe, frame_url);
+                            if (how.mintDriven && !how.fallback && root.kind === 'folder' && (root.path === repository_folder || assignmentGate)) {
+                                confirmAssignmentFolder(project, assignment_open, el_iframe, frame_url, root.path);
                                 assignment_open = undefined;
                             }
                             on_root(root, how);
@@ -1674,6 +1688,7 @@ export async function openCodeWindow (ctx = {}) {
         if (disposed) return;
         lifecycle?.stop();
         disposed = true;
+        void assignmentGate?.close();
         git_access?.dispose();
         git_access_notice?.remove(); git_access_notice = null;
         hide_state();
@@ -1724,8 +1739,35 @@ export async function openCodeWindow (ctx = {}) {
     window.addEventListener(TRANSITION_EVENT, on_transition);
 
     function launchWithConsent() {
-        openWithAssignmentConsent({project, computerId: computer.id, actor: () => session.payload()?.user?.id,
-            open: () => { if (!disposed) void start_boot(); }});
+        const generation=++assignmentGeneration;
+        const requestedProject=project;
+        const stillHere=()=>!disposed && generation===assignmentGeneration;
+        void assignmentGate?.close();
+        assignmentGate = null;
+        assignmentGate = openWithAssignmentConsent({project:requestedProject, computerId:computer.id, actor:()=>session.payload()?.user?.id,
+            body:el_body,
+            park(locked) {
+                if(!stillHere())return;
+                el_body.classList.toggle('ezil-assignment-work-locked',locked);
+                el_iframe.inert = locked;
+                if (locked) {
+                    if (document.activeElement === el_iframe) el_iframe.blur();
+                    el_iframe.setAttribute('aria-hidden','true');
+                } else el_iframe.removeAttribute('aria-hidden');
+            },
+            async prepare(attemptId) {
+                if (!stillHere()) throw Object.assign(new Error('closed'),{code:'workspace_disconnected'});
+                mint_ctl?.abort(); mint_ctl = new AbortController();
+                const result = await mintCodePreviewUrl(computer.id,mint_ctl.signal,requestedProject,null,null,{attemptId,phase:'prepare'});
+                if(!stillHere())throw Object.assign(new Error('closed'),{code:'workspace_disconnected'});
+                if (!result.ok) throw Object.assign(new Error('prepare_failed'),{code:result.errorCode});
+                return result;
+            },
+            open:()=>{if (stillHere()) void start_boot();}});
+        if (!assignmentGate) {
+            el_body.classList.remove('ezil-assignment-work-locked');
+            el_iframe.inert=false; el_iframe.removeAttribute('aria-hidden');
+        }
     }
     launchWithConsent();
     return el_window;

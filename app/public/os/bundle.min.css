@@ -945,9 +945,13 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-store-detail-heading h1{font-size:25px}
 .ezil-store-facts{gap:10px}
 }
-.ezil-assignment-video-panel{position:fixed;z-index:2147483647;inset:auto 12px 12px auto;max-width:min(34rem,calc(100vw - 24px));display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px;border:1px solid #8194ad;border-radius:6px;box-shadow:0 2px 12px #14192044;background:#172238;color:#fff;font:13px/1.4 system-ui,sans-serif;text-align:left}
-.ezil-assignment-video-panel button{border:1px solid #a0b7d3;border-radius:4px;padding:5px 8px;background:#fff;color:#18253b;font:inherit;cursor:pointer}
-.ezil-assignment-video-panel button:focus-visible{outline:#72d4ff solid 3px}
+.ezil-assignment-work-locked .window-app-iframe{visibility:hidden!important;pointer-events:none!important}
+.ezil-assignment-work-gate{position:absolute;inset:0;z-index:100;display:grid;place-content:center;padding:24px;background:#151d28;color:#e7eff9;font:15px/1.5 system-ui,sans-serif}
+.ezil-assignment-work-gate[hidden]{display:none}
+.ezil-assignment-work-gate>div{max-width:34rem}
+.ezil-assignment-work-gate h2{margin:0 0 8px;color:inherit;font:600 22px/1.35 system-ui,sans-serif}
+.ezil-assignment-work-gate p{margin:0;color:#c3d0df}
+.ezil-assignment-work-gate button{margin-top:16px;padding:7px 13px;border:1px solid #a6bbd1;border-radius:5px;background:#edf5fe;color:#152236;cursor:pointer}
 .ezil-assignment-click{position:fixed;pointer-events:none;z-index:2147483646;transform:translate(-50%,-50%);display:grid;place-content:center;width:29px;height:29px;border:2px solid #42ecd2;border-radius:50%;background:#132531df;color:#fff;font:bold 12px system-ui,sans-serif}
 .ezil-assignment-click-right{border-color:#ff9ac6}
 .ezil-settings-window{--bg:#04060c;--surface:#0d1118;--surface-2:#141a23;--border:rgba(255, 255, 255, 0.08);--text:#f5f5f4;--muted:#9aa3ad;--accent:var(--ezil-accent, #00adb5);--accent-ink:var(--ezil-accent-contrast, #04060c);--warn:#f5a524;--danger:#f05d5e;container-type:inline-size;container-name:ezil-settings-window;max-width:100vw}

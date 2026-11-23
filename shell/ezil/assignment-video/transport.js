@@ -26,9 +26,9 @@ export async function checkAssignmentVideoEligibility(attemptId, {fetcher = glob
     return result;
 }
 
-export function createAssignmentVideoTransport({attemptId, repoOpenProof, consentVersion, onStop, fetcher = globalThis.fetch,
+export function createAssignmentVideoTransport({attemptId, repoOpenProof, consentVersion, captureSessionId, onStop, fetcher = globalThis.fetch,
     clock = Date.now, pollMs = 3000}) {
-    if (!uuid.test(attemptId) || typeof repoOpenProof !== 'string' || !/^[A-Za-z0-9_-]{48,1700}$/.test(repoOpenProof) || !Number.isSafeInteger(consentVersion) || consentVersion < 1)
+    if (!uuid.test(attemptId) || (captureSessionId && !uuid.test(captureSessionId)) || typeof repoOpenProof !== 'string' || !/^[A-Za-z0-9_-]{48,1700}$/.test(repoOpenProof) || !Number.isSafeInteger(consentVersion) || consentVersion < 1)
         throw failure('invalid_assignment');
     let recording, poll, expiry, disposed = false, stopped = false, misses = 0;
     function clearTimers() { clearTimeout(poll); clearTimeout(expiry); }
@@ -40,12 +40,13 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
     }
     async function control(action, fields = {}) {
         if (disposed) throw failure('transport_disposed');
-        return callControl(attemptId, action, fields, fetcher);
+        return callControl(attemptId, action, {...(captureSessionId ? {captureSessionId} : {}),...fields}, fetcher);
     }
     async function status() {
         const data = await control('status');
         if (!recording || data.recordingId !== recording.recordingId) throw failure('recording_changed');
-        if (data.revoked || data.stopRequestedAt || data.status !== 'recording') {
+        if (captureSessionId && data.captureSessionId !== captureSessionId) throw failure('recording_phase_changed');
+        if (data.revoked || data.stopRequestedAt || (data.status !== 'recording' && !(captureSessionId && data.status === 'awaiting_frame'))) {
             const why = ['submitted','timeout','stopped'].includes(data.stopReason) ? data.stopReason : 'stopped';
             const cutoff = data.stopRequestedAt ?? (why === 'timeout' ? recording.deadlineAt : null);
             stop(why, typeof cutoff === 'string' && Number.isFinite(Date.parse(cutoff)) ? cutoff : null);
@@ -66,8 +67,9 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         if (stopped || disposed) throw failure('recording_closed');
         await preflight();
         const data = await control('begin', {consentAccepted:true,consentVersion,repoOpenProof});
-        const deadline = Date.parse(data.deadlineAt);
-        if (!uuid.test(data.recordingId) || data.status !== 'recording' || !Number.isFinite(deadline) || deadline <= clock()
+        const provisional = captureSessionId && data.status === 'awaiting_frame';
+        const deadline = Date.parse(provisional ? data.authorizationExpiresAt : data.deadlineAt);
+        if (!uuid.test(data.recordingId) || (!provisional && data.status !== 'recording') || (captureSessionId && (data.captureSessionId !== captureSessionId || !Number.isSafeInteger(data.nextSequence))) || !Number.isFinite(deadline) || deadline <= clock()
             || (recording && recording.recordingId !== data.recordingId)) throw failure('recording_changed');
         recording = data;
         clearTimers();
@@ -96,13 +98,31 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         const result = await control('confirm', {sequence});
         if (!result.confirmed || result.recordingId !== recording.recordingId || result.sequence !== sequence)
             throw failure('upload_unconfirmed');
+        if (result.phaseReady && captureSessionId && result.captureSessionId === captureSessionId) {
+            const end = Date.parse(result.deadlineAt);
+            if (!Number.isFinite(end) || end <= clock() || end-clock() > 3600000+1500) throw failure('recording_changed');
+            recording={...recording,startedAt:result.startedAt,deadlineAt:result.deadlineAt};
+            clearTimeout(expiry); expiry=setTimeout(()=>stop('timeout',recording.deadlineAt),end-clock());
+        }
         return result;
+    }
+    async function checkpoint(reason) {
+        if (!recording || disposed || !captureSessionId) throw failure('recording_unavailable');
+        stopped=true; clearTimers();
+        return control('checkpoint',{reason});
     }
     async function finalize({reason,expectedSegments}) {
         if (!recording || disposed) throw failure('recording_unavailable');
         stopped = true; clearTimers();
         return control('finalize',{reason,expectedSegments});
     }
+    function checkpointOnExit(reason) {
+        if (!recording || disposed || !captureSessionId) return;
+        // Closing a document cannot promise to flush an unconfirmed tail. Preserve already accepted clips.
+        void fetcher(path,{method:'POST',credentials:'same-origin',redirect:'error',cache:'no-store',keepalive:true,
+            headers:{'Content-Type':'application/json','X-Ezil-Assignment-Video':'1'},
+            body:JSON.stringify({action:'checkpoint',attemptId,captureSessionId,reason})}).catch(()=>{});
+    }
     function dispose() { disposed = true; clearTimers(); recording = null; }
-    return {preflight, begin, status, upload, finalize, dispose};
+    return {preflight, begin, status, upload, checkpoint, checkpointOnExit, finalize, dispose};
 }
