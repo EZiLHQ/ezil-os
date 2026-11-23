@@ -1,16 +1,35 @@
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
-import { LifecycleDeploymentSchema, RebasePreparationReferenceSchema } from './aws-intent';
+import { LifecycleDeploymentSchema, RebasePreparationReferenceSchema, type LifecycleDeployment } from './aws-intent';
 import { RebaseCounter, RebaseDigest, RebaseHash, RebaseSnapshot, RebaseTime, RebaseUuid, RebaseVolume, parseRebaseJson } from './aws-rebase-json';
 import { assertImageExecution, type Execution } from './aws-rebase-evidence';
 import type { Ec2VolumeView } from './aws-clients';
 import type { ImageJob } from './aws-rebase-store';
 const execution = z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/);
-export const ImageRecoverySchema = z.object({ schemaVersion: z.literal(1), jobId: RebaseUuid, imageJobId: RebaseUuid,
+export const ImageRecoverySchema = z.object({ schemaVersion: z.union([z.literal(1), z.literal(2)]), jobId: RebaseUuid, imageJobId: RebaseUuid,
     sourceExecutionArn: execution, rebasePreparation: RebasePreparationReferenceSchema, computerId: RebaseUuid,
     originalVolumeId: RebaseVolume, fsUuid: RebaseUuid, sourceGeneration: RebaseCounter, sourceLeaseEpoch: RebaseCounter,
     sourceFenceToken: RebaseUuid, fromDigest: RebaseDigest, snapshotId: RebaseSnapshot, deployment: LifecycleDeploymentSchema, createdAt: RebaseTime }).strict();
 export type ImageRecovery = z.infer<typeof ImageRecoverySchema>;
+
+/** V2 restores the incumbent identity, with only the approved candidate workflow versions substituted. */
+export function recoveryBridgeDeploymentFor(source: LifecycleDeployment, target: LifecycleDeployment): LifecycleDeployment {
+    const s = LifecycleDeploymentSchema.parse(source), d = LifecycleDeploymentSchema.parse(target);
+    const scope = ['accountId', 'region', 'namespace', 'zoneId', 'subnetId', 'securityGroupId', 'dataKeyArn',
+        'launchTemplateId', 'storage', 'instanceTypes'] as const;
+    if (!s.preparationStateMachineVersionArn || !s.recoveryStateMachineVersionArn ||
+        !d.preparationStateMachineVersionArn || !d.recoveryStateMachineVersionArn ||
+        !s.lowerImageDigest || d.previousLowerImageDigest !== s.lowerImageDigest ||
+        d.stateMachineVersionArn === s.stateMachineVersionArn ||
+        (d.preparationStateMachineVersionArn === s.preparationStateMachineVersionArn
+            && d.recoveryStateMachineVersionArn === s.recoveryStateMachineVersionArn) ||
+        scope.some(key => !isDeepStrictEqual(s[key], d[key]))) throw new Error('restore_lineage_mismatch');
+    return LifecycleDeploymentSchema.parse({ ...s, stateMachineVersionArn: d.stateMachineVersionArn,
+        preparationStateMachineVersionArn: d.preparationStateMachineVersionArn,
+        recoveryStateMachineVersionArn: d.recoveryStateMachineVersionArn });
+}
+
 export function buildImageRecovery(raw: ImageRecovery) {
     const intent = ImageRecoverySchema.parse(raw);
     if (intent.fromDigest !== intent.deployment.lowerImageDigest || !intent.deployment.recoveryStateMachineVersionArn

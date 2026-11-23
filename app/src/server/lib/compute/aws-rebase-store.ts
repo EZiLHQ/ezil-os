@@ -1,5 +1,5 @@
 import { dedicatedProvisionWork, type DedicatedProvisionRecord } from './aws-dedicated-source';
-import { buildImageRecovery, recoveryFor, verifyImageRestore, MaintenanceReportSchema } from './aws-rebase-recovery';
+import { buildImageRecovery, recoveryBridgeDeploymentFor, recoveryFor, verifyImageRestore, MaintenanceReportSchema } from './aws-rebase-recovery';
 import { decideAdmission } from './admission';
 import { readAwsAdmissionConfig, type Env } from './aws-config';
 import { createHash } from 'node:crypto';
@@ -8,7 +8,7 @@ import type { Ec2EnrollmentView } from './aws-enroll';
 import type { Ec2VolumeView } from './aws-clients';
 import { sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { buildLifecycleWork, LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleWork } from './aws-intent';
+import { buildLifecycleWork, LifecycleDeploymentSchema, LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleWork } from './aws-intent';
 import { parseEnrollmentUserData } from './aws-rebase-lease';
 import { buildRebasePreparation, RebaseSnapshotReceiptSchema, validateRebaseSnapshotReceipt } from './aws-rebase-preparation';
 import { parseRebaseJson, RebaseCounter, RebaseDigest, RebaseHash, RebaseSnapshot, RebaseTime, RebaseUuid, RebaseVolume } from './aws-rebase-json';
@@ -228,13 +228,17 @@ export function validateImageJob(raw: unknown): ImageJob {
     if (!allOrNone([j.recoveryJobId, j.recoveryDocument, j.recoveryDigest, j.recoveryExecutionArn])) throw new ImageJobConflictError();
     if (j.recoveryDocument) {
         const w = recoveryFor(j), i = w.intent;
+        if (i.schemaVersion === 2 && j.sourceRelease.agentCommit !== j.targetRelease.agentCommit) throw new ImageJobConflictError();
+        const restoreDeployment = i.schemaVersion === 2
+            ? recoveryBridgeDeploymentFor(LifecycleDeploymentSchema.parse(p.intent.sourceDeployment), p.intent.deployment)
+            : p.intent.sourceDeployment;
         if (w.document !== j.recoveryDocument || w.digest !== j.recoveryDigest || w.executionArn !== j.recoveryExecutionArn
             || i.jobId !== j.recoveryJobId || i.imageJobId !== j.jobId || i.computerId !== j.computerId
             || i.sourceExecutionArn !== j.launchExecutionArn || i.originalVolumeId !== j.sourceVolumeId || i.fsUuid !== j.fsUuid
             || i.sourceGeneration !== j.sourceGeneration || i.sourceLeaseEpoch !== j.sourceLeaseEpoch || i.sourceFenceToken !== j.sourceFenceToken
             || i.jobId === j.launchJobId || i.fromDigest !== j.fromDigest || i.snapshotId !== j.snapshotId || i.rebasePreparation.preparationJobId !== j.jobId
             || i.rebasePreparation.executionArn !== j.preparationExecutionArn || i.rebasePreparation.digest !== j.preparationDigest
-            || !equal(i.deployment, p.intent.sourceDeployment) || Date.parse(i.createdAt) < Date.parse(j.createdAt)) throw new ImageJobConflictError();
+            || !equal(i.deployment, restoreDeployment) || Date.parse(i.createdAt) < Date.parse(j.createdAt)) throw new ImageJobConflictError();
     }
     if (['recovery_pending', 'restore_pending', 'rebind_pending', 'recovered'].includes(j.phase) && !j.recoveryDocument) throw new ImageJobConflictError();
     if (!allOrNone([j.restoredVolumeId, j.quarantinedVolumeId]) || (j.restoredVolumeId !== null
@@ -600,6 +604,8 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
             });
         },
         async admitRecovery(expected: ImageJob, work: ReturnType<typeof buildImageRecovery>, failed: Execution, now: Date) {
+            if (work.intent.schemaVersion === 2 && (expected.sourceRelease.agentCommit !== expected.targetRelease.agentCommit
+                || env.EZIL_AWS_IMAGE_RECOVERY_BRIDGE_V2 !== expected.jobId + ':' + expected.preparationDigest)) throw new Error('operator_required');
             assertImageExecution(failed, launchFor(expected));
             if (!['failed', 'unconfirmed'].includes(expected.phase) || expected.hostEvidence || expected.recoveryDocument
                 || !['FAILED', 'TIMED_OUT', 'ABORTED', 'SUCCEEDED'].includes(failed.status) || work.intent.jobId.split('-')[2]?.[0] !== '4') throw new ImageJobConflictError();

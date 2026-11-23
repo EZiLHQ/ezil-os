@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { DIGEST } from './strict-json.js';
 
@@ -147,6 +148,25 @@ export function recoveryDeploymentFor(source: SourceLifecycleDeployment, target:
         return LifecycleDeploymentSchema.parse(s);
     if ((['accountId', 'region', 'namespace', 'zoneId', 'dataKeyArn'] as const).some(k => s[k] !== d[k])
         || d.previousLowerImageDigest !== s.lowerImageDigest) throw new Error('restore_lineage_mismatch');
+    return LifecycleDeploymentSchema.parse({ ...s, stateMachineVersionArn: d.stateMachineVersionArn,
+        preparationStateMachineVersionArn: d.preparationStateMachineVersionArn,
+        recoveryStateMachineVersionArn: d.recoveryStateMachineVersionArn });
+}
+
+/** V2 keeps incumbent restore resources and adopts only the proven candidate workflow versions. */
+export function recoveryBridgeDeploymentFor(source: SourceLifecycleDeployment, target: LifecycleDeployment): LifecycleDeployment | null {
+    const parsed = LifecycleDeploymentSchema.safeParse(source), d = LifecycleDeploymentSchema.parse(target);
+    if (!parsed.success) return null;
+    const s = parsed.data;
+    const scope = ['accountId', 'region', 'namespace', 'zoneId', 'subnetId', 'securityGroupId', 'dataKeyArn',
+        'launchTemplateId', 'storage', 'instanceTypes'] as const;
+    if (!s.preparationStateMachineVersionArn || !s.recoveryStateMachineVersionArn ||
+        !d.preparationStateMachineVersionArn || !d.recoveryStateMachineVersionArn ||
+        !s.lowerImageDigest || d.previousLowerImageDigest !== s.lowerImageDigest ||
+        d.stateMachineVersionArn === s.stateMachineVersionArn ||
+        (d.preparationStateMachineVersionArn === s.preparationStateMachineVersionArn
+            && d.recoveryStateMachineVersionArn === s.recoveryStateMachineVersionArn) ||
+        scope.some(key => !isDeepStrictEqual(s[key], d[key]))) return null;
     return LifecycleDeploymentSchema.parse({ ...s, stateMachineVersionArn: d.stateMachineVersionArn,
         preparationStateMachineVersionArn: d.preparationStateMachineVersionArn,
         recoveryStateMachineVersionArn: d.recoveryStateMachineVersionArn });
