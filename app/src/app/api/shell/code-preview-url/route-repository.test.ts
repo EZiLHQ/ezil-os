@@ -39,6 +39,7 @@ const s = vi.hoisted(() => ({
     swapSessionOnMint: false,
     aws: [false, false] as boolean[],
     preview: { ok: true } as Record<string, unknown>,
+    migration: null as null | Record<string, unknown>,
     /** How long the stubbed Code mint takes, ms of `Date.now()`. */
     mintTakes: 0,
     skew: 0,
@@ -81,6 +82,9 @@ vi.mock('@/server/lib/compute/aws-control-auth', () => ({ controlTargetFor: asyn
         ? { sandboxName: SANDBOX, auth: { kind: 'v2', claims: { sandboxId: SANDBOX, computerId: COMPUTER, userId: USER, provider: 'aws-ec2', store: '', generation: 3, leaseEpoch: 1 } } }
         : { sandboxName: SANDBOX, auth: { kind: 'v1' } };
 } }));
+vi.mock('@/server/lib/compute/provider-migrate-store', () => ({
+    createProviderMigrationStore: () => ({readByComputer: async () => s.migration}),
+}));
 vi.mock('@/server/lib/cloudflare-guacamole-provider', async importOriginal => ({
     ...await importOriginal<typeof import('@/server/lib/cloudflare-guacamole-provider')>(),
     resolveCloudflareGuacamoleConfig: () => ({ workerUrl: WORKER, isConfigured: true, hasHmacSecret: true }),
@@ -107,7 +111,7 @@ const standalonePacket = (scope: 'read' | 'write') => ({ version: 2,
 let logs: ReturnType<typeof vi.spyOn>[];
 beforeEach(() => {
     Object.assign(s, { order: [], owned: true, identity: 'ok', sessionId: 'session-a', swapSessionOnMint: false,
-        aws: [false, false], requests: [], cleared: 0, mintTakes: 0, skew: 0, mintInputs: [],
+        aws: [false, false], migration: null, requests: [], cleared: 0, mintTakes: 0, skew: 0, mintInputs: [],
         preview: { ok: true, correlationId: 'c', codePreviewUrl: MINTED, expiresAt: Date.now() + 300_000, provider: 'cloudflare-guacamole' },
         universe: () => Response.json(grant()),
         worker: () => Response.json({ folder: `/workspace/projects/${REPO}`, head: 'b'.repeat(40) }),
@@ -509,5 +513,162 @@ describe('the enrolled checkout signals the protected top-level shell only after
         ack='good';
         boundProvider='different';
         await locked(await open(prep));
+    });
+});
+
+describe('the staged AWS protected checkout uses fresh Universe binding and the host acknowledgement', () => {
+    const attemptId = 'ecb246af-f1b8-4c72-8e6d-414c814de821';
+    const captureSessionId = '00000000-0000-4000-8000-000000000099';
+    const recordingId = '00000000-0000-4000-8000-000000000098';
+    const operationId = '00000000-0000-4000-8000-000000000097';
+    const origin = 'https://os-staging.ezil.work';
+    const subject = 'auth0|builder';
+    const signingKey = 'test-only-repo-open-key-material'.repeat(2);
+
+    async function assignment() {
+        const {expectedRepositoryURL} = await import('@/server/git/assignment-enrollment');
+        const {makeChallenge, readOpen, workspaceIdentity} = await import('@/server/assignment-video/repo-open');
+        const repositoryUrl = expectedRepositoryURL(subject, 'a-' + attemptId);
+        const workspaceId = workspaceIdentity(USER, COMPUTER, SANDBOX);
+        const actor = {userId: USER, issuer:'https://id.ezil.work/', subject, sessionId: s.sessionId, expiresAt: Date.now()+600000};
+        const iso = (relative: number) => new Date(Date.now() + relative).toISOString();
+        const enrollment = {status: 'eligible', attemptId, jobId: '9', repositoryUrl, ref: 'refs/heads/main',
+            manifestSha256: makeChallenge(attemptId, repositoryUrl).manifestSha256, providerId: 'fg1wtcrexaf7acl0',
+            expiresAt: iso(120000), windowStartedAt: iso(-1000), deadlineAt: iso(3480000), boundWorkspaceId: null as string | null};
+        const state = {captureSessionId, recordingId, repositoryOpenReceiptId: recordingId, status: 'recording',
+            revoked: false, stopRequestedAt: null, firstFrameAt: iso(-100), startedAt: enrollment.windowStartedAt,
+            deadlineAt: enrollment.deadlineAt, phaseReady: true, workspaceUnlocked: true};
+        const migration = {id: operationId, userId: USER, computerId: COMPUTER, state: 'committed',
+            fromProvider: 'cloudflare', toProvider: 'aws-ec2', updatedAt: iso(-500).replace('T', ' ').replace('Z', '+00')};
+        let read = 0;
+        let authority = (r: number): object => ({...enrollment, expiresAt: iso(120000 + r)});
+        let ack: 'valid' | 'missing' | 'wrong' | 'wrong-folder' = 'valid';
+        vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', 'https://universe-staging.ezil.work');
+        vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET', signingKey);
+        vi.stubEnv('AWS_STANDALONE_REPO_OPEN_ENABLED', 'true');
+        s.preview = {...s.preview, computeProvider: 'aws-ec2', sandboxId: SANDBOX, generation: 3, leaseEpoch: 1};
+        s.universe = () => Response.json(s.requests.at(-1)?.url.pathname.endsWith('/status') ? state : authority(++read));
+        s.gateway = scope => {
+            const packet = standalonePacket(scope);
+            packet.repository.canonicalURL = repositoryUrl;
+            return Response.json(packet);
+        };
+        s.worker = body => {
+            const request = JSON.parse(body), challenge = request.assignmentPreload;
+            const folder = '/workspace/projects/' + request.repositoryId;
+            expect(challenge).toMatchObject({attemptId, manifestSha256: enrollment.manifestSha256});
+            if (ack === 'missing') return Response.json({ok: true, folder, status: 'fetched'});
+            return Response.json({ok: true, folder, status: 'fetched',
+                checkoutFolder: folder + '/' + (ack === 'wrong-folder' ? 'other' : repositoryUrl.split('/').at(-1)!.slice(0,-4)),
+                assignmentPreload: {eventId: challenge.eventId, nonce: ack === 'wrong' ? '1'.repeat(64) : challenge.nonce,
+                    port: 5679, status: 'acknowledged'}});
+        };
+        const open = (phase: object = {phase: 'prepare'}, placements = [true, true, true, true]) => {
+            s.aws = placements;
+            return POST(new Request(origin+'/api/shell/code-preview-url', {method: 'POST',
+                headers: {origin, host: 'os-staging.ezil.work', 'sec-fetch-site': 'same-origin', 'content-type': 'application/json'},
+                body: JSON.stringify({computerId: COMPUTER, intent: 'open', repository: {url: repositoryUrl}, assignment: {attemptId, ...phase}})}));
+        };
+        return {open, enrollment, state, workspaceId, migration, iso,
+            readProof: (value: string) => readOpen(value, actor, attemptId, Date.now(), signingKey),
+            setAuthority: (source: typeof authority) => { authority = source; },
+            setAck: (value: typeof ack) => { ack = value; }};
+    }
+
+    it.each([false, true])('prepares a first binding with already-started=%s and verifies Universe before and after checkout', async started => {
+        const fixture = await assignment();
+        const {open, enrollment, readProof, workspaceId, setAuthority} = fixture;
+        if (!started) setAuthority(() => ({...enrollment, windowStartedAt: null, deadlineAt: null}));
+        const response = await open();
+        expect(response.status).toBe(200);
+        const answer = await response.json();
+        expect(answer).not.toHaveProperty('codePreviewUrl');
+        expect(answer).not.toHaveProperty('url');
+        expect(answer.assignmentOpen).toMatchObject({attemptId, windowStartedAt: started ? enrollment.windowStartedAt : null,
+            deadlineAt: started ? enrollment.deadlineAt : null});
+        expect(readProof(answer.assignmentOpen.proof)).toMatchObject({workspaceId, providerId: enrollment.providerId});
+        expect(s.order.filter(event => ['universe','worker','codePreviewUrl'].includes(event))).toEqual([
+            'universe', 'codePreviewUrl', 'universe', 'worker', 'universe',
+        ]);
+    });
+
+    it('exposes Code only when the saved assignment capture confirms the acknowledged repo open', async () => {
+        const {open, enrollment, state, workspaceId, readProof} = await assignment();
+        const prepared = await open();
+        const {assignmentOpen} = await prepared.json();
+        enrollment.boundWorkspaceId = workspaceId;
+        const enter = {phase: 'open', captureSessionId, repoOpenProof: assignmentOpen.proof};
+        const denied = await open(enter);
+        expect(denied.status).toBe(409);
+        expect(await denied.text()).not.toContain('preview-bootstrap');
+        state.repositoryOpenReceiptId = readProof(assignmentOpen.proof).eventId;
+        expect((await open({...enter, repoOpenProof: 'A'.repeat(80)})).status).toBe(409);
+        const confirmed = await open(enter);
+        expect(confirmed.status).toBe(200);
+        expect(new URL((await confirmed.json()).codePreviewUrl).searchParams.get('folder')).toMatch(/^\/workspace\/projects\//);
+    });
+
+    it.each(['missing','foreign','unpaired','expired','expires-beyond-window','future-start','malformed'] as const)(
+        'refuses %s authority before waking the AWS computer', async kind => {
+            const {open, enrollment, iso, setAuthority} = await assignment();
+            const overrides = {
+                missing: {boundWorkspaceId: undefined},
+                foreign: {boundWorkspaceId: 'f'.repeat(64)},
+                unpaired: {deadlineAt: null},
+                expired: {deadlineAt: iso(-100), expiresAt: iso(-100)},
+                'expires-beyond-window': {deadlineAt: iso(500), expiresAt: iso(600)},
+                'future-start': {windowStartedAt: iso(10000)},
+                malformed: {windowStartedAt: '2026-invalid'},
+            }[kind];
+            setAuthority(() => ({...enrollment, ...overrides}));
+            const answer = await open();
+            expect(answer.status).toBe(409);
+            expect((await answer.json()).error.code).toBe('assignment_aws_unverified');
+            expect(s.order).not.toContain('codePreviewUrl');
+            expect(s.order).not.toContain('worker');
+        });
+
+    it.each([2,3])('retires the request when Universe proof changes on read %s', async changedRead => {
+        const {open, enrollment, setAuthority} = await assignment();
+        setAuthority(read => ({...enrollment, boundWorkspaceId: read >= changedRead ? 'f'.repeat(64) : null}));
+        const answer = await open();
+        expect(answer.status).toBe(409);
+        expect((await answer.clone().json()).error.code).toBe('assignment_aws_unverified');
+        expect(await answer.text()).not.toContain('preview-bootstrap');
+        expect(s.order.includes('worker')).toBe(changedRead === 3);
+    });
+
+    it('requires the exact committed operation if the workspace moved after the window started', async () => {
+        const {open, enrollment, setAuthority, workspaceId, migration} = await assignment();
+        enrollment.boundWorkspaceId = workspaceId;
+        s.migration = migration;
+        for (const extras of [{}, {upgradeOperationId: operationId},
+            {upgradedWorkspaceId: workspaceId, upgradeOperationId: recordingId}]) {
+            setAuthority(() => ({...enrollment, ...extras}));
+            const answer = await open();
+            expect(answer.status).toBe(409);
+        }
+        expect(s.order).not.toContain('codePreviewUrl');
+        setAuthority(() => ({...enrollment, upgradedWorkspaceId: workspaceId, upgradeOperationId: operationId}));
+        expect((await open()).status).toBe(200);
+    });
+
+    it.each(['missing','wrong','wrong-folder'] as const)('refuses the %s host acknowledgement', async ack => {
+        const {open, setAck} = await assignment();
+        setAck(ack);
+        const answer = await open();
+        expect(answer.status).toBeGreaterThanOrEqual(400);
+        expect(await answer.text()).not.toContain('preview-bootstrap');
+    });
+
+    it('continues waiting for the cold AWS host before exposing any checkout URL', async () => {
+        const {open} = await assignment();
+        s.preview = {ok: false, retryable: true, retryAfterMs: 2000, computeProvider: 'aws-ec2',
+            errorCode: 'computer_warming', computeBootPending: true, codePreviewUrl: MINTED, arbitrary: PRIVATE_GIT_TOKEN};
+        const pending = await open();
+        expect(pending.status).toBe(200);
+        expect(await pending.json()).toEqual({ok: false, retryable: true, retryAfterMs: 2000, computeProvider: 'aws-ec2',
+            errorCode: 'computer_warming', computeBootPending: true});
+        expect(s.order).not.toContain('worker');
     });
 });

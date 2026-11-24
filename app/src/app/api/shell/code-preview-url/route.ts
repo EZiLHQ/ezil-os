@@ -1,5 +1,5 @@
 import { recordingAction } from '@/server/assignment-video/broker';
-import { osOrigin, universeOrigin, uuid } from '@/server/assignment-video/contract';
+import { BrokerError, osOrigin, universeOrigin, uuid, type Eligible } from '@/server/assignment-video/contract';
 import { enrolledAttempt, makeChallenge, matchesEnrollment, readOpen, repoOpenSecret, sealOpen, workspaceIdentity } from '@/server/assignment-video/repo-open';
 import { z } from 'zod';
 import { expectedRepositoryURL } from '@/server/git/assignment-enrollment';
@@ -12,6 +12,8 @@ import { createTRPCContext } from '@/server/api/trpc';
 import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 import type { AutomaticImageUpdateWait } from '@/server/lib/compute/aws-auto-update-progress';
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
+import { failureFields } from '@/server/lib/failure-diagnostics';
+import { createProviderMigrationStore } from '@/server/lib/compute/provider-migrate-store';
 import { ImageJobConflictError, PlacementOwnerError, type PlacementDb, type PlacementExecutor } from '@/server/lib/compute/placement';
 import {
     matchesAck, REPO_OPEN_MAX_TIMEOUT_MS, REPO_OPEN_MIN_TIMEOUT_MS, REPO_OPEN_TRANSPORT_MARGIN_MS, requestRepoOpen, withRepositoryFolder,
@@ -68,7 +70,24 @@ const assignmentPhase = z.discriminatedUnion('phase', [
     z.object({phase:z.literal('open'),attemptId:uuid,captureSessionId:uuid,repoOpenProof:z.string().regex(/^[A-Za-z0-9_-]{48,1700}$/)}).strict(),
 ]);
 const assignmentLocked = () => shellRefusal(409,'assignment_recording_required','Share the assignment tab and wait for the first recorded frame to open Code.');
+const assignmentAwsUnverified = () => shellRefusal(409, 'assignment_aws_unverified', 'Universe could not verify this AWS workspace. Reopen the assignment on its assigned computer.');
+const assignmentUnavailable = () => shellRefusal(503, 'assignment_open_unavailable', 'Universe could not verify this assignment just now. Try again.');
 
+/** Return only the existing retry fields when an enrolled AWS computer is still waking. */
+function assignmentNotReady(preview: Record<string, unknown>) {
+    const answer: Record<string, unknown> = {ok: false};
+    for (const key of ['errorCode', 'error', 'provider', 'computeProvider', 'capacityAttemptId'] as const) {
+        const value = preview[key];
+        if (typeof value === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(value)) answer[key] = value;
+    }
+    if (typeof preview.retryable === 'boolean') answer.retryable = preview.retryable;
+    if (typeof preview.retryAfterMs === 'number' && Number.isSafeInteger(preview.retryAfterMs) && preview.retryAfterMs >= 0)
+        answer.retryAfterMs = preview.retryAfterMs;
+    for (const [key, value] of Object.entries(preview)) {
+        if (/^compute[A-Z][A-Za-z]{1,40}$/.test(key) && value === true) answer[key] = true;
+    }
+    return shellJson({...answer, ...failureFields({reason: preview.reason, correlationId: preview.correlationId})});
+}
 
 async function shellCaller(req: Request) {
     const headers = new Headers(req.headers);
@@ -205,6 +224,23 @@ async function target(ctx: ProjectCtx, computerId: string): Promise<ControlTarge
 }
 const isAws = (t: ControlTarget) => t.auth.kind === 'v2' && t.auth.claims.provider === 'aws-ec2';
 
+/** Normalize the placement store's Postgres timestamp or fail closed. */
+function migrationTime(value: unknown): number {
+    if (typeof value !== 'string') return NaN;
+    const time = value.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}(?::?\d{2})?)$/);
+    if (!time) return NaN;
+    const zone = time[4] === 'Z' ? 'Z' : time[4]!.slice(0, 3) + ':' + (time[4]!.replace(':', '').slice(3) || '00');
+    return Date.parse(time[1] + 'T' + time[2] + '.' + (time[3] ?? '').padEnd(3, '0').slice(0, 3) + zone);
+}
+
+function sameAssignmentBinding(before: Eligible, after: Eligible): boolean {
+    return before.boundWorkspaceId === after.boundWorkspaceId && before.upgradedWorkspaceId === after.upgradedWorkspaceId
+        && before.upgradeOperationId === after.upgradeOperationId && before.windowStartedAt === after.windowStartedAt
+        && before.deadlineAt === after.deadlineAt && before.manifestSha256 === after.manifestSha256
+        && before.jobId === after.jobId && before.attemptId === after.attemptId && before.repositoryUrl === after.repositoryUrl
+        && before.providerId === after.providerId && before.ref === after.ref;
+}
+
 /**
  * Open a Universe project repository in Code. In this order, and each step only after the one before it held:
  *
@@ -325,7 +361,9 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     const deadline = AbortSignal.any([request.signal, AbortSignal.timeout(Math.max(1, left()))]);
 
     await caller.computer.get({ id: computerId });
-    if (isAws(await target(ctx, computerId)) && (parsed.host !== 'github.ezil.work' || !awsStandaloneGitEnabled())) return unsupportedProvider();
+    const selected = await target(ctx, computerId);
+    const startedOnAws = isAws(selected);
+    if (startedOnAws && (parsed.host !== 'github.ezil.work' || !awsStandaloneGitEnabled())) return unsupportedProvider();
 
     // Only the parsed parts reach the resolver; it rebuilds the address on its literal github.com origin.
     const resolved = parsed.host === 'github.com' ? await resolvePublicGitHub({ host: parsed.host, owner: parsed.owner, name: parsed.name }, { signal: deadline }) : null;
@@ -375,9 +413,59 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     const reserved = staging && identity && canonicalHint && uuid.safeParse(canonicalHint).success
         && parsed.canonicalURL === expectedRepositoryURL(identity.subject,'a-' + canonicalHint);
     const phase = assignmentPhase.safeParse(request.assignment);
-    if ((request.assignment !== undefined && !reserved) || (reserved && (!request.allowAssignmentPreload || !phase.success || phase.data.attemptId !== canonicalHint
-        || !privatePacket || privatePacket.git.scope !== 'write' || !repoOpenSecret()))) return assignmentLocked();
+    const signer = request.allowAssignmentPreload && staging && process.env.UNIVERSE_PROJECT_REPO_ORIGIN === universeOrigin
+        ? repoOpenSecret() : undefined;
+    if ((request.assignment !== undefined && !reserved) || (reserved && (!signer || !phase.success || phase.data.attemptId !== canonicalHint
+        || !privatePacket || privatePacket.git.scope !== 'write'))) return assignmentLocked();
+    const attemptId = reserved && signer && identity && privatePacket ? enrolledAttempt(identity, privatePacket, Date.now()) : undefined;
+    const readEnrollment = async () => {
+        if (!attemptId || !identity) return null;
+        try {
+            return await recordingAction(identity, { action: 'preflight', attemptId }, { signal: deadline });
+        } catch (error) {
+            if (!startedOnAws) return null;
+            if (error instanceof BrokerError && error.code === 'identity_refresh_required')
+                return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
+            if (error instanceof BrokerError && (error.code === 'media_unavailable' || error.status >= 500)) return assignmentUnavailable();
+            return null;
+        }
+    };
+    // This is the exact machine selected and owned by the authenticated user. Universe's explicit null comes from a
+    // row-locked first bind. Both fresh and already-started first opens are permitted, but an omitted field is not null.
+    async function verifyAwsBinding(current: ControlTarget, enrolled: Eligible | null): Promise<boolean> {
+        if (!reserved || !startedOnAws || !isAws(current) || !identity || !privatePacket || !attemptId
+            || !enrolled || enrolled.boundWorkspaceId === undefined || current.sandboxName !== selected.sandboxName) return false;
+        if (current.auth.kind !== 'v2' || current.auth.claims.userId !== identity.userId
+            || current.auth.claims.computerId !== computerId || current.auth.claims.sandboxId !== current.sandboxName) return false;
+        const workspace = workspaceIdentity(identity.userId, computerId, current.sandboxName);
+        if (enrolled.boundWorkspaceId !== null && enrolled.boundWorkspaceId !== workspace) return false;
+        const now = Date.now();
+        if (!matchesEnrollment(enrolled, privatePacket, attemptId, now)) return false;
+        const expires = Date.parse(enrolled.expiresAt);
+        const start = enrolled.windowStartedAt === null ? null : Date.parse(enrolled.windowStartedAt);
+        const end = enrolled.deadlineAt === null ? null : Date.parse(enrolled.deadlineAt);
+        if (!Number.isFinite(expires) || expires <= now || ((start === null || end === null)
+            ? start !== null || end !== null
+            : !Number.isFinite(start) || !Number.isFinite(end) || start > now || end <= now || expires > end)) return false;
+        const migration = await createProviderMigrationStore(ctx.db as unknown as PlacementExecutor).readByComputer(computerId);
+        if (enrolled.upgradeOperationId) {
+            return enrolled.upgradedWorkspaceId === workspace && migration?.id === enrolled.upgradeOperationId
+                && migration.state === 'committed' && migration.userId === identity.userId && migration.computerId === computerId
+                && migration.fromProvider === 'cloudflare' && migration.toProvider === 'aws-ec2';
+        }
+        if (migration && (!['committed', 'failed_reopened'].includes(migration.state)
+            || migration.userId !== identity.userId || migration.computerId !== computerId)) return false;
+        if (start !== null && migration?.state === 'committed' && migration.toProvider === 'aws-ec2') {
+            const moved = migrationTime(migration.updatedAt);
+            if (!Number.isFinite(moved) || moved >= start) return false;
+        }
+        return true;
+    }
+    const beforeWake = reserved && startedOnAws ? await readEnrollment() : null;
+    if (beforeWake instanceof Response) return beforeWake;
+    if (reserved && startedOnAws && !await verifyAwsBinding(selected, beforeWake)) return assignmentAwsUnverified();
     const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown; computeProvider?: unknown; sandboxId?: unknown; generation?: unknown; leaseEpoch?: unknown };
+    if (!preview.ok && reserved && startedOnAws) return assignmentNotReady(preview);
     if (!preview.ok || typeof preview.codePreviewUrl !== 'string') return reserved ? assignmentLocked() : shellJson(preview);
     if (left() < REPO_OPEN_MIN_TIMEOUT_MS + REPO_OPEN_TRANSPORT_MARGIN_MS) return openTimedOut();
     if (!(await sameSession())) return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
@@ -402,15 +490,23 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     } else if (preview.computeProvider === 'aws-ec2') {
         return shellRefusal(409, 'repo_open_computer_changed', 'This computer changed while opening. Try again.');
     }
-    // Only a signed worker acknowledgement for this enrolled repository may authorize the assignment workspace.
-    const signer = request.allowAssignmentPreload && !isAws(controls) && process.env.UNIVERSE_PROJECT_REPO_ORIGIN === universeOrigin
-        && ['https://ai-staging.ezil.work','https://ai-staging.ezil.work/'].includes(process.env.BILLING_FUNDING_URL ?? '')
-        ? repoOpenSecret() : undefined;
-    const attemptId = signer && identity && privatePacket ? enrolledAttempt(identity, privatePacket, Date.now()) : undefined;
-    const enrolled = attemptId && identity && privatePacket
-        ? await recordingAction(identity,{action:'preflight',attemptId},{signal:deadline}).catch(() => null) : null;
-    const challenge = enrolled && privatePacket && attemptId && matchesEnrollment(enrolled, privatePacket, attemptId, Date.now())
+    if (reserved && startedOnAws !== isAws(controls)) return assignmentAwsUnverified();
+    const authority = beforeWake ?? await readEnrollment();
+    if (authority instanceof Response) return authority;
+    let enrolled = authority;
+    // A cold AWS wake may outlast the preliminary proof. The fresh check before checkout verifies its replacement.
+    const challenge = authority && privatePacket && attemptId
+        && (startedOnAws || matchesEnrollment(authority, privatePacket, attemptId, Date.now()))
         ? makeChallenge(attemptId, privatePacket.repository.canonicalURL) : undefined;
+    if (reserved && !challenge) return startedOnAws ? assignmentAwsUnverified() : assignmentLocked();
+    if (reserved && startedOnAws && signer && identity && attemptId && phase.success && phase.data.phase === 'open') {
+        const suppliedProof = phase.data.repoOpenProof;
+        const proof = (() => { try { return readOpen(suppliedProof, identity, attemptId, Date.now(), signer); } catch { return null; } })();
+        if (!proof || proof.workspaceId !== workspaceIdentity(identity.userId, computerId, controls.sandboxName)
+            || proof.repositoryUrl !== parsed.canonicalURL || proof.providerId !== privatePacket?.repository.id
+            || proof.manifestSha256 !== authority?.manifestSha256) return assignmentLocked();
+    }
+    let revalidationRefusal: Response | undefined;
     const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS,
         privatePacket ? Date.parse(privatePacket.git.expiresAt) - Date.now() - 15_000 : REPO_OPEN_MAX_TIMEOUT_MS);
     if (timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS) {
@@ -426,7 +522,22 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
             git: privatePacket ? { token: privatePacket.git.token, expiresAt: privatePacket.git.expiresAt, scope: privatePacket.git.scope } : null,
             ...(privatePacket ? { privatePacket, ...(identity?.gitAuthor ? { gitAuthor: identity.gitAuthor } : {}) } : {}), timeoutMs },
         { correlationId: newCorrelationId(), signal: deadline, awsStandaloneEnabled: awsStandaloneGitEnabled(),
-            revalidateTarget: () => target(ctx, computerId) });
+            revalidateTarget: async () => {
+                const current = await target(ctx, computerId);
+                // The AWS transport calls this immediately before and after checkout, and itself compares the full
+                // placement claims both times. A changed/missing binding retires the request before any proof or URL.
+                if (reserved && startedOnAws) {
+                    const latest = await readEnrollment();
+                    if (latest instanceof Response || !authority || !latest || !sameAssignmentBinding(authority, latest)
+                        || !await verifyAwsBinding(current, latest) || !await sameSession()) {
+                        revalidationRefusal = latest instanceof Response ? latest : assignmentAwsUnverified();
+                        throw new Error('assignment_aws_unverified');
+                    }
+                    enrolled = latest;
+                }
+                return current;
+            } });
+    if (revalidationRefusal) return revalidationRefusal;
     if (!opened.ok) {
         if (opened.errorCode === 'repo_open_unsupported_provider') return unsupportedProvider();
         return repoOpenFailureResponse(ctx.db, ctx.user.id, computerId, opened, "This repository's files could not be opened. Try again.");

@@ -32,7 +32,12 @@ export type Prepare = Extract<Input, { action: 'prepare' }>;
 const moment = z.string().datetime({offset: true});
 export const eligible = z.object({status: z.literal('eligible'), attemptId: uuid,
     jobId: z.string().regex(/^[1-9][0-9]{0,18}$/), expiresAt: moment, windowStartedAt: moment.nullable(), deadlineAt: moment.nullable(),
-    manifestSha256: z.string().regex(/^[a-f0-9]{64}$/), repositoryUrl: z.string().max(260), providerId: z.string().regex(/^[a-z0-9]{1,64}$/), ref: z.literal('refs/heads/main')});
+    manifestSha256: z.string().regex(/^[a-f0-9]{64}$/), repositoryUrl: z.string().max(260), providerId: z.string().regex(/^[a-z0-9]{1,64}$/), ref: z.literal('refs/heads/main'),
+    boundWorkspaceId: z.string().regex(/^[a-f0-9]{64}$/).nullable().optional(),
+    upgradedWorkspaceId: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    upgradeOperationId: uuid.optional(),
+}).refine(state => (state.upgradedWorkspaceId === undefined) === (state.upgradeOperationId === undefined));
+export type Eligible = z.infer<typeof eligible>;
 const control = {
     recordingId: uuid, status: z.enum(['awaiting_frame','paused','recording', 'empty', 'partial', 'complete']),
     startedAt: moment.nullable(), deadlineAt: moment.nullable(),
