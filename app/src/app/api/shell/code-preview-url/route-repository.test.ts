@@ -39,7 +39,7 @@ const s = vi.hoisted(() => ({
     swapSessionOnMint: false,
     aws: [false, false] as boolean[],
     migration: null as null | { id: string; state: string; userId: string; computerId: string;
-        fromProvider: string; toProvider: string },
+        fromProvider: string; toProvider: string; updatedAt?: string },
     preview: { ok: true } as Record<string, unknown>,
     /** How long the stubbed Code mint takes, ms of `Date.now()`. */
     mintTakes: 0,
@@ -627,6 +627,135 @@ describe('a reserved assignment repository whose computer or Universe is not rea
         const blocked = await prepare();
         expect(blocked.ok).toBe(false);
         expect(await blocked.text()).not.toContain('preview-bootstrap');
+    });
+
+    it('starts a direct AWS assignment only from Universe\'s bound workspace on the current placement, and keeps Cloudflare and migration as they were', async () => {
+        const { open, prep, universe, enrolled, repositoryUrl, now } = await enrolledFixture();
+        const { readOpen, sealOpen, workspaceIdentity } = await import('@/server/assignment-video/repo-open');
+        const foreign = '0'.repeat(64);
+        // Cloudflare ignores the field entirely: the same prepare as before the field existed.
+        universe.preflight = () => Response.json({ ...enrolled, boundWorkspaceId: foreign });
+        const onCloudflare = await open(prep);
+        expect(onCloudflare.status).toBe(200);
+        expect(await onCloudflare.json()).toMatchObject({ ok: true, assignmentOpen: { attemptId } });
+
+        vi.stubEnv('AWS_STANDALONE_REPO_OPEN_ENABLED', '1');
+        Object.assign(s.preview, { computeProvider: 'aws-ec2', sandboxId: SANDBOX, generation: 3, leaseEpoch: 1 });
+        const workspace = workspaceIdentity(USER, COMPUTER, SANDBOX);
+        const prepare = (aws = Array<boolean>(6).fill(true)) => { s.aws = aws; return open(prep); };
+        const started = { windowStartedAt: new Date(now - 1000).toISOString(), deadlineAt: new Date(now + 3480000).toISOString() };
+        const operation = '99999999-9999-4999-8999-999999999999';
+        const committed = { id: operation, state: 'committed', userId: USER, computerId: COMPUTER, fromProvider: 'cloudflare', toProvider: 'aws-ec2' };
+        const refused = async (enrollment: object, migration: typeof s.migration = null) => {
+            universe.preflight = () => Response.json(enrollment);
+            s.migration = migration; s.order = [];
+            const response = await prepare();
+            expect(response.status).toBe(409);
+            expect((await response.json()).error.code).toBe('assignment_aws_unverified');
+            expect(s.order).not.toContain('codePreviewUrl');
+            expect(s.order).not.toContain('worker');
+        };
+        await refused(enrolled); // an older Universe: the field is absent
+        await refused({ ...enrolled, boundWorkspaceId: 'not-a-workspace' });
+        await refused({ ...enrolled, boundWorkspaceId: foreign });
+        await refused({ ...enrolled, boundWorkspaceId: foreign, ...started });
+        await refused({ ...enrolled, boundWorkspaceId: null, ...started }); // null is a first opening only
+        await refused({ ...enrolled, boundWorkspaceId: null }, { ...committed, state: 'exported' });
+        await refused({ ...enrolled, boundWorkspaceId: workspace, ...started }, { ...committed, state: 'provisioning' });
+        // A committed migration still has to name this workspace, and a foreign binding cannot ride along with it.
+        const migrated = { ...enrolled, upgradedWorkspaceId: workspace, upgradeOperationId: operation };
+        await refused({ ...migrated, boundWorkspaceId: foreign }, committed);
+        await refused({ ...migrated, upgradedWorkspaceId: foreign }, committed);
+        await refused({ ...enrolled, boundWorkspaceId: null }, { ...committed, state: 'failed_needs_operator' });
+        // A move that committed DURING the running assignment is not a plain AWS computer: only verified upgrade metadata opens it.
+        const pg = (ms: number) => new Date(ms).toISOString().replace('T', ' ').replace('Z', '+00');
+        const bound = { ...enrolled, boundWorkspaceId: workspace, ...started };
+        for (const updatedAt of [pg(now - 500), pg(now - 1000), new Date(now - 500).toISOString(), 'yesterday', '', undefined])
+            await refused(bound, { ...committed, updatedAt });
+        const earlier = { ...committed, updatedAt: pg(now - 60000) };
+        // The binding is read again after the mint: one that changed meanwhile never reaches the Worker.
+        universe.preflight = () => Response.json({ ...enrolled, boundWorkspaceId: s.order.includes('codePreviewUrl') ? foreign : null });
+        s.migration = null; s.order = [];
+        const raced = await prepare();
+        expect(raced.status).toBe(409);
+        expect(s.order).toContain('codePreviewUrl');
+        expect(s.order).not.toContain('worker');
+
+        // The first opening: Universe has bound nothing and started no clock.
+        s.migration = null;
+        s.worker = body => {
+            const { repositoryId, assignmentPreload } = JSON.parse(body);
+            const folder = '/workspace/projects/' + repositoryId;
+            return Response.json({ ok: true, status: 'fetched', folder, checkoutFolder: folder + '/' + repositoryUrl.split('/').at(-1)!.slice(0, -4),
+                assignmentPreload: { eventId: assignmentPreload.eventId, nonce: assignmentPreload.nonce, port: 5679, status: 'acknowledged' } });
+        };
+        universe.preflight = () => Response.json({ ...enrolled, boundWorkspaceId: null });
+        const prepared = await prepare();
+        expect(prepared.status).toBe(200);
+        const preparation = await prepared.json();
+        expect(preparation).toMatchObject({ ok: true, assignmentOpen: { attemptId, windowStartedAt: null, deadlineAt: null } });
+        expect(preparation.codePreviewUrl).toBeUndefined();
+        const proof = preparation.assignmentOpen.proof;
+        const actor = { userId: USER, issuer: 'https://id.ezil.work/', subject, sessionId: s.sessionId, expiresAt: now + 600000 };
+        const receipt = readOpen(proof, actor, attemptId, Date.now(), signingKey).eventId;
+        const editorReady = () => s.requests.filter(request => request.url.pathname.endsWith('/editor-ready')).length;
+        universe.status = () => Response.json({ captureSessionId, recordingId, repositoryOpenReceiptId: receipt, status: 'recording',
+            revoked: false, stopRequestedAt: null, startedAt: new Date(now - 1000).toISOString(),
+            deadlineAt: new Date(now + 3480000).toISOString(), firstFrameAt: new Date(now - 1000).toISOString(),
+            phaseReady: true, workspaceUnlocked: true });
+        universe.ready = () => Response.json({ startedAt: new Date(now).toISOString(), deadlineAt: new Date(now + 3480000).toISOString(),
+            serverNow: new Date(now).toISOString(), revision: 2, remainingMs: 3480000, pausedAt: null, pauseReason: null });
+        const enter = { phase: 'open', attemptId, captureSessionId, repoOpenProof: proof };
+        const enterOpen = (assignment: object = enter, aws?: boolean[]) => { s.aws = aws ?? Array<boolean>(6).fill(true); return open(assignment); };
+
+        // A proof sealed for another workspace never starts the editor or the clock.
+        const elsewhere = sealOpen(actor, enrolled as never, COMPUTER, 'guac-9999999999994999-8888888888884888', receipt, Date.now(), signingKey).proof;
+        expect((await enterOpen({ ...enter, repoOpenProof: elsewhere })).status).toBe(409);
+        expect(editorReady()).toBe(0);
+        // The computer moved or was replaced between the proof and the open: refused before the Worker or the clock.
+        s.preview.sandboxId = 'guac-3333333333334333-4444444444444444';
+        s.order = [];
+        expect((await enterOpen()).status).toBe(409);
+        expect(s.order).not.toContain('worker');
+        s.preview.sandboxId = SANDBOX;
+        s.order = [];
+        expect((await enterOpen(enter, [true, false, false, false, false, false])).status).toBe(409);
+        expect(s.order).not.toContain('worker');
+        expect(editorReady()).toBe(0);
+
+        const reopened = await enterOpen();
+        expect(reopened.status).toBe(200);
+        expect(new URL((await reopened.json()).codePreviewUrl).searchParams.get('folder')).toBe(preparation.repository.workspaceFolder);
+        expect(editorReady()).toBe(1);
+
+        // The same attempt again, now that its clock runs and Universe bound this workspace: the same window, not a new one.
+        universe.preflight = () => Response.json({ ...enrolled, boundWorkspaceId: workspace, ...started });
+        const retried = await prepare();
+        expect(retried.status).toBe(200);
+        expect(await retried.json()).toMatchObject({ ok: true, assignmentOpen: { attemptId, ...started } });
+        // ...also when the computer moved to AWS strictly before that window began.
+        s.migration = earlier;
+        expect((await prepare()).status).toBe(200);
+        // A fresh attempt on a computer that moved to AWS earlier is eligible: nothing was running during the move.
+        universe.preflight = () => Response.json({ ...enrolled, boundWorkspaceId: null });
+        s.migration = { ...committed, updatedAt: pg(now + 1000) };
+        expect((await prepare()).status).toBe(200);
+
+        // A committed migration of this workspace keeps working, whenever it committed.
+        universe.preflight = () => Response.json(migrated);
+        s.migration = committed;
+        expect((await prepare()).status).toBe(200);
+        universe.preflight = () => Response.json({ ...migrated, ...started });
+        s.migration = { ...committed, updatedAt: pg(now - 500) };
+        expect((await prepare()).status).toBe(200);
+
+        // An old host that cannot acknowledge the private nonce never mints a proof or a Code URL.
+        s.worker = body => Response.json({ ok: true, status: 'fetched', folder: '/workspace/projects/' + JSON.parse(body).repositoryId });
+        universe.preflight = () => Response.json({ ...enrolled, boundWorkspaceId: null });
+        s.migration = null;
+        const old = await prepare();
+        expect(old.ok).toBe(false);
+        expect(await old.text()).not.toContain('preview-bootstrap');
     });
 
     it('a cold computer answers its wake fields only (no Universe, no Worker, no URL, no capability), so the wake loop waits', async () => {

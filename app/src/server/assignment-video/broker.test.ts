@@ -319,6 +319,17 @@ describe('assignment media broker',()=>{
             await expect(recordingAction(identity,request,{...d,fetcher:async()=>Response.json(invalid)}))
                 .rejects.toMatchObject({code:'recording_unavailable'});
     });
+    it('projects the direct AWS binding only as absent, null or a 64-hex workspace',async()=>{
+        const request = {action:'preflight' as const,attemptId:attempt};
+        const d = deps();
+        for (const bound of [undefined,null,'b'.repeat(64)]) {
+            const body = bound === undefined ? eligibility : {...eligibility,boundWorkspaceId:bound};
+            await expect(recordingAction(identity,request,{...d,fetcher:async()=>Response.json(body)})).resolves.toEqual(body);
+        }
+        for (const bound of ['B'.repeat(64),'b'.repeat(63),'',1])
+            await expect(recordingAction(identity,request,{...d,fetcher:async()=>Response.json({...eligibility,boundWorkspaceId:bound})}))
+                .rejects.toMatchObject({code:'recording_unavailable'});
+    });
     it('accepts revised eligibility and exposes a paused snapshot without authorizing a checkout',async()=>{
         const reopened = {...eligibility, deadlineAt:time(initial+hour+50000),revision:2,pausedAt:null};
         const d = {...deps(),fetcher:async()=>Response.json(reopened)};

@@ -72,6 +72,7 @@ function causeMessage(cause,error,item) {
     if(cause==='wrong_tab')return 'Select this EZiL OS tab. The other source was discarded.';
     if(error?.name==='NotAllowedError')return 'Sharing was declined. Share this OS tab to open your editor.';
     if(cause==='repo_open_unsupported_provider')return 'This computer does not support assignment recording. Select a Cloudflare computer you own in EZiL OS, then reopen the assignment.';
+    if(cause==='assignment_aws_unverified')return 'This AWS computer is not verified for this assignment. Reopen it from Universe on the computer you started with, or select a Cloudflare computer you own.';
     if(cause==='assigned_checkout_unverified')return 'The assigned checkout could not be verified.'+(item.accepted?' Accepted footage is preserved.':'')+' Share this tab to try again.';
     if(cause==='assignment_recording_required')return 'This assignment opens only in its own recorded EZiL OS tab. Open it again from Universe.';
     if(WAKING.includes(cause))return 'Your computer is still starting.'+again;
@@ -274,7 +275,9 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     }
     function showSignIn(){
         lockedView('Sign in to EZiL OS','Return to this assignment after signing in.');
-        const dest='/app/code?'+new URLSearchParams({repo,assignment:attemptId});
+        const params=new URLSearchParams({repo,assignment:attemptId});
+        if(uuid.test(computerId??''))params.set('computer',computerId);
+        const dest='/app/code?'+params;
         ui.action('Sign in to EZiL OS',()=>win.location.assign('/auth/auth0/login?'+new URLSearchParams({returnUrl:dest})));
     }
     async function eligible(){
@@ -291,9 +294,14 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
                 const upgradedAssignment = provider === 'aws-ec2'
                     && /^[a-f0-9]{64}$/.test(result.upgradedWorkspaceId ?? '')
                     && uuid.test(result.upgradeOperationId ?? '');
-                if (provider !== 'cloudflare' && !upgradedAssignment) {
+                // A direct AWS start: Universe's trusted `boundWorkspaceId` must be present, null only before a window
+                // started, or the workspace it bound. The server alone checks it against this computer's own workspace.
+                const bound = result.boundWorkspaceId;
+                const directAssignment = provider === 'aws-ec2'
+                    && ((bound === null && !result.windowStartedAt && !result.deadlineAt) || /^[a-f0-9]{64}$/.test(bound ?? ''));
+                if (provider !== 'cloudflare' && !upgradedAssignment && !directAssignment) {
                     lockedView('Choose an assignment-ready computer',provider === 'aws-ec2'
-                        ? 'This AWS computer does not support assignment recording. Select a Cloudflare computer you own in EZiL OS, then reopen the assignment.'
+                        ? 'Universe has not verified this AWS computer for this assignment. Reopen the assignment from Universe, or select a Cloudflare computer you own in EZiL OS.'
                         : 'EZiL OS could not verify this computer’s assignment support. Check its provider in Settings → System, then try again.');
                     ui.action('Check this computer again',eligible);
                     return;

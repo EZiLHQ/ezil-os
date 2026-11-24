@@ -952,9 +952,28 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-assignment-work-gate h2{margin:0 0 8px;color:inherit;font:600 22px/1.35 system-ui,sans-serif}
 .ezil-assignment-work-gate p{margin:0;color:#c3d0df}
 .ezil-assignment-work-gate button{margin-top:16px;padding:7px 13px;border:1px solid #a6bbd1;border-radius:5px;background:#edf5fe;color:#152236;cursor:pointer}
-.ezil-assignment-recording-status{position:fixed;top:max(6px,env(safe-area-inset-top));right:10px;z-index:2147483645;border:1px solid #5d7187;border-radius:16px;padding:5px 9px;background:#1b2631;color:#fff;font:600 12px/1.3 system-ui,sans-serif;cursor:pointer}
-.ezil-assignment-recording-status::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:#f46b68;margin-right:6px}
-.ezil-assignment-recording-status:focus-visible{outline:#fff solid 2px;outline-offset:2px}
+.ezil-assignment-recording-status{position:fixed;top:max(6px,env(safe-area-inset-top));right:max(10px,env(safe-area-inset-right));z-index:2147483645;display:flex;align-items:center;gap:7px;box-sizing:border-box;max-width:calc(100vw - 20px);padding:3px 4px 3px 10px;border:1px solid #5d7187;border-radius:16px;background:#1b2631;color:#fff;font:600 12px/1.3 system-ui,sans-serif}
+.ezil-assignment-recording-dot{flex:none;box-sizing:border-box;width:9px;height:9px;border-radius:50%;border:2px solid #f46b68;background:0 0}
+.ezil-assignment-recording-status[data-state=recording] .ezil-assignment-recording-dot{background:#f46b68}
+@media (prefers-reduced-motion:no-preference){
+.ezil-assignment-recording-status[data-state=recording] .ezil-assignment-recording-dot{animation:2.4s ease-in-out infinite ezil-assignment-pulse}
+}
+@keyframes ezil-assignment-pulse{
+50%{opacity:.45}
+}
+.ezil-assignment-recording-time{flex:none;min-width:4.2ch;font-variant-numeric:tabular-nums;letter-spacing:.01em}
+.ezil-assignment-recording-state{min-width:5ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#c9d6e4;font-weight:500}
+.ezil-assignment-recording-stop{flex:none;min-height:24px;padding:0 10px;border:1px solid #a6bbd1;border-radius:12px;background:#edf5fe;color:#152236;font:inherit;cursor:pointer}
+.ezil-assignment-recording-stop[hidden]{display:none}
+.ezil-assignment-recording-stop:focus-visible{outline:#fff solid 2px;outline-offset:2px;box-shadow:0 0 0 4px #1b2631}
+.ezil-assignment-recording-sr{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap}
+@media (max-width:480px){
+.ezil-assignment-recording-status{gap:5px;padding-left:8px}
+.ezil-assignment-recording-state{max-width:11ch}
+}
+@media (forced-colors:active){
+.ezil-assignment-recording-status[data-state=recording] .ezil-assignment-recording-dot{background:Highlight}
+}
 .ezil-settings-window{--bg:#04060c;--surface:#0d1118;--surface-2:#141a23;--border:rgba(255, 255, 255, 0.08);--text:#f5f5f4;--muted:#9aa3ad;--accent:var(--ezil-accent, #00adb5);--accent-ink:var(--ezil-accent-contrast, #04060c);--warn:#f5a524;--danger:#f05d5e;container-type:inline-size;container-name:ezil-settings-window;max-width:100vw}
 .ezil-settings-window .window-body{background:var(--bg);color:var(--text)}
 .ezil-settings,.ezil-settings *{box-sizing:border-box}
