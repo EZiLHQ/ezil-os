@@ -32,12 +32,35 @@ export async function checkAssignmentVideoEligibility(attemptId, {fetcher = glob
     return result;
 }
 
-export function createAssignmentVideoTransport({attemptId, repoOpenProof, consentVersion, captureSessionId, onStop, fetcher = globalThis.fetch,
+/** A report of the server's clock: the answers that carry `deadlineAt` (begin, the seed's confirm, status). */
+const hasClock = data => data && typeof data === 'object' && typeof data.deadlineAt === 'string';
+
+/**
+ * The assignment's server clock (`{serverNow, startedAt, deadlineAt, pausedAt, pauseReason, remainingMs, revision}`,
+ * nullable before the clock starts). Needs no capture lease, so it answers after a refresh and after a share stops.
+ */
+export async function checkAssignmentClock(attemptId, {fetcher = globalThis.fetch} = {}) {
+    if (!uuid.test(attemptId)) throw failure('invalid_assignment');
+    const result = await callControl(attemptId, 'clock', {}, fetcher);
+    if (!result || typeof result !== 'object' || !Number.isSafeInteger(result.revision)) throw failure('recording_unavailable');
+    return result;
+}
+
+/** The longest a segment's end may be: an hour, or the span the server's clock now allows once it has given paused time back. */
+const HOUR = 3600000;
+
+export function createAssignmentVideoTransport({attemptId, repoOpenProof, consentVersion, captureSessionId, onStop, onClock, maxEndMs = () => HOUR, paused = () => false, fetcher = globalThis.fetch,
     clock = Date.now, pollMs = 3000}) {
     if (!uuid.test(attemptId) || (captureSessionId && !uuid.test(captureSessionId)) || typeof repoOpenProof !== 'string' || !/^[A-Za-z0-9_-]{48,1700}$/.test(repoOpenProof) || !Number.isSafeInteger(consentVersion) || consentVersion < 1)
         throw failure('invalid_assignment');
     let recording, poll, expiry, disposed = false, stopped = false, misses = 0;
     function clearTimers() { clearTimeout(poll); clearTimeout(expiry); }
+    // While the server's clock is paused its deadline is not running down: the local copy waits instead of ending the share.
+    function expire(reason, at) {
+        if (disposed || stopped) return;
+        if (paused()) { expiry = setTimeout(() => expire(reason, at), pollMs); return; }
+        stop(reason, at);
+    }
     function stop(reason, effectiveAt = null) {
         if (stopped || disposed) return;
         stopped = true;
@@ -52,7 +75,17 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         const data = await control('status');
         if (!recording || data.recordingId !== recording.recordingId) throw failure('recording_changed');
         if (captureSessionId && data.captureSessionId !== captureSessionId) throw failure('recording_phase_changed');
-        if (data.revoked || data.stopRequestedAt || (data.status !== 'recording' && !(captureSessionId && data.status === 'awaiting_frame'))) {
+        // A server-declared system pause (it names its cause) is a running share with a stopped clock, not an end.
+        const systemPause = data.status === 'paused' && (typeof data.pauseReason === 'string' || typeof data.pausedAt === 'string');
+        if (hasClock(data) && typeof onClock === 'function') onClock(data);
+        // A later deadline (the server gave back time it stopped for a system interruption) moves the local expiry with it.
+        const later = Date.parse(data.deadlineAt);
+        if (!stopped && !disposed && Number.isFinite(later) && later > Date.parse(recording.deadlineAt) && later - clock() <= 3600000 + 1500) {
+            recording = {...recording, deadlineAt: data.deadlineAt};
+            clearTimeout(expiry);
+            expiry = setTimeout(() => expire('timeout', recording.deadlineAt), later - clock());
+        }
+        if (data.revoked || data.stopRequestedAt || (data.status !== 'recording' && !systemPause && !(captureSessionId && data.status === 'awaiting_frame'))) {
             const why = ['submitted','timeout','stopped'].includes(data.stopReason) ? data.stopReason : 'stopped';
             const cutoff = data.stopRequestedAt ?? (why === 'timeout' ? recording.deadlineAt : null);
             stop(why, typeof cutoff === 'string' && Number.isFinite(Date.parse(cutoff)) ? cutoff : null);
@@ -79,7 +112,7 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
             || (recording && recording.recordingId !== data.recordingId)) throw failure('recording_changed');
         recording = data;
         clearTimers();
-        expiry = setTimeout(() => stop(provisional?'unavailable':'timeout', data.deadlineAt), Math.min(3600000, deadline-clock()));
+        expiry = setTimeout(() => expire(provisional?'unavailable':'timeout', data.deadlineAt), Math.min(3600000, deadline-clock()));
         poll = setTimeout(watch, pollMs);
         return data;
     }
@@ -88,7 +121,7 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         const blob = bytes instanceof Blob ? bytes : new Blob([bytes], {type:'video/webm'});
         if (mimeType !== 'video/webm' || !Number.isSafeInteger(sequence) || sequence < 0 || sequence >= 600
             || !Number.isSafeInteger(startMs) || !Number.isSafeInteger(endMs) || endMs <= startMs
-            || startMs < 0 || endMs > 3600000 || endMs-startMs > 60000 || !blob.size || blob.size > 8*1024*1024)
+            || startMs < 0 || endMs > Math.max(HOUR, maxEndMs()) || endMs-startMs > 60000 || !blob.size || blob.size > 8*1024*1024)
             throw failure('invalid_segment');
         const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
         const sha256 = Array.from(new Uint8Array(digest), n => n.toString(16).padStart(2,'0')).join('');
@@ -111,7 +144,8 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
             const remaining=end-(Number.isFinite(serverNow)?serverNow:clock());
             if (!Number.isFinite(end) || remaining<=0 || remaining>3600000+1500) throw failure('recording_changed');
             recording={...recording,startedAt:result.startedAt,deadlineAt:result.deadlineAt};
-            clearTimeout(expiry); expiry=setTimeout(()=>stop('timeout',recording.deadlineAt),remaining);
+            if (typeof onClock === 'function') onClock(result);
+            clearTimeout(expiry); expiry=setTimeout(()=>expire('timeout',recording.deadlineAt),remaining);
         }
         return result;
     }

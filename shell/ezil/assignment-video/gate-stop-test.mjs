@@ -85,7 +85,9 @@ function harness(t,{prepare,control={},video,media=false,settleMs=40,saveCeiling
             const sequence=Number(String(url).split('/segments/')[1].split('/')[0]);calls.push('put:'+sequence);
             return await control.put?.(sequence)??new Response(null,{status:200});
         }
-        const body=JSON.parse(options.body);calls.push(body.action+(Number.isInteger(body.sequence)?':'+body.sequence:''));
+        const body=JSON.parse(options.body);
+        // The server clock is asked for on its own schedule (`clock`); `calls` is the recording protocol only.
+        if(body.action!=='clock')calls.push(body.action+(Number.isInteger(body.sequence)?':'+body.sequence:''));
         if(control[body.action])return control[body.action](body);
         if(body.action==='preflight')return Response.json({status:'eligible',attemptId:id,repositoryUrl:repo,expiresAt:new Date(Date.now()+60000).toISOString()});
         return Response.json({});

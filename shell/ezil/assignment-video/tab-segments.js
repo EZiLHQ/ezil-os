@@ -72,9 +72,14 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
     video.srcObject = stream;
     let active = true, timer, segment, pendingUpload, sequence = firstSequence, last = null, stopped, recovery;
     let uploadsQueued = 0;
+    // `held`: a server-gated hold (`hold`/`release`) stops recording. The timeline stays the real wall clock since the
+    // window started: a hold leaves an honest gap between two clips, never a compressed one.
+    let held = false;
     const wall = Date.now()+clockOffset, mono = win.performance.now();
     const time = () => Math.floor(wall + win.performance.now() - mono - windowStart);
-    const limit = deadline - windowStart;
+    // The server's deadline in wall time; a later report (time the server gave back) moves it with `setDeadline`.
+    let deadlineAt = deadline;
+    const limit = () => deadlineAt - windowStart;
     const canvas = win.document.createElement('canvas');
     const ctx = canvas.getContext('2d', {alpha:false});
     try {
@@ -138,7 +143,7 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
         function usableTime() {
             const t = time();
             if (!matches() || t < 0) throw new Error('source_lost');
-            if (t >= limit) throw new Error('deadline');
+            if (t >= limit()) throw new Error('deadline');
             return t;
         }
         async function resume(wait, pausedAt) {
@@ -155,13 +160,48 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
                 onResume?.();
                 if (active && !recovery) timer = win.setTimeout(tick, 1001);
             } catch (err) {
-                if (active && !signal?.aborted) fault(faultCode(err));
+                if (active && !signal?.aborted && !wait.signal.aborted) fault(faultCode(err));
             } finally {
                 signal?.removeEventListener('abort', cancel);
             }
         }
+        /** Stop recording while the server's clock is paused: seal the clip so far, leave no timer and no sampling until `release`. */
+        function hold() {
+            if (!active || held || signal?.aborted) return;
+            try {
+                const t = usableTime();
+                held = true;
+                win.clearTimeout(timer);
+                recovery?.abort();
+                recovery = undefined;
+                if (segment) rotate(Math.min(t, (last ?? t)+1000), true);
+            } catch (err) { fault(faultCode(err)); }
+        }
+        /** End a hold: wait for a fresh frame of the shared tab, then record again; the held time stays a gap on the real timeline. */
+        function release() {
+            if (!active || !held || signal?.aborted) return;
+            held = false;
+            const wait = new AbortController();
+            recovery = wait;
+            const cancel = () => wait.abort();
+            signal?.addEventListener('abort', cancel, {once:true});
+            void (async () => {
+                try {
+                    await freshFrame(video, track, recoveryMs, undefined, win, wait.signal, true);
+                    if (!active || wait.signal.aborted || held) return;
+                    const t = usableTime();
+                    if (track.muted || video.readyState < 2) throw new Error('no_current_frame');
+                    record(t);
+                    recovery = undefined;
+                    onResume?.();
+                    if (active && !recovery && !held) timer = win.setTimeout(tick, 1001);
+                } catch (err) {
+                    if (active && !signal?.aborted && !held && !wait.signal.aborted) fault(faultCode(err));
+                } finally { signal?.removeEventListener('abort', cancel); }
+            })();
+        }
         function pause(cause='track_muted') {
-            if (!active || recovery || signal?.aborted) return;
+            if (!active || recovery || held || signal?.aborted) return;
             try {
                 const t = usableTime();
                 const wait = new AbortController();
@@ -202,13 +242,14 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
         }
         sample();
         if (active && !recovery) timer = win.setTimeout(tick, 1001);
-        return {pause, stop(effectiveAt) {
+        return {pause, hold, release, held:() => held, setDeadline(at) { if (Number.isFinite(at)) deadlineAt = at; },
+        stop(effectiveAt) {
             if (stopped) return stopped;
             active = false; win.clearTimeout(timer);
             recovery?.abort();
             const cutoffAt = Date.parse(effectiveAt);
-            const end = Math.min(limit,time(), (last ?? 0)+1000,
-                Number.isFinite(cutoffAt) ? cutoffAt-windowStart : limit);
+            const end = Math.min(limit(),time(), (last ?? 0)+1000,
+                Number.isFinite(cutoffAt) ? cutoffAt-windowStart : limit());
             video.pause(); video.srcObject = null;
             const finalSegment = segment;
             segment = undefined;
