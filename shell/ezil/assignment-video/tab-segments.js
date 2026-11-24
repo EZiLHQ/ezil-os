@@ -1,5 +1,23 @@
 import {createVP8Muxer} from './vp8-webm.js';
 
+// A newly shared, static tab may need a paint before play() can finish. Subscribe before starting playback,
+// paint the capture status while playback is pending, and bound the whole wait with one timeout.
+export async function playToPresentedFrame(video, timers, timeoutMs, onWaiting) {
+    let timeout, frameRequest;
+    try {
+        const frame = new Promise(resolve => { frameRequest = video.requestVideoFrameCallback(resolve); });
+        const deadline = new Promise((_, reject) => {
+            timeout = timers.setTimeout(() => reject(new Error('no_current_frame')), timeoutMs);
+        });
+        const playing = Promise.resolve().then(() => video.play());
+        const paint = Promise.resolve().then(() => onWaiting?.());
+        await Promise.race([Promise.all([playing, paint, frame]), deadline]);
+    } finally {
+        timers.clearTimeout(timeout);
+        if (frameRequest !== undefined) video.cancelVideoFrameCallback(frameRequest);
+    }
+}
+
 export async function encodeTabSegments({win, stream, matches, windowStart, deadline, upload, cutoff, onFault, onFrame, onAwaitFrame, firstSequence=0, clockOffset=0}) {
     const video = win.document.createElement('video');
     video.muted = true;
@@ -12,13 +30,8 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
     const canvas = win.document.createElement('canvas');
     const ctx = canvas.getContext('2d', {alpha:false});
     try {
-        await video.play();
-        // Wait for a compositor frame presented after authorization. Never encode the pre-armed track's cached image.
-        await new Promise((resolve, reject) => {
-            const timeout = win.setTimeout(() => reject(new Error('no_current_frame')), 4500);
-            video.requestVideoFrameCallback(() => { win.clearTimeout(timeout); resolve(); });
-            onAwaitFrame?.();
-        });
+        // Wait for the authorized tab's compositor frame before encoding the ongoing recording.
+        await playToPresentedFrame(video, win, 4500, onAwaitFrame);
         if (!matches() || !ctx || !video.videoWidth || !video.videoHeight) throw new Error('source_lost');
         const scale = Math.min(1, 1920/video.videoWidth, 1080/video.videoHeight);
         canvas.width = Math.max(2, 2*Math.floor(video.videoWidth*scale/2));
@@ -118,12 +131,7 @@ export async function seedFrame(stream,valid,onWaiting) {
     video.srcObject=stream; video.muted=true; video.playsInline=true;
     let encoder;
     try {
-        await video.play();
-        await new Promise((resolve,reject)=>{
-            const timeout=setTimeout(()=>reject(new Error('no_current_frame')),8000);
-            video.requestVideoFrameCallback(()=>{clearTimeout(timeout);resolve();});
-            onWaiting();
-        });
+        await playToPresentedFrame(video, globalThis, 8000, onWaiting);
         if (!valid() || !video.videoWidth || !video.videoHeight) throw new Error('source_lost');
         const scale=Math.min(1,640/video.videoWidth,480/video.videoHeight);
         const canvas=document.createElement('canvas');
