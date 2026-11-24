@@ -752,6 +752,16 @@ HOST_AGENT_DIRECTED_EXCEPTIONS=(
         'lib/ezil_host/terminal_work.py':('100644 fd03bb7d3466fe0fa59fc1ca10ce7239c8d3b7c4','100644 97774533318c9d96179b59186fa728d770f3692a'),
         'test/test_terminal_work.py':('100644 d1806bda80bba506ce4f667580502c2c4e75bd6f','100644 225b514cfb73742eb39727181ef13af29feadc2d'),
     }),
+    # Staging R160 9d40705a to the signed private assignment checkout and receipt on the same AWS host baseline.
+    ('fed9ba92a6bdf6fd956e1cf172d550d9fc4a67a7','2133b294aad918806c29bcf750a726d5dfc4d0f4',{
+        'lib/ezil_host/edge.py':('100644 e621a7861f4f2dbaba2fe303e7222903b0173e5d','100644 bca17d8ca5af8c84f01ad766d9140f066b7bf0d9'),
+        'lib/ezil_host/standalone_git.py':('100644 b54d07996810668b54e6aa007edbf00a89daad38','100644 ee00a571876cd913082d3a8d7a588152f2941de7'),
+        'lib/ezil_host/standalone_git_assets/assignment-preload.py':(None,'100644 7dabfe9e974a50a864c32609e2c7e1e41270a517'),
+        'lib/ezil_host/standalone_git_assets/pin.json':('100644 c167f33cf3cd6766898375ea6bdece74ddce7d55','100644 383374d11002c3c054eb8d0917ad15b1d6f65fc8'),
+        'lib/ezil_host/standalone_git_assets/supervise.py':('100644 e578c8cd0df336409b609d6c4bf9df120ba913a1','100644 4b0f02c8ca00172413cf4ac5312b1b4c2c3c34bd'),
+        'lib/ezil_host/standalone_git_runtime.py':('100644 2996b5a7703b03bb4d73708ca169e422cf990965','100644 6791c5a6e5238cb4df2121b8bf47ab9b0a137b75'),
+        'test/test_standalone_git.py':('100644 a406d07d8c9ddc30800bc7f001be1929bdc91beb','100644 f613fb8458a16418c23680492991c48a50252837'),
+    }),
 )
 
 

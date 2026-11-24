@@ -362,7 +362,7 @@ class StandaloneHostAbiTests(unittest.TestCase):
 
 
 HOST_ABI_FIXTURE = HERE / 'host-abi-predecessors.json'
-HOST_ABI_FIXTURE_TREES = 8
+HOST_ABI_FIXTURE_TREES = 9
 HOST_ABI_FIXTURE_MAX_FILES = 256
 HOST_ABI_PATH_PART = re.compile(r'[A-Za-z0-9._-]{1,128}')
 HOST_ABI_ENTRY = re.compile(r'(100644|100755) ([0-9a-f]{40})')
@@ -417,11 +417,13 @@ class DirectedHostAbiTests(unittest.TestCase):
     repository borrows this checkout's objects through alternates (read-only) and writes its own fixture objects."""
     PREVIOUS = '96ff8e224443e0d684cb99e808a903235f2def11'
     DEPLOYED_R157 = 'b7700d49c946157cd75c862bce867caf7fd08810'
-    TARGET = 'fed9ba92a6bdf6fd956e1cf172d550d9fc4a67a7'
+    DEPLOYED_R160 = 'fed9ba92a6bdf6fd956e1cf172d550d9fc4a67a7'
+    TARGET = '2133b294aad918806c29bcf750a726d5dfc4d0f4'
     PREDECESSORS = {PREVIOUS: 'S 0c113cb4 standalone Git edge/history/resilience host',
                     'c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d': 'stage 1f4712c4 and 6a187841',
                     '7a35e4c5ec543abe83b9bccc8c6e5af815e02247': 'main 9ca8b3c0',
                     DEPLOYED_R157: '20a02206, deployed staging R157',
+                    DEPLOYED_R160: '9d40705a, deployed staging R160 recipe 1.0.62',
                     # The deployed staging predecessor (R151): the closed diagnostics without the full-marker host_ready.
                     'f3a5a1ba954c56ab31aa0c844cb5719c88905dfc': 'f27ddff7 deployed staging R151'}
     # The deployed predecessor's standalone_git.py (two-field guard stamp, 1024/4096 read limits).
@@ -511,7 +513,8 @@ class DirectedHostAbiTests(unittest.TestCase):
                           ('c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d', self.DEPLOYED_R157, 11),
                           ('7a35e4c5ec543abe83b9bccc8c6e5af815e02247', self.DEPLOYED_R157, 9),
                           ('f3a5a1ba954c56ab31aa0c844cb5719c88905dfc', self.DEPLOYED_R157, 8),
-                          (self.DEPLOYED_R157, self.TARGET, 3)])
+                          (self.DEPLOYED_R157, self.DEPLOYED_R160, 3),
+                          (self.DEPLOYED_R160, self.TARGET, 7)])
         for source, target, delta in self.maps():
             old, new = self.files(source), self.files(target)
             self.assertEqual({n: (old.get(n), new.get(n)) for n in old.keys() | new.keys() if old.get(n) != new.get(n)}, delta)
@@ -588,7 +591,8 @@ class DirectedHostAbiTests(unittest.TestCase):
         head = self.commit(self.head_files())
         self.assertEqual(release.host_agent_tree_id(head, self.repo), self.TARGET)
         anchors = {self.PREVIOUS: self.commit(self.files(self.PREVIOUS)),
-                   self.DEPLOYED_R157: self.commit(self.files(self.DEPLOYED_R157)), self.TARGET: head}
+                   self.DEPLOYED_R157: self.commit(self.files(self.DEPLOYED_R157)),
+                   self.DEPLOYED_R160: self.commit(self.files(self.DEPLOYED_R160)), self.TARGET: head}
         for source, target, delta in self.maps():
             baked, deployed = anchors[target], self.commit(self.files(source))
             with self.subTest(source=source, target=target):
@@ -597,7 +601,7 @@ class DirectedHostAbiTests(unittest.TestCase):
                     release.require_host_abi(baked, deployed, self.repo)
 
     def test_r157_code_inference_refuses_every_partial_forward_update(self):
-        deployed_files, candidate_files = self.files(self.DEPLOYED_R157), self.head_files()
+        deployed_files, candidate_files = self.files(self.DEPLOYED_R157), self.files(self.DEPLOYED_R160)
         deployed = self.commit(deployed_files)
         paths = ('lib/ezil_host/agent.py', 'lib/ezil_host/terminal_work.py', 'test/test_terminal_work.py')
         for size in range(1, len(paths)):
