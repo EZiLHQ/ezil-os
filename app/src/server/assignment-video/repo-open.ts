@@ -6,6 +6,9 @@ import { expectedRepositoryURL } from '@/server/git/assignment-enrollment';
 import type { PreloadChallenge } from '@/server/lib/compute/repo-open';
 import type { PrivateGitPacket } from '@/server/git/private-packet';
 import { eligible, issuer, refuse, uuid } from './contract';
+import { workspaceIdentity } from './workspace-identity';
+
+export { workspaceIdentity } from './workspace-identity';
 
 type Actor = Pick<RetainedIdentity, 'userId'|'issuer'|'subject'|'sessionId'|'expiresAt'>;
 const lifetime = 5 * 60_000;
@@ -50,8 +53,6 @@ export function matchesEnrollment(eligible: Eligible, packet: PrivateGitPacket, 
 
 const actorBinding = (actor: Actor) => createHash('sha256').update(JSON.stringify(
     [actor.userId, actor.issuer, actor.subject, actor.sessionId])).digest('hex');
-export const workspaceIdentity = (userId: string, computerId: string, sandboxName: string) =>
-    createHash('sha256').update(JSON.stringify([userId, computerId, sandboxName])).digest('hex');
 const encryptionKey = (secret: string) => createHmac('sha256', secret).update('ezil/assignment-repo-open/encryption/v1').digest();
 
 // A short-lived opaque proof travels solely in same-origin shell memory. No Git grant, user token or actor identifier is stored in it.

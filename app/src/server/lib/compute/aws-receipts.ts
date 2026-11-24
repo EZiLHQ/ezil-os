@@ -4,6 +4,7 @@ import { failStalledPoolAdopt, reconcileStalledPoolAdopt, replaceStalledPoolAdop
 import { replacementNeverLaunched, replacementWorkFromExecution, settleReplacementGeneration } from './aws-rebase-generation';
 import { failPoolOpenRelease, isPoolOpenRelease, POOL_OPEN_RELEASE_FAILED, recoverRefusedAdopt } from './aws-pool-recovery';
 import { createProviderMigrationStore } from './provider-migrate-store';
+import { assignmentMigrationClock } from './assignment-migration-clock';
 import { createProviderReverseStore, reverseMovesTablePresent } from './provider-reverse-store';
 /**
  * Lifecycle receipts: the RECONCILER path (docs/AWS-COMPUTERS.md C-3).
@@ -277,12 +278,13 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     if (!options.terminalOnly && deps.executions && await reconcileParkedStop({ ...deps, executions: deps.executions }, p0, deployment)) return;
     if (!options.terminalOnly && await reconcilePoolReleaseRecovery(deps, p0, deployment)) return;
     // Migration provision receipts restore a host, but cannot open a normal epoch before commit.
-    let migrationCommitted = false;
-    if (p0.lastError?.startsWith('migration_pending:')) {
-        const m = await createProviderMigrationStore(deps.db).readById(p0.lastError.slice('migration_pending:'.length));
+    const migrationId = p0.lastError?.startsWith('migration_pending:')
+        ? p0.lastError.slice('migration_pending:'.length) : null;
+    if (migrationId) {
+        const m = await createProviderMigrationStore(deps.db).readById(migrationId);
         if (!m || m.state !== 'committed' || m.computerId !== p0.computerId || m.userId !== p0.ownerUserId) return;
-        migrationCommitted = true;
     }
+    const migrationCommitted = migrationId !== null;
     // 🔴 A reverse move's export boot (REVERSE-MOVE-CONTRACT §5.2) keeps every receipt rule but two: STARTING → MOUNTING
     // opens no usage row, and MOUNTING → RUNNING is never taken (no epoch, no usage, no session limit). Failures fail
     // exactly like a Free open's. Keyed on the reverse row's claim, never on `last_error` (enrollment overwrites it).
@@ -297,6 +299,12 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         // Billing tables are not installed in production: deliberately write epochs AFTER
         // the placement transaction commits, never in that transaction. Metering cannot roll it back.
         if (r.ok && to === 'RUNNING') {
+            if (migrationId) {
+                const clock = assignmentMigrationClock(deps.db);
+                await clock?.flush(migrationId).catch(() => {
+                    console.warn('[compute.migration] assignment clock delivery pending', { migrationId });
+                });
+            }
             const size = meteredSizeForInstanceType(p.instanceType);
             if (size === null) {
                 console.error('[billing.meter] unknown instance type, epoch not opened', { computerId: p.computerId });
