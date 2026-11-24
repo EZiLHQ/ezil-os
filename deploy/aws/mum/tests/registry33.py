@@ -66,8 +66,9 @@ class SourceCapacityTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.repo, (self.cap45, self.cap44, self.cap43, self.cap42, self.cap41, self.cap40, self.cap39, self.cap38, self.cap37, self.cap36, self.cap35, self.cap34, self.cap33, self.cap32, self.cap27, self.cap26, self.twice, self.absent) = source_repo(
+        self.repo, (self.cap46, self.cap45, self.cap44, self.cap43, self.cap42, self.cap41, self.cap40, self.cap39, self.cap38, self.cap37, self.cap36, self.cap35, self.cap34, self.cap33, self.cap32, self.cap27, self.cap26, self.twice, self.absent) = source_repo(
             Path(temporary.name),
+            'export const REBASE_RELEASE_REGISTRY_CAPACITY = 46;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 45;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 44;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 43;',
@@ -110,9 +111,9 @@ class SourceCapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
             release.require_reader_capacity(34, self.cap33, self.repo)
 
-    def test_this_checkout_declares_forty_five_and_ed7_thirty_two(self):
+    def test_this_checkout_declares_forty_six_and_ed7_thirty_two(self):
         text = (REPO / release.CAPACITY_SOURCE).read_text()
-        self.assertEqual(release.CAPACITY_DECLARATION.findall(text), ['45'])
+        self.assertEqual(release.CAPACITY_DECLARATION.findall(text), ['46'])
         self.assertEqual(release.source_reader_capacity(AGENT_ED7, REPO)[0], 32)
         with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
             release.require_reader_capacity(33, AGENT_ED7, REPO)
@@ -160,14 +161,16 @@ class SourceCapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'running app reader capacity is below'):
             release.require_runtime_capacity({'readerCapacity': 37}, 38)
 
-    def test_forty_five_requires_a_matched_source_and_running_reader_and_refuses_forty_six(self):
+    def test_forty_six_requires_a_matched_source_and_running_reader_and_refuses_forty_seven(self):
         self.assertEqual(release.require_reader_capacity(43, self.cap43, self.repo)['capacity'], 43)
         release.require_runtime_capacity({'readerCapacity': 43}, 43)
         self.assertEqual(release.require_reader_capacity(44, self.cap44, self.repo)['capacity'], 44)
         release.require_runtime_capacity({'readerCapacity': 44}, 44)
         self.assertEqual(release.require_reader_capacity(45, self.cap45, self.repo)['capacity'], 45)
         release.require_runtime_capacity({'readerCapacity': 45}, 45)
-        for count, source, running in ((39, self.cap38, 38), (40, self.cap39, 39), (41, self.cap40, 40), (42, self.cap41, 41), (43, self.cap42, 42), (44, self.cap43, 43), (45, self.cap44, 44), (46, self.cap45, 45)):
+        self.assertEqual(release.require_reader_capacity(46, self.cap46, self.repo)['capacity'], 46)
+        release.require_runtime_capacity({'readerCapacity': 46}, 46)
+        for count, source, running in ((39, self.cap38, 38), (40, self.cap39, 39), (41, self.cap40, 40), (42, self.cap41, 41), (43, self.cap42, 42), (44, self.cap43, 43), (45, self.cap44, 44), (46, self.cap45, 45), (47, self.cap46, 46)):
             with self.subTest(count=count):
                 with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
                     release.require_reader_capacity(count, source, self.repo)
@@ -874,7 +877,7 @@ class RealHttpProbeTests(unittest.TestCase):
 
 class LegacyGcParityTests(unittest.TestCase):
     def test_frozen_gc_stays_a_thirty_two_record_tool(self):
-        self.assertEqual((TOOL.RELEASE_REGISTRY_CAPACITY, TOOL.ACTIVE_REGISTRY_CAPACITY), (32, 45))
+        self.assertEqual((TOOL.RELEASE_REGISTRY_CAPACITY, TOOL.ACTIVE_REGISTRY_CAPACITY), (32, 46))
         self.assertEqual(TOOL.LEGACY_REGISTRY_CAPACITY, {'mum': 32, 'prd': 26})
         self.assertEqual(gc.tool.legacy_registry_capacity(), 32)
         self.assertEqual(gc.tool.RELEASE_REGISTRY_CAPACITY, 32)
