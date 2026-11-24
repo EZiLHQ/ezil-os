@@ -64,7 +64,10 @@ export const clockState = clockDetails.extend({
 });
 export const eligible = z.object({...optionalClock, status: z.literal('eligible'), attemptId: uuid,
     jobId: z.string().regex(/^[1-9][0-9]{0,18}$/), expiresAt: moment, windowStartedAt: moment.nullable(), deadlineAt: moment.nullable(),
-    manifestSha256: z.string().regex(/^[a-f0-9]{64}$/), repositoryUrl: z.string().max(260), providerId: z.string().regex(/^[a-z0-9]{1,64}$/), ref: z.literal('refs/heads/main')});
+    manifestSha256: z.string().regex(/^[a-f0-9]{64}$/), repositoryUrl: z.string().max(260), providerId: z.string().regex(/^[a-z0-9]{1,64}$/), ref: z.literal('refs/heads/main'),
+    upgradedWorkspaceId: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    upgradeOperationId: uuid.optional(),
+}).refine(state => (state.upgradedWorkspaceId !== undefined) === (state.upgradeOperationId !== undefined));
 const control = {
     ...optionalClock,
     recordingId: uuid, status: z.enum(['awaiting_frame','paused','recording', 'empty', 'partial', 'complete']),

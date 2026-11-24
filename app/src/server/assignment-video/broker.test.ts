@@ -310,6 +310,15 @@ describe('assignment media broker',()=>{
         await expect(recordingAction(identity,{action:'confirm',attemptId:attempt,sequence:0,captureSessionId:phase},d))
             .resolves.toMatchObject({startedAt:time(initial),deadlineAt:time(revisedDeadline),revision:2,workStartedAt});
     });
+    it('projects the upgraded workspace and operation only as an authenticated pair',async()=>{
+        const updated = {...eligibility,upgradedWorkspaceId:'a'.repeat(64),upgradeOperationId:recording};
+        const request = {action:'preflight' as const,attemptId:attempt};
+        const d = deps();
+        await expect(recordingAction(identity,request,{...d,fetcher:async()=>Response.json(updated)})).resolves.toEqual(updated);
+        for (const invalid of [{...updated,upgradeOperationId:undefined},{...updated,upgradedWorkspaceId:'other'}])
+            await expect(recordingAction(identity,request,{...d,fetcher:async()=>Response.json(invalid)}))
+                .rejects.toMatchObject({code:'recording_unavailable'});
+    });
     it('accepts revised eligibility and exposes a paused snapshot without authorizing a checkout',async()=>{
         const reopened = {...eligibility, deadlineAt:time(initial+hour+50000),revision:2,pausedAt:null};
         const d = {...deps(),fetcher:async()=>Response.json(reopened)};
