@@ -159,18 +159,27 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     function applyClock(report){
         if(disposed || !countdown.sync(report))return;
         const item=activity&&!activity.ended&&isHere()?activity:null;
-        if(item)applyGate(item);
-        else if(!indicator && !over && countdown.started())showIndicator(countdown.state()==='ended'?'ended':'idle');
+        if(item){
+            // Universe publishes the new deadline after Works acknowledges it. Move the recorder before releasing hold.
+            if(item.mediaStart!==undefined)syncMedia(item,report,true);
+            applyGate(item);
+        }else if(!indicator && !over && countdown.started())showIndicator(countdown.state()==='ended'?'ended':'idle');
         indicator?.sync();
     }
     /**
      * The recording's own window (begin / seed confirm / status: `startedAt`, `deadlineAt`, in server time). It bounds the
      * recording only: it moves the recorder's deadline and the share's deadline timer, never the countdown.
      */
-    function syncMedia(item,report){
-        const deadline=Date.parse(report?.deadlineAt),start=Date.parse(report?.startedAt);
-        if(!samePhase(item)||!Number.isFinite(deadline))return;
-        if(Number.isFinite(start))item.mediaStart=start;
+    function syncMedia(item,report,canonical=false){
+        const deadline=Date.parse(report?.deadlineAt),start=canonical?NaN:Date.parse(report?.startedAt);
+        const revision=report?.revision??0;
+        if(!samePhase(item)||!Number.isFinite(deadline)||!Number.isSafeInteger(revision)
+            ||revision<(item.mediaRevision??0)||(item.mediaDeadline!==undefined&&deadline<item.mediaDeadline))return;
+        if(Number.isFinite(start)){
+            if(item.mediaStart!==undefined&&item.mediaStart!==start)return;
+            item.mediaStart=start;
+        }
+        item.mediaRevision=revision;
         item.mediaDeadline=deadline;
         item.recorder?.setDeadline(deadline);
         armDeadline(item);
