@@ -265,10 +265,15 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             const result=await retry(()=>checkAssignmentVideoEligibility(attemptId),['media_unavailable','recording_unavailable']);
             if(!isHere())return;
             if(result.status!=='eligible' || result.attemptId!==attemptId || result.repositoryUrl!==repo)throw failure('assignment_mismatch');
+            // The same attempt's clock is available while the provider is unavailable or sharing is stopped.
+            void refreshClock();scheduleClock();
             if (win.location.origin === 'https://os.ezil.work') {
                 const provider = await computerProvider?.();
                 if (!isHere()) return;
-                if (provider !== 'cloudflare') {
+                const upgradedAssignment = provider === 'aws-ec2'
+                    && /^[a-f0-9]{64}$/.test(result.upgradedWorkspaceId ?? '')
+                    && uuid.test(result.upgradeOperationId ?? '');
+                if (provider !== 'cloudflare' && !upgradedAssignment) {
                     lockedView('Choose an assignment-ready computer',provider === 'aws-ec2'
                         ? 'This AWS computer does not support assignment recording. Select a Cloudflare computer you own in EZiL OS, then reopen the assignment.'
                         : 'EZiL OS could not verify this computer’s assignment support. Check its provider in Settings → System, then try again.');
@@ -278,8 +283,6 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             }
             picker??=currentTabPicker(win);
             displayConsent();
-            // A refresh loses the page's state, not the server's clock: show the time left before sharing again.
-            void refreshClock();scheduleClock();
         }catch(e){
             if(!isHere())return;
             if(e.code==='identity_refresh_required'){showSignIn();return;}
