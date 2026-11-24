@@ -7,7 +7,7 @@
  */
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { describe, expect, it, mock } from 'bun:test';
+import { describe, expect, it, mock, spyOn } from 'bun:test';
 
 mock.module('cloudflare:workers', () => ({
   DurableObject: class {},
@@ -278,6 +278,49 @@ describe('staging assignment repo-open preload', () => {
     expect(text).not.toContain(gitPassword);
     expect(calls[0]?.preload).toEqual({ eventId, attemptId, ownerSha256, canonicalURL, repositoryId: folderId, ref, manifestSha256 });
     expect(JSON.stringify(calls[0]?.preload)).not.toContain(nonce);
+  });
+
+  it('routes a signed staging AWS assignment to the enrolled host and returns its ack', async () => {
+    const worker = await loadWorker();
+    const { binding, calls } = fakeNamespace();
+    const userId = '11111111-1111-4111-8111-111111111111';
+    const computerId = '22222222-2222-4222-8222-222222222222';
+    const sandboxId = 'guac-1111111111114111-2222222222224222';
+    const path = `/sandbox/${sandboxId}/repo-open`;
+    const record = { computerId, sandboxId, generation: 2, leaseEpoch: 4, originVerified: true, controlKey: btoa('k'.repeat(32)) };
+    const request = () => signed({
+      claims: claims({ userId, computerId, sandboxId, provider: 'aws-ec2', generation: 2, leaseEpoch: 4 }),
+      path, url: `https://api-desktop-staging.ezil.work${path}`, signBody: body(),
+    });
+    const aws = {
+      AWS_ROUTING_ENABLED: 'on', AWS_STANDALONE_REPO_OPEN_ENABLED: 'on',
+      AWS_ORIGIN_ZONE: 'ezil.work', AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.work',
+      AWS_TUNNELS: { idFromName: (id: string) => id, get: () => ({ fetch: async () => Response.json({ record }) }) },
+    };
+    const result = { ok: true, folder, checkoutFolder, status: 'cloned',
+      assignmentPreload: { eventId, nonce, port: 5679, status: 'acknowledged' } };
+    const host = spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => init?.method === 'POST'
+      ? Response.json({ ok: true, state: 'running' }, { status: 202 })
+      : Response.json({ ok: true, state: 'done', result }));
+    try {
+      const outsideStage = await worker.fetch(await request(), env(binding, { ...aws, EZIL_AI_GATEWAY_URL: 'https://ai.ezil.work' }));
+      expect(outsideStage.status).toBe(400);
+      expect(host).not.toHaveBeenCalled();
+      const response = await worker.fetch(await request(), env(binding, { ...aws, ...stage }));
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(JSON.parse(text)).toEqual(result);
+      expect(text).not.toContain(gitPassword);
+      expect(calls).toHaveLength(0);
+      expect(host.mock.calls.map(([, init]) => init?.method)).toEqual(['POST', 'GET']);
+      const [target, init] = host.mock.calls[0]!;
+      expect(new URL(String(target)).hostname).toBe(`c-${sandboxId}-g2-e4.ezil.work`);
+      expect(JSON.parse(String(init?.body)).assignmentPreload).toEqual({
+        eventId, attemptId, nonce, ownerSha256, canonicalURL, repositoryId: folderId, ref, manifestSha256,
+      });
+    } finally {
+      host.mockRestore();
+    }
   });
 
   it('keeps Code open when the runtime has no loopback ack; no inferred receipt from a repo or a port', async () => {
