@@ -372,7 +372,8 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             item.expected=ack.nextSequence;item.accepted=true;
             const startAt=Date.parse(ack.startedAt), deadline=Date.parse(ack.deadlineAt), serverNow=Date.parse(ack.serverNow);
             const offset=Number.isFinite(serverNow)?serverNow-Date.now():0;
-            if(!Number.isFinite(startAt)||!Number.isFinite(deadline)||deadline<=Date.now()+offset||deadline<=startAt||deadline-startAt>3600000)
+            // Confirm bounds remaining time; trusted pauses can make the elapsed media window longer than an hour.
+            if(!Number.isFinite(startAt)||!Number.isFinite(deadline)||deadline<=Date.now()+offset||deadline<=startAt)
                 throw failure('recording_closed');
             // The seed's window bounds the recording only; the countdown starts at the verified editor (`ready`).
             item.offset=offset;
