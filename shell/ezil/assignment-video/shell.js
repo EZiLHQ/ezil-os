@@ -31,12 +31,36 @@ function buildGate(body) {
         clear(){card.querySelector('button')?.remove();},reveal(){panel.hidden=true;},remove(){panel.remove();}};
 }
 
-async function retry(operation, codes, times=2) {
-    for(let i=0;;i++){try{return await operation();}catch(err){if(i+1>=times||!codes.includes(err.code))throw err;
-        await new Promise(resolve=>setTimeout(resolve,320*(i+1)));}}
+// `live`: a stopped share never asks again (a stale prepare would otherwise abort the next share's mint).
+async function retry(operation, codes, times=2, live=()=>true) {
+    for(let i=0;;i++){
+        if(!live())throw failure('cancelled');
+        try{return await operation();}catch(err){if(i+1>=times||!codes.includes(err.code)||!live())throw err;
+            await new Promise(resolve=>setTimeout(resolve,320*(i+1)));}}
 }
 
-export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare}) {
+const AWS_UNVERIFIED='This AWS computer is not verified for this assignment. Reopen it from Universe on the computer you started with, or select a Cloudflare computer you own.';
+const hex64=/^[a-f0-9]{64}$/;
+const WINDOW_MS=3600000;
+/**
+ * Whether Universe's answer lets this AWS computer run the assignment. The server alone compares the binding with the
+ * computer's own workspace; this only requires an explicit, well-formed answer. `boundWorkspaceId` must be PRESENT: a
+ * 64-hex workspace Universe bound, or null for the first opening (an older Universe omits it and is refused). A first
+ * opening may already hold the explicit Start window, as long as that window is complete and no longer than the
+ * assignment hour; nothing here supplies a time Universe did not sign. A migrated workspace is the other way in.
+ */
+export function awsAssignmentAnswer(result) {
+    if(hex64.test(result?.upgradedWorkspaceId??'') && uuid.test(result?.upgradeOperationId??''))return true;
+    const bound=result?.boundWorkspaceId;
+    if(typeof bound==='string')return hex64.test(bound);
+    if(bound!==null)return false;
+    const {windowStartedAt:from,deadlineAt:until}=result;
+    if(!from&&!until)return true;
+    const start=Date.parse(from),deadline=Date.parse(until);
+    return Number.isFinite(start)&&Number.isFinite(deadline)&&deadline>start&&deadline-start<=WINDOW_MS;
+}
+
+export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare, computerProvider}) {
     const win=globalThis.window, repo=project?.repoUrl;
     if(!win || win.location.origin!==OS){queueMicrotask(open);return null;}
     const address=new URL(win.location.href);
@@ -46,7 +70,8 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     if(!canonical.test(repo) && !explicit){queueMicrotask(open);return null;}
 
     const owner=actor(), ui=buildGate(body);
-    let disposePromise, disposed=false, locked=true, picker, activity, indicator, clickCues, frameCues;
+    // `windowStart`: the first accepted start of this attempt's recording window, kept across stops and reopenings.
+    let disposePromise, disposed=false, locked=true, picker, activity, indicator, clickCues, frameCues, windowStart;
     const isOwner=()=>Boolean(owner) && actor()===owner;
     const isHere=()=>!disposed && current===gate && isOwner() && win===win.top;
     const samePhase=item=>isHere() && activity===item && !item.ended;
@@ -75,7 +100,10 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     }
     function showSignIn(){
         lockedView('Sign in to EZiL OS','Return to this assignment after signing in.');
-        const dest='/app/code?'+new URLSearchParams({repo,assignment:attemptId});
+        // The selected computer survives the sign-in: the assignment resumes on exactly the one it started on.
+        const params=new URLSearchParams({repo,assignment:attemptId});
+        if(uuid.test(computerId??''))params.set('computer',computerId);
+        const dest='/app/code?'+params;
         ui.action('Sign in to EZiL OS',()=>win.location.assign('/auth/auth0/login?'+new URLSearchParams({returnUrl:dest})));
     }
     async function eligible(){
@@ -84,6 +112,17 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             const result=await retry(()=>checkAssignmentVideoEligibility(attemptId),['media_unavailable','recording_unavailable']);
             if(!isHere())return;
             if(result.status!=='eligible' || result.attemptId!==attemptId || result.repositoryUrl!==repo)throw failure('assignment_mismatch');
+            // Only an AWS computer is checked here: any other provider keeps its own path, and the server decides it.
+            const provider=await Promise.resolve(computerProvider?.()).catch(()=>null);
+            if(provider==='aws-ec2'){
+                if(!isHere())return;
+                if(!awsAssignmentAnswer(result)){
+                    lockedView('Choose an assignment-ready computer',AWS_UNVERIFIED);
+                    ui.action('Check this computer again',eligible);
+                    return;
+                }
+            }
+            if(!isHere())return;
             picker??=currentTabPicker(win);
             displayConsent();
         }catch(e){
@@ -104,6 +143,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         item.starting=start(item,selection);
     }
     async function start(item,selection) {
+        const live=()=>samePhase(item);
         try{
             const source=await selection;
             if(!samePhase(item)){source.stream.getTracks().forEach(t=>t.stop());return;}
@@ -114,7 +154,8 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             track.addEventListener('capturehandlechange',()=>{if(!recordingSource(item))void finish(item,'connection_lost');});
             item.watch=setInterval(()=>{if(!recordingSource(item))void finish(item,'connection_lost');},1100);
             showIndicator('Sharing');lockedView('Preparing assignment','Verifying the assigned repository…');
-            const result=await retry(()=>prepare(attemptId),['sandbox_starting','media_unavailable','assignment_open_unavailable'],3);
+            item.prepareCtl=new AbortController();
+            const result=await retry(()=>prepare(attemptId,{signal:item.prepareCtl.signal}),['sandbox_starting','media_unavailable','assignment_open_unavailable'],3,live);
             check(item);
             const proof=result?.assignmentOpen, meta=result?.repository, name=repo.split('/').at(-1).slice(0,-4);
             if(result.ok!==true||result.codePreviewUrl||result.url||proof?.attemptId!==attemptId||!/^[A-Za-z0-9_-]{48,1700}$/.test(proof.proof)
@@ -123,7 +164,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             item.meta=meta;item.proof=proof.proof;
             item.transport=createAssignmentVideoTransport({attemptId,repoOpenProof:item.proof,captureSessionId:item.id,consentVersion:4,
                 onStop:(why,at)=>void finish(item,why==='submitted'||why==='timeout'?why:'connection_lost',at)});
-            item.grant=await retry(()=>item.transport.begin(),['media_unavailable'],2);
+            item.grant=await retry(()=>item.transport.begin(),['media_unavailable'],2,live);
             check(item);
             if(item.grant.captureSessionId!==item.id||item.grant.status!=='awaiting_frame'||!Number.isSafeInteger(item.grant.nextSequence))
                 throw failure('recording_phase_changed');
@@ -141,6 +182,9 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             const offset=Number.isFinite(serverNow)?serverNow-Date.now():0;
             if(!Number.isFinite(startAt)||!Number.isFinite(deadline)||deadline<=Date.now()+offset||deadline<=startAt||deadline-startAt>3600000)
                 throw failure('recording_closed');
+            // Reopening after a stop resumes the attempt's own window; a different start is never a new clock.
+            if(windowStart!==undefined&&windowStart!==startAt)throw failure('recording_closed');
+            windowStart=startAt;
             item.recorder=await encodeTabSegments({win,stream:source.stream,matches:()=>recordingSource(item),windowStart:startAt,deadline,
                 firstSequence:item.expected,clockOffset:offset,upload:part=>{item.expected=Math.max(item.expected,part.sequence+1);return upload(part);},
                 cutoff:async()=>{const state=await item.transport.status();return state.stopRequestedAt||null;},
@@ -165,6 +209,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             if(cause==='wrong_tab')message='Select this EZiL OS tab. The other source was discarded.';
             if(error.name==='NotAllowedError')message='Sharing was declined. Share this OS tab to open your editor.';
             if(cause==='assigned_checkout_unverified')message='The assigned checkout could not be verified. Share this tab to try again.';
+            if(cause==='assignment_aws_unverified')message=AWS_UNVERIFIED;
             void finish(item,'connection_lost',null,message,cause==='identity_refresh_required'||cause==='IDENTITY_REFRESH_REQUIRED');
         }finally{clearTimeout(item.editorTimeout);item.editor=null;}
     }
@@ -179,7 +224,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     function finish(item,reason='sharing_stopped',effectiveAt=null,message,signIn=false){
         if(activity!==item)return Promise.resolve();
         if(item.ending)return item.ending;
-        item.ended=true;item.allowMint=false;clearInterval(item.watch);clearTimeout(item.deadline);clearTimeout(item.editorTimeout);
+        item.ended=true;item.allowMint=false;item.prepareCtl?.abort();clearInterval(item.watch);clearTimeout(item.deadline);clearTimeout(item.editorTimeout);
         item.editor?.reject(failure('workspace_locked'));
         item.source?.stream.getTracks().forEach(t=>t.stop());
         removeIndicator();lockedView('Sharing stopped','Checking saved assignment footage…');

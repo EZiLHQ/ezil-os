@@ -77,3 +77,102 @@ test('the native Stop during a delayed private checkout cannot later start media
         assert.equal(track.readyState,'ended');assert.deepEqual(requests,['preflight']);assert.equal(opened,0);assert.equal(gate.access(),null);
     }finally{await gate.close();}
 });
+function consentWindow(url){
+    const elements=[],assigned=[];let handle;
+    class Track{
+        readyState='live';muted=false;listeners={};
+        getCaptureHandle(){return {origin:'https://os-staging.ezil.work',handle};}
+        getSettings(){return {displaySurface:'browser'};}
+        addEventListener(n,f){this.listeners[n]=f;} stop(){this.readyState='ended';}
+    }
+    const track=new Track(),stream={getTracks:()=>[track],getVideoTracks:()=>[track],getAudioTracks:()=>[]};
+    const doc={body:new Element(),createElement(tag){const e=new Element();e.tag=tag;elements.push(e);return e;}};
+    const location=Object.assign(new URL(url),{assign:target=>assigned.push(target)});
+    const win={location,crypto:globalThis.crypto,isSecureContext:true,document:doc,addEventListener(){},removeEventListener(){},
+        MediaStreamTrack:Track,VideoFrame:class{},VideoEncoder:class{},
+        navigator:{mediaDevices:{setCaptureHandleConfig(config){handle=config.handle;},getDisplayMedia:async()=>stream}}};
+    win.top=win;win.parent=win;Object.assign(globalThis,{window:win,document:doc});
+    const button=label=>elements.find(e=>typeof e.onclick==='function'&&e.textContent===label);
+    return {elements,assigned,track,button};
+}
+const entry='https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id;
+const eligibleBody=extra=>({status:'eligible',attemptId:id,repositoryUrl:repo,expiresAt:new Date(Date.now()+60000).toISOString(),
+    windowStartedAt:null,deadlineAt:null,...extra});
+test('an AWS computer needs Universe\'s explicit binding answer; every other provider keeps its own path',async t=>{
+    const bound='b'.repeat(64),now=Date.now();
+    const window=(from,until)=>({windowStartedAt:new Date(now-from).toISOString(),deadlineAt:new Date(now+until).toISOString()});
+    for(const [provider,proof,opens] of [
+        ['aws-ec2',{boundWorkspaceId:null},true],
+        ['aws-ec2',{boundWorkspaceId:null,...window(1000,60000)},true],
+        ['aws-ec2',{boundWorkspaceId:null,...window(1000,3600000)},false],
+        ['aws-ec2',{boundWorkspaceId:null,windowStartedAt:new Date(now-1000).toISOString(),deadlineAt:null},false],
+        ['aws-ec2',{boundWorkspaceId:bound,...window(1000,60000)},true],
+        ['aws-ec2',{boundWorkspaceId:'b'.repeat(63)},false],
+        ['aws-ec2',{},false],
+        ['aws-ec2',{upgradedWorkspaceId:bound,upgradeOperationId:'11111111-1111-4111-8111-111111111111'},true],
+        ['aws-ec2',{upgradedWorkspaceId:bound},false],
+        ['cloudflare',{},true],
+        [null,{},true],
+    ]){
+        t.mock.method(globalThis,'fetch',async()=>Response.json(eligibleBody(proof)));
+        const w=consentWindow(entry);
+        const gate=openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>'owner',computerId:'fixture',body:new Element(),
+            computerProvider:async()=>provider,park(){},open(){assert.fail('editor must stay closed');},prepare(){assert.fail('checkout must stay closed');}});
+        try{
+            await new Promise(r=>setImmediate(r));
+            assert.equal(Boolean(w.button('Share this OS tab and open assignment')),opens,JSON.stringify([provider,proof]));
+            assert.equal(Boolean(w.button('Check this computer again')),!opens);
+            assert.equal(gate.locked(),true);assert.equal(gate.access(),null);
+        }finally{await gate.close();t.mock.restoreAll();}
+    }
+});
+test('an unreadable provider does not block a share the server will decide',async t=>{
+    t.mock.method(globalThis,'fetch',async()=>Response.json(eligibleBody({})));
+    const w=consentWindow(entry);
+    const gate=openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>'owner',computerId:'fixture',body:new Element(),
+        computerProvider:async()=>{throw new Error('offline');},park(){},open(){},prepare(){}});
+    try{
+        await new Promise(r=>setImmediate(r));
+        assert.ok(w.button('Share this OS tab and open assignment'));
+    }finally{await gate.close();}
+});
+test('an assignment sign-in refresh keeps the selected computer, repository and attempt',async t=>{
+    const computerId='11111111-1111-4111-8111-111111111111';
+    t.mock.method(globalThis,'fetch',async()=>Response.json({error:{code:'identity_refresh_required'}},{status:409}));
+    const w=consentWindow(entry+'&computer='+computerId);
+    const gate=openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>'owner',computerId,body:new Element(),
+        park(){},open(){assert.fail('editor must stay closed');},prepare(){assert.fail('checkout must stay closed');}});
+    try{
+        await new Promise(r=>setImmediate(r));
+        const signIn=w.button('Sign in to EZiL OS');
+        assert.ok(signIn);
+        signIn.onclick({isTrusted:false});
+        assert.deepEqual(w.assigned,[]);
+        signIn.onclick({isTrusted:true});
+        const login=new URL(w.assigned[0],'https://os-staging.ezil.work');
+        assert.equal(login.pathname,'/auth/auth0/login');
+        const back=new URL(login.searchParams.get('returnUrl'),'https://os-staging.ezil.work');
+        assert.equal(back.pathname,'/app/code');
+        assert.deepEqual([...back.searchParams],[['repo',repo],['assignment',id],['computer',computerId]]);
+    }finally{await gate.close();}
+});
+test('a stopped share never asks the checkout again and aborts only its own mint',async t=>{
+    t.mock.method(globalThis,'fetch',async()=>Response.json(eligibleBody({})));
+    const w=consentWindow(entry);
+    let prepares=0,signal,release;
+    const first=new Promise(r=>release=r);
+    const gate=openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>'owner',computerId:'fixture',body:new Element(),
+        park(){},open(){assert.fail('editor must stay closed');},
+        async prepare(_id,options){prepares++;signal=options?.signal;release();await new Promise(r=>setTimeout(r,20));
+            throw Object.assign(new Error('prepare_failed'),{code:'sandbox_starting'});}});
+    try{
+        await new Promise(r=>setImmediate(r));
+        w.button('Share this OS tab and open assignment').onclick({isTrusted:true});
+        await first;
+        assert.equal(signal.aborted,false);
+        w.track.listeners.ended();
+        assert.equal(signal.aborted,true);
+        await new Promise(r=>setTimeout(r,800));
+        assert.equal(prepares,1);
+    }finally{await gate.close();}
+});

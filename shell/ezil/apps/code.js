@@ -199,6 +199,8 @@ const PROJECT_REFUSALS = {
     repo_url_moved: 'repo_url_moved',
     repo_url_empty: 'repo_url_empty',
     repo_url_unavailable: 'repo_url_unavailable',
+    // A reserved assignment on an AWS computer Universe has not bound to this attempt (`../assignment-video/shell.js`).
+    assignment_aws_unverified: 'assignment_aws_unverified',
 };
 const PROJECT_FAILURE_COPY = {
     project_not_authorized: {
@@ -245,6 +247,10 @@ const PROJECT_FAILURE_COPY = {
     repo_url_unavailable: {
         title: "Couldn't reach this repository",
         body: 'Something went wrong while checking the repository. Try again in a moment.',
+    },
+    assignment_aws_unverified: {
+        title: "Couldn't verify this AWS computer for the assignment",
+        body: 'Universe has no matching record of this assignment on this computer. Reopen it from Universe on the computer you started with, or select a Cloudflare computer you own.',
     },
 };
 /** A repository address as `../app-link.js` accepts it: https only; the server decides what it may name. */
@@ -1760,10 +1766,28 @@ export async function openCodeWindow (ctx = {}) {
                     el_iframe.setAttribute('aria-hidden','true');
                 } else el_iframe.removeAttribute('aria-hidden');
             },
-            async prepare(attemptId) {
+            async computerProvider() {
+                const path = desktop_state.endpoints?.system;
+                if (path !== '/api/shell/system') return null;
+                const response = await fetch(path + '?' + new URLSearchParams({computerId:computer.id}), {
+                    cache:'no-store', credentials:'same-origin', redirect:'error', signal:AbortSignal.timeout(7000),
+                });
+                if (!response.ok) return null;
+                const result = await response.json();
+                return result?.ok === true ? result.info?.provider : null;
+            },
+            async prepare(attemptId, {signal}={}) {
                 if (!stillHere()) throw Object.assign(new Error('closed'),{code:'workspace_disconnected'});
-                mint_ctl?.abort(); mint_ctl = new AbortController();
-                const result = await mintCodePreviewUrl(computer.id,mint_ctl.signal,requestedProject,null,null,{attemptId,phase:'prepare'});
+                // A share that already ended never starts (or aborts) a mint: the next share may own `mint_ctl` by now.
+                if (signal?.aborted) throw Object.assign(new Error('cancelled'),{code:'cancelled'});
+                mint_ctl?.abort();
+                const ctl = mint_ctl = new AbortController();
+                // The gate's stop reaches this call's mint only, never a later share's.
+                const cancel = () => ctl.abort();
+                signal?.addEventListener('abort',cancel,{once:true});
+                let result;
+                try { result = await mintCodePreviewUrl(computer.id,ctl.signal,requestedProject,null,null,{attemptId,phase:'prepare'}); }
+                finally { signal?.removeEventListener('abort',cancel); if (mint_ctl === ctl) mint_ctl = null; }
                 if(!stillHere())throw Object.assign(new Error('closed'),{code:'workspace_disconnected'});
                 if (!result.ok) throw Object.assign(new Error('prepare_failed'),{code:result.errorCode});
                 return result;
