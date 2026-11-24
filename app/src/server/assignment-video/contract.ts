@@ -67,6 +67,8 @@ export const eligible = z.object({...optionalClock, status: z.literal('eligible'
     manifestSha256: z.string().regex(/^[a-f0-9]{64}$/), repositoryUrl: z.string().max(260), providerId: z.string().regex(/^[a-z0-9]{1,64}$/), ref: z.literal('refs/heads/main'),
     upgradedWorkspaceId: z.string().regex(/^[a-f0-9]{64}$/).optional(),
     upgradeOperationId: uuid.optional(),
+    /** Direct AWS: the workspace Universe bound for this attempt (64-hex), or null before its first opening. Absent from an older Universe. */
+    boundWorkspaceId: z.string().regex(/^[a-f0-9]{64}$/).nullable().optional(),
 }).refine(state => (state.upgradedWorkspaceId !== undefined) === (state.upgradeOperationId !== undefined));
 const control = {
     ...optionalClock,

@@ -90,6 +90,12 @@ test('verified production placement gates the picker and ordinary Code is unaffe
         ['aws-ec2',{upgradedWorkspaceId},false],
         [null,{upgradedWorkspaceId,upgradeOperationId},false],
         ['aws-ec2',{upgradedWorkspaceId,upgradeOperationId},true],
+        ['aws-ec2',{boundWorkspaceId:null},true],
+        ['aws-ec2',{boundWorkspaceId:null,windowStartedAt:new Date(Date.now()-1000).toISOString(),deadlineAt:new Date(Date.now()+60000).toISOString()},false],
+        ['aws-ec2',{boundWorkspaceId:'b'.repeat(64),windowStartedAt:new Date(Date.now()-1000).toISOString(),deadlineAt:new Date(Date.now()+60000).toISOString()},true],
+        ['aws-ec2',{boundWorkspaceId:'b'.repeat(63)},false],
+        [null,{boundWorkspaceId:null},false],
+        ['cloudflare',{},true],
     ]) {
         upgrade=proof;
         const texts=[],doc={createElement(){const e=new Element();Object.defineProperty(e,'textContent',{set:v=>texts.push(v)});return e;}};
@@ -106,4 +112,32 @@ test('verified production placement gates the picker and ordinary Code is unaffe
         assert.equal(texts.includes('Share this OS tab and open assignment'),consent);assert.equal(gate.locked(),true);
         assert.equal(opens,0);assert.equal(prepares,0);await gate.close();
     }
+});
+
+test('an assignment sign-in refresh keeps the selected computer, repository and attempt',async t=>{
+    const assigned=[],elements=[];
+    const computerId='11111111-1111-4111-8111-111111111111';
+    const origin='https://os.ezil.work';
+    const location=Object.assign(new URL(origin+'/app/code?'+new URLSearchParams({repo,assignment:id,computer:computerId})),
+        {assign:target=>assigned.push(target)});
+    const doc={createElement(){const element=new Element();elements.push(element);return element;}};
+    const win={location,document:doc,addEventListener(){},removeEventListener(){}};
+    win.top=win;
+    Object.assign(globalThis,{window:win,document:doc});
+    t.mock.method(globalThis,'fetch',async()=>Response.json({error:{code:'identity_refresh_required'}},{status:409}));
+    const gate=openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>'owner',computerId,body:new Element(),
+        park(){},open(){assert.fail('editor must stay closed');},prepare(){assert.fail('checkout must stay closed');}});
+    try{
+        await new Promise(r=>setImmediate(r));
+        const signIn=elements.find(element=>typeof element.onclick==='function'&&element.textContent==='Sign in to EZiL OS');
+        assert.ok(signIn);
+        signIn.onclick({isTrusted:false});
+        assert.deepEqual(assigned,[]);
+        signIn.onclick({isTrusted:true});
+        const login=new URL(assigned[0],origin);
+        assert.equal(login.pathname,'/auth/auth0/login');
+        const back=new URL(login.searchParams.get('returnUrl'),origin);
+        assert.equal(back.pathname,'/app/code');
+        assert.deepEqual([...back.searchParams],[['repo',repo],['assignment',id],['computer',computerId]]);
+    }finally{await gate.close();}
 });

@@ -204,6 +204,7 @@ const PROJECT_REFUSALS = {
     assignment_recording_required: 'assignment_recording_required',
     assignment_checkout_unverified: 'assigned_checkout_unverified',
     assignment_open_unavailable: 'assignment_open_unavailable',
+    assignment_aws_unverified: 'assignment_aws_unverified',
 };
 const PROJECT_FAILURE_COPY = {
     project_not_authorized: {
@@ -258,6 +259,10 @@ const PROJECT_FAILURE_COPY = {
     assigned_checkout_unverified: {
         title: "Couldn't verify the assignment checkout",
         body: 'The protected assignment checkout could not be verified. Share this OS tab again to retry.',
+    },
+    assignment_aws_unverified: {
+        title: "Couldn't verify this AWS computer for the assignment",
+        body: 'Universe has no matching record of this assignment on this computer. Reopen it from Universe on the computer you started with, or select a Cloudflare computer you own.',
     },
     assignment_open_unavailable: {
         title: "Couldn't reach Universe",

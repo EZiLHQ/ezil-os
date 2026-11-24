@@ -76,6 +76,8 @@ const assignmentLocked = () => shellRefusal(409,'assignment_recording_required',
  * the shell's wake loop re-asks once and the assignment gate's prepare retries it, so a blip never reads as a refusal.
  */
 const assignmentUnavailable = () => shellRefusal(503,'assignment_open_unavailable','Universe could not verify this assignment just now. Try again.');
+/** A reserved assignment on an AWS computer whose trusted placement/binding proof is missing, stale or foreign: nothing was woken, no editor, no clock. */
+const assignmentAwsUnverified = () => shellRefusal(409,'assignment_aws_unverified','This AWS computer is not verified for this assignment. Reopen it from Universe on the computer you started with, or select a Cloudflare computer you own.');
 const assignmentIdentity = () => shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
 type UniverseCall<T> = { ok: true; value: T } | { ok: false; kind: 'unavailable' | 'identity' | 'refused' };
 /** A Universe call through the broker, classified: a failed call is not an answer, and an identity lapse is neither. */
@@ -213,6 +215,14 @@ async function target(ctx: ProjectCtx, computerId: string): Promise<ControlTarge
     }
 }
 const isAws = (t: ControlTarget) => t.auth.kind === 'v2' && t.auth.claims.provider === 'aws-ec2';
+/** A migration's `updated_at::text` (`2026-11-24 10:00:00.123456+00`) or an ISO time, as epoch ms; NaN for anything else. */
+function migrationTime(value: unknown): number {
+    const m = typeof value === 'string'
+        ? value.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}(?::?\d{2})?)$/) : null;
+    if (!m) return NaN;
+    const zone = m[4] === 'Z' ? 'Z' : m[4]!.slice(0, 3) + ':' + (m[4]!.replace(':', '').slice(3) || '00');
+    return Date.parse(`${m[1]}T${m[2]}.${(m[3] ?? '').padEnd(3, '0').slice(0, 3)}${zone}`);
+}
 
 /**
  * Open a Universe project repository in Code. In this order, and each step only after the one before it held:
@@ -400,21 +410,41 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     };
     const startedOnAws = isAws(selected);
     const migrationStore = () => createProviderMigrationStore(ctx.db as unknown as PlacementExecutor);
+    /**
+     * An assignment may run on AWS in exactly two ways, each against Universe's trusted preflight and this computer's
+     * CURRENT placement (never the browser's): a committed Cloudflare-to-AWS migration of this very workspace
+     * (`upgradedWorkspaceId` + `upgradeOperationId`), or a direct AWS start/retry through `boundWorkspaceId`. That field
+     * must be PRESENT: `null` is the first opening, allowed only while no window has started; a string is the workspace
+     * Universe bound and must be this computer's exact one. An omitted field (an older Universe), a malformed or a
+     * foreign binding, or a computer mid-migration is refused, so nothing wakes and no editor or clock starts.
+     */
     async function verifyAwsContinuation(controls: ControlTarget, enrollment: Awaited<ReturnType<typeof readEnrollment>>) {
         if (!startedOnAws || !isAws(controls) || !identity || !enrollment?.ok) return false;
-        const { upgradedWorkspaceId, upgradeOperationId } = enrollment.value;
-        if (!upgradeOperationId || upgradedWorkspaceId !== workspaceIdentity(identity.userId, computerId, controls.sandboxName))
-            return false;
+        const { upgradedWorkspaceId, upgradeOperationId, boundWorkspaceId, windowStartedAt, deadlineAt } = enrollment.value;
+        const workspace = workspaceIdentity(identity.userId, computerId, controls.sandboxName);
+        if (typeof boundWorkspaceId === 'string' && boundWorkspaceId !== workspace) return false;
         const migration = await migrationStore().readByComputer(computerId);
-        return migration?.id === upgradeOperationId && migration.state === 'committed'
-            && migration.userId === identity.userId && migration.computerId === computerId
-            && migration.fromProvider === 'cloudflare' && migration.toProvider === 'aws-ec2';
+        if (upgradeOperationId) {
+            return upgradedWorkspaceId === workspace && migration?.id === upgradeOperationId && migration.state === 'committed'
+                && migration.userId === identity.userId && migration.computerId === computerId
+                && migration.fromProvider === 'cloudflare' && migration.toProvider === 'aws-ec2';
+        }
+        // Only a finished move (or one reopened on its source) is settled: `failed_needs_operator` stays fail-closed.
+        if (migration && !['committed', 'failed_reopened'].includes(migration.state)) return false;
+        // A move into AWS that committed while this assignment was already running needs the verified upgrade metadata,
+        // even when the workspace hash matches. Only a move strictly before the trusted window start (or no window yet)
+        // is a plain AWS computer; a missing or unreadable time on either side is not provably earlier.
+        if (migration?.state === 'committed' && migration.toProvider === 'aws-ec2' && windowStartedAt !== null) {
+            const moved = migrationTime(migration.updatedAt), began = Date.parse(windowStartedAt);
+            if (!Number.isFinite(moved) || !Number.isFinite(began) || moved >= began) return false;
+        }
+        return boundWorkspaceId === workspace || (boundWorkspaceId === null && windowStartedAt === null && deadlineAt === null);
     }
     let preflight = reserved && startedOnAws ? await readEnrollment() : null;
     if (reserved && startedOnAws) {
         if (preflight && !preflight.ok && preflight.kind === 'unavailable') return assignmentUnavailable();
         if (preflight && !preflight.ok && preflight.kind === 'identity') return assignmentIdentity();
-        if (!await verifyAwsContinuation(selected, preflight)) return unsupportedProvider();
+        if (!await verifyAwsContinuation(selected, preflight)) return assignmentAwsUnverified();
     }
 
     const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown; computeProvider?: unknown; sandboxId?: unknown; generation?: unknown; leaseEpoch?: unknown };
@@ -445,15 +475,16 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     } else if (preview.computeProvider === 'aws-ec2') {
         return shellRefusal(409, 'repo_open_computer_changed', 'This computer changed while opening. Try again.');
     }
-    // A migrated assignment has to be authorized for this exact workspace before and after minting.
-    if (reserved && (startedOnAws || isAws(controls)) && !await verifyAwsContinuation(controls, preflight))
-        return unsupportedProvider();
     const attemptId = enrolledId();
-    preflight ??= await readEnrollment();
+    // An AWS binding can change while Code mints, so Universe is asked again now: the first answer never authorizes the Worker.
+    if (reserved && isAws(controls)) preflight = await readEnrollment(); else preflight ??= await readEnrollment();
     // A reserved checkout is never cloned on a failed Universe call: no answer is not a refusal (retryable), and a
     // lapsed EZiL ID is a sign-in. Universe's own refusal keeps today's path (`assignment_checkout_unverified`).
     if (reserved && preflight && !preflight.ok && preflight.kind === 'unavailable') return assignmentUnavailable();
     if (reserved && preflight && !preflight.ok && preflight.kind === 'identity') return assignmentIdentity();
+    // An AWS assignment has to be authorized for this exact workspace, before and after minting.
+    if (reserved && (startedOnAws || isAws(controls)) && !await verifyAwsContinuation(controls, preflight))
+        return assignmentAwsUnverified();
     const enrolled = preflight?.ok ? preflight.value : null;
     const challenge = enrolled && privatePacket && attemptId && matchesEnrollment(enrolled, privatePacket, attemptId, Date.now())
         ? makeChallenge(attemptId, privatePacket.repository.canonicalURL) : undefined;
@@ -475,8 +506,13 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
         { correlationId: newCorrelationId(), signal: deadline, awsStandaloneEnabled: awsStandaloneGitEnabled(),
             revalidateTarget: async () => {
                 const fresh = await target(ctx, computerId);
-                if (reserved && isAws(controls) && !await verifyAwsContinuation(fresh, preflight))
-                    throw new Error('assignment_placement_changed');
+                if (reserved && isAws(controls)) {
+                    // The last look before the signed Worker call: the same enrollment, still bound to this workspace.
+                    const latest = await readEnrollment();
+                    if (!latest?.ok || !privatePacket || !attemptId || !matchesEnrollment(latest.value, privatePacket, attemptId, Date.now())
+                        || latest.value.manifestSha256 !== enrolled?.manifestSha256 || !await verifyAwsContinuation(fresh, latest))
+                        throw new Error('assignment_placement_changed');
+                }
                 return fresh;
             } });
     if (!opened.ok) {
