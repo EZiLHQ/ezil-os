@@ -58,6 +58,17 @@ describe('same-origin actual assignment shell route',()=>{
         }
         expect(mocks.action).not.toHaveBeenCalled();
     });
+    it('exposes the authenticated clock without a recording phase or client-supplied state',async()=>{
+        const clock = {attemptId,action:'clock'};
+        mocks.action.mockResolvedValueOnce({revision:0,startedAt:null,deadlineAt:null});
+        const res = await post(defaults,clock);
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({revision:0,startedAt:null,deadlineAt:null});
+        expect(mocks.action).toHaveBeenCalledWith(expect.objectContaining({subject:'participant'}),clock,
+            expect.objectContaining({signal:expect.any(AbortSignal)}));
+        expect((await post(defaults,{...clock,captureSessionId:attemptId})).status).toBe(400);
+        expect((await post(defaults,{...clock,pausedAt:'2026-11-24T00:00:00.000Z'})).status).toBe(400);
+    });
     it('sends only the normal validated action and identity and returns a private no-store receipt',async()=>{
         const res=await post();
         expect(res.status).toBe(200);

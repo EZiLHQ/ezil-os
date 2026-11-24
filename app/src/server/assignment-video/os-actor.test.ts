@@ -41,7 +41,7 @@ describe('OS authenticated assignment requests',()=>{
     it('signs only existing OS-owned service calls and checks session and canonical checkout',()=>{
         const media='/internal/assignment-video/';
         expect(()=>encode(json({action:'complete',repositoryUrl:repo}))).not.toThrow();
-        for(const action of ['preflight','begin','status','checkpoint','finalize']){
+        for(const action of ['preflight','begin','clock','editor-ready','status','checkpoint','finalize']){
             const text=json({osSessionId:actor.sessionId,repoOpen:{repositoryUrl:repo}});
             expect(osActorHeaders(actor,origin+media+action,attempt,text,now,env)['X-Ezil-Assignment-Actor']).toBe(actor.subject);
             expect(()=>osActorHeaders(actor,origin+media+action,attempt,json({osSessionId:'other'}),now,env)).toThrow();

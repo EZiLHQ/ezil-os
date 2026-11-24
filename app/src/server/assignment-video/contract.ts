@@ -7,19 +7,29 @@ export const {os:osOrigin, universe:universeOrigin, works:worksOrigin, storage:o
 export const issuer = 'https://id.ezil.work/';
 export const hour = 3_600_000;
 export const drain = 90_000;
+// Recording offsets are backed by integers in the evidence ledger.
+const maxElapsed = 2_147_483_647;
+export function validAssignmentWindow(start: number, deadline: number, revision = 0): boolean {
+    const duration = deadline - start;
+    return duration > 0 && duration <= (revision > 0 ? maxElapsed : hour);
+}
 export const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
 const integer = (min: number, max: number) => z.number().int().min(min).max(max);
 const sequence = integer(0, 599);
 const base = { attemptId: uuid };
 const phase = {captureSessionId: uuid.optional()};
+const repoOpenProof = z.string().regex(/^[A-Za-z0-9_-]{48,1700}$/);
 export const reason = z.enum(['stopped', 'submitted', 'timeout']);
 const segment = {
     sequence, sha256: z.string().regex(/^[a-f0-9]{64}$/), byteLength: integer(1, 8 * 1024 * 1024),
-    mimeType: z.literal('video/webm'), startMs: integer(0, hour), endMs: integer(1, hour),
+    mimeType: z.literal('video/webm'), startMs: integer(0, maxElapsed - 1), endMs: integer(1, maxElapsed),
 };
 export const requestSchema = z.discriminatedUnion('action', [
-    z.object({ ...base, ...phase, action: z.literal('begin'), repoOpenProof: z.string().regex(/^[A-Za-z0-9_-]{48,1700}$/), consentAccepted: z.literal(true), consentVersion: integer(1, 2147483647) }).strict(),
+    z.object({ ...base, ...phase, action: z.literal('begin'), repoOpenProof, consentAccepted: z.literal(true), consentVersion: integer(1, 2147483647) }).strict(),
     z.object({ ...base, action: z.literal('preflight') }).strict(),
+    z.object({ ...base, action: z.literal('clock') }).strict(),
+    z.object({ ...base, action: z.literal('editor-ready'), captureSessionId: uuid,
+        repoOpenProof }).strict(),
     z.object({ ...base, ...phase, action: z.literal('status') }).strict(),
     z.object({ ...base, ...phase, action: z.literal('prepare'), ...segment }).strict(),
     z.object({ ...base, ...phase, action: z.literal('confirm'), sequence }).strict(),
@@ -29,10 +39,34 @@ export const requestSchema = z.discriminatedUnion('action', [
 export type Input = z.infer<typeof requestSchema>;
 export type Prepare = Extract<Input, { action: 'prepare' }>;
 const moment = z.string().datetime({offset: true});
-export const eligible = z.object({status: z.literal('eligible'), attemptId: uuid,
+export const clockDetails = z.object({
+    serverNow: moment,
+    pausedAt: moment.nullable(),
+    pauseReason: z.string().min(1).max(128).nullable(),
+    remainingMs: integer(0, hour).nullable(),
+    revision: integer(0, Number.MAX_SAFE_INTEGER),
+});
+export const mediaClockDetails = clockDetails.partial().extend({workStartedAt: moment.nullable().optional()});
+const optionalClock = mediaClockDetails.shape;
+export const clockState = clockDetails.extend({
+    startedAt: moment.nullable(),
+    deadlineAt: moment.nullable(),
+}).refine(state => {
+    if (state.startedAt === null || state.deadlineAt === null)
+        return state.startedAt === null && state.deadlineAt === null && state.pausedAt === null
+            && state.pauseReason === null && state.remainingMs === null;
+    const start = Date.parse(state.startedAt), end = Date.parse(state.deadlineAt);
+    if (!validAssignmentWindow(start, end, state.revision) || state.remainingMs === null) return false;
+    if (state.pausedAt === null) return state.pauseReason === null;
+    const pause = Date.parse(state.pausedAt);
+    return state.revision > 0 && start <= pause && pause < end
+        && pause <= Date.parse(state.serverNow) && state.pauseReason !== null;
+});
+export const eligible = z.object({...optionalClock, status: z.literal('eligible'), attemptId: uuid,
     jobId: z.string().regex(/^[1-9][0-9]{0,18}$/), expiresAt: moment, windowStartedAt: moment.nullable(), deadlineAt: moment.nullable(),
     manifestSha256: z.string().regex(/^[a-f0-9]{64}$/), repositoryUrl: z.string().max(260), providerId: z.string().regex(/^[a-z0-9]{1,64}$/), ref: z.literal('refs/heads/main')});
 const control = {
+    ...optionalClock,
     recordingId: uuid, status: z.enum(['awaiting_frame','paused','recording', 'empty', 'partial', 'complete']),
     startedAt: moment.nullable(), deadlineAt: moment.nullable(),
     captureSessionId: uuid.optional(), repositoryOpenReceiptId: uuid.optional(), nextSequence: integer(0,600).optional(),

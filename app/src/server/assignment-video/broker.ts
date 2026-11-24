@@ -1,18 +1,51 @@
 import { osActorHeaders } from './os-actor';
 import { assignmentAuthority, productionAssignment } from './authority';
 import { privateMediaPost } from './private-ingress';
-import { eligibleForActor, readOpen, repoOpenSecret, signBegin } from './repo-open';
+import { eligibleForActor, readOpen, repoOpenSecret, signRepoOpen } from './repo-open';
 import { createHash } from 'node:crypto';
 import type { RetainedIdentity } from '@/server/auth/retained-identity';
-import { boundedJson, checkedPut, drain, eligible, hour, issuer, refuse, started, summary, type Input } from './contract';
+import { boundedJson, checkedPut, clockState, mediaClockDetails, drain, eligible, issuer, refuse, started, summary, validAssignmentWindow, type Input } from './contract';
 
 type Identity = Pick<RetainedIdentity, 'token' | 'issuer' | 'subject' | 'sessionId' | 'expiresAt' | 'userId'>;
-type Capability = { recording: string; token: string; deadline: number; preparedEnds: Map<number, number>; phase?: string; seed?: number };
+type ClockWindow = {startedAt: string | null; deadlineAt: string | null; pausedAt?: string | null; revision?: number};
+type Capability = {
+    recording: string;
+    token: string;
+    deadline: number;
+    startedAt?: number;
+    pausedAt?: number;
+    revision: number;
+    identityExpiresAt: number;
+    preparedEnds: Map<number, number>;
+    phase?: string;
+    seed?: number;
+    seedDeadline?: number;
+};
 type Dependencies = { fetcher?: typeof fetch; clock?: () => number; leases?: Map<string, Capability>; signal?: AbortSignal };
 const storage = globalThis as typeof globalThis & { ezilAssignmentMediaLeases?: Map<string, Capability> };
 // The same process already holds the verified OS session identity. A process loss requires a new authenticated begin.
 // No Works capability, retained ID token, signature, signed URL or storage key is persisted.
 const defaults = storage.ezilAssignmentMediaLeases ??= new Map<string, Capability>();
+
+function syncLeaseClock(entry: Capability, report: ClockWindow) {
+    if (report.startedAt === null || report.deadlineAt === null) {
+        if (entry.startedAt !== undefined) return refuse('recording_state_changed', 409);
+        return;
+    }
+    const start = Date.parse(report.startedAt), deadline = Date.parse(report.deadlineAt);
+    const revision = report.revision ?? 0;
+    const pausedAt = report.pausedAt ? Date.parse(report.pausedAt) : undefined;
+    if (revision < entry.revision || !validAssignmentWindow(start, deadline, revision)
+        || (entry.startedAt !== undefined && entry.startedAt !== start)
+        || (pausedAt !== undefined && !(revision > 0 && start <= pausedAt && pausedAt < deadline))) {
+        return refuse('recording_state_changed', 409);
+    }
+    if (entry.startedAt !== undefined && (deadline < entry.deadline
+        || (revision === entry.revision && (deadline !== entry.deadline || pausedAt !== entry.pausedAt)))) {
+        return refuse('recording_state_changed', 409);
+    }
+    Object.assign(entry, {deadline, startedAt:start, pausedAt, revision});
+}
 
 export function recordingAction(identity: Identity, input: Extract<Input, {action: 'preflight'}>, deps?: Dependencies):
     Promise<ReturnType<typeof eligible.parse>>;
@@ -26,9 +59,13 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
     if (identity.issuer !== issuer || !identity.token || !identity.userId || !identity.sessionId || !identity.subject
         || identity.expiresAt <= clock()) return refuse('identity_refresh_required', 401);
     const key = createHash('sha256').update(JSON.stringify([authority.os, identity.userId, identity.subject, identity.sessionId, input.attemptId])).digest('hex');
-    for (const [id, entry] of leases) if (entry.deadline + drain < clock()) leases.delete(id);
+    const currentLease = leases.get(key);
+    if (currentLease) currentLease.identityExpiresAt = identity.expiresAt;
+    // The assignment can be paused beyond the last observed deadline. Expire its lease with the bound OS identity.
+    for (const [id, entry] of leases) if (entry.identityExpiresAt <= clock()) leases.delete(id);
 
-    async function post(url: string, body: object, capability?: string, beginSecret?: string): Promise<unknown> {
+    type ProofHeaders = (serialized: string, now: number) => Record<string,string>;
+    async function post(url: string, body: object, capability?: string, proofHeaders?: ProofHeaders): Promise<unknown> {
         const serialized = JSON.stringify(body);
         const timeout = AbortSignal.timeout(12000);
         let response: Response;
@@ -42,7 +79,7 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
                     headers:{'content-type':'application/json', accept:'application/json',
                         ...(capability ? {authorization:'Bearer ' + capability} : {}),
                         ...(!capability && authority === productionAssignment ? osActorHeaders(identity,url,input.attemptId,serialized,clock()) : {}),
-                        ...(beginSecret ? signBegin(beginSecret, serialized, clock()) : {})}, body:serialized, signal});
+                        ...(proofHeaders ? proofHeaders(serialized, clock()) : {})}, body:serialized, signal});
             }
         } catch { return refuse('media_unavailable', 503); }
         if (!response.ok) {
@@ -54,10 +91,17 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
         if (!response.headers.get('content-type')?.toLowerCase().startsWith('application/json')) return refuse('media_unavailable', 503);
         return boundedJson(response.body, 262144, 503);
     }
-    const control = (action: 'preflight'|'begin'|'status'|'finalize'|'checkpoint', fields: object = {}, beginSecret?: string) =>
+    const control = (action: 'preflight'|'begin'|'clock'|'editor-ready'|'status'|'finalize'|'checkpoint',
+        fields: object = {}, proofHeaders?: ProofHeaders) =>
         post(authority.universe + '/internal/assignment-video/' + action, {
             userIdToken: identity.token, attemptId: input.attemptId, osSessionId: identity.sessionId, ...fields,
-        }, undefined, beginSecret);
+        }, undefined, proofHeaders);
+    function openControl(action: 'begin'|'editor-ready', proof: string, fields: object) {
+        const secret = repoOpenSecret();
+        if (!secret) return refuse('assignment_open_unavailable', 503);
+        const repoOpen = readOpen(proof, identity, input.attemptId, clock(), secret);
+        return control(action, {...fields, repoOpen}, (serialized, now) => signRepoOpen(secret, action, serialized, now));
+    }
 
     if (input.action === 'preflight') {
         const result = eligible.safeParse(await control('preflight'));
@@ -65,15 +109,26 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
             return refuse('recording_unavailable', 404);
         return result.data;
     }
+    if (input.action === 'clock') {
+        const result = clockState.safeParse(await control('clock'));
+        if (!result.success) return refuse('media_unavailable', 503);
+        return result.data;
+    }
+    if (input.action === 'editor-ready') {
+        const result = clockState.safeParse(await openControl('editor-ready', input.repoOpenProof, {
+            captureSessionId:input.captureSessionId,
+        }));
+        if (!result.success || result.data.startedAt === null) return refuse('media_unavailable', 503);
+        return result.data;
+    }
     if (input.action === 'begin') {
         if (authority === productionAssignment && (!input.captureSessionId || input.consentVersion !== 4))
             return refuse('video_consent_required', 409);
-        const secret = repoOpenSecret();
-        if (!secret) return refuse('assignment_open_unavailable', 503);
-        const repoOpen = readOpen(input.repoOpenProof, identity, input.attemptId, clock(), secret);
         const requestedPhase = input.captureSessionId;
-        const result = started.safeParse(await control('begin', {consentAccepted: true, consentVersion: input.consentVersion, repoOpen,
-            ...(requestedPhase ? {captureSessionId:requestedPhase} : {})}, secret));
+        const result = started.safeParse(await openControl('begin', input.repoOpenProof, {
+            consentAccepted:true, consentVersion:input.consentVersion,
+            ...(requestedPhase ? {captureSessionId:requestedPhase} : {}),
+        }));
         if (!result.success) return refuse('media_unavailable', 503);
         const {uploadToken, ...receipt} = result.data;
         const provisional = requestedPhase !== undefined && receipt.phaseReady !== true;
@@ -81,8 +136,8 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
         const authorityEnd = receipt.deadlineAt ? Date.parse(receipt.deadlineAt) : NaN;
         const deadline = provisional && receipt.authorizationExpiresAt ? Date.parse(receipt.authorizationExpiresAt) : authorityEnd;
         const validWindow = Number.isFinite(t0) && Number.isFinite(authorityEnd) && t0 <= clock()+1500
-            && authorityEnd > clock() && authorityEnd-t0 <= hour && authorityEnd > t0;
-        if (!uploadToken || receipt.revoked || receipt.stopRequestedAt !== null || !Number.isFinite(deadline) || deadline <= clock()
+            && authorityEnd > clock() && validAssignmentWindow(t0, authorityEnd, receipt.revision);
+        if (!uploadToken || receipt.revoked || receipt.pausedAt || receipt.stopRequestedAt !== null || !Number.isFinite(deadline) || deadline <= clock()
             || (requestedPhase && (receipt.captureSessionId !== requestedPhase || receipt.nextSequence === undefined))
             || (provisional ? !['awaiting_frame','recording'].includes(receipt.status) || !receipt.authorizationExpiresAt
                 || !(validWindow || (receipt.startedAt === null && receipt.deadlineAt === null))
@@ -90,8 +145,13 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
         if (!leases.has(key) && leases.size >= 2048) return refuse('media_unavailable', 503);
         const previous = leases.get(key);
         const same = previous?.recording === receipt.recordingId && previous.phase === requestedPhase;
-        leases.set(key, {recording:receipt.recordingId, token:uploadToken, deadline, phase:requestedPhase,
-            seed:provisional ? receipt.nextSequence : undefined, preparedEnds:same ? previous.preparedEnds : new Map()});
+        const entry: Capability = {recording:receipt.recordingId, token:uploadToken, deadline, phase:requestedPhase,
+            revision:0, identityExpiresAt:identity.expiresAt, seed:provisional ? receipt.nextSequence : undefined,
+            seedDeadline:provisional ? deadline : undefined,
+            preparedEnds:same ? previous.preparedEnds : new Map()};
+        if (validWindow) syncLeaseClock(entry, receipt);
+        if (same && previous.startedAt !== undefined) syncLeaseClock({...previous}, receipt);
+        leases.set(key, entry);
         return receipt;
     }
 
@@ -116,18 +176,27 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
     if (!parsed.success) return refuse('media_unavailable', 503);
     const state = parsed.data;
     if (input.captureSessionId && state.captureSessionId !== input.captureSessionId) return refuse('recording_phase_changed',409);
-    if (input.action === 'status') return state;
     const entry = leases.get(key);
+    if (input.action === 'status') {
+        if (entry?.recording === state.recordingId && (state.revision ?? 0) >= entry.revision)
+            syncLeaseClock(entry, state);
+        return state;
+    }
     if (!entry || entry.recording !== state.recordingId)
         return refuse('recording_session_refresh_required', 409);
+    syncLeaseClock(entry, state);
     const seed = entry.phase !== undefined && entry.seed === input.sequence;
-    if ((entry.phase && !seed && (state.phaseReady !== true || state.workspaceUnlocked !== true))
-        || state.revoked || (state.status !== 'recording' && !(seed && state.status === 'awaiting_frame')))
+    const paused = entry.pausedAt !== undefined;
+    const draining = paused && input.action === 'confirm' && !seed;
+    if ((entry.phase && !seed && !draining && (state.phaseReady !== true || state.workspaceUnlocked !== true))
+        || state.revoked || (paused && !draining)
+        || (state.status !== 'recording' && !(seed && state.status === 'awaiting_frame')
+            && !(draining && state.status === 'paused')))
         return refuse('recording_closed',409);
-    if (state.deadlineAt && !seed) entry.deadline = Date.parse(state.deadlineAt);
+    const cutoff = Math.min(seed ? entry.seedDeadline ?? entry.deadline : entry.deadline,
+        entry.pausedAt ?? Infinity, state.stopRequestedAt ? Date.parse(state.stopRequestedAt) : Infinity);
     const segmentPath = authority.works + '/universe/assignment-media/segments';
     if (input.action === 'confirm') {
-        const cutoff = Math.min(entry.deadline, state.stopRequestedAt ? Date.parse(state.stopRequestedAt) : entry.deadline);
         if (clock() > cutoff + drain) return refuse('recording_closed', 409);
         const preparedEnd = entry.preparedEnds.get(input.sequence);
         if (preparedEnd === undefined || preparedEnd > cutoff) return refuse('segment_outside_recording', 409);
@@ -141,20 +210,24 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
             const first = typeof ready.firstFrameAt === 'string' ? Date.parse(ready.firstFrameAt) : NaN;
             const start = typeof ready.startedAt === 'string' ? Date.parse(ready.startedAt) : NaN;
             const end = typeof ready.deadlineAt === 'string' ? Date.parse(ready.deadlineAt) : NaN;
+            const details = mediaClockDetails.safeParse(ready);
+            const revision = details.data?.revision ?? (ready.startedAt === state.startedAt && ready.deadlineAt === state.deadlineAt
+                ? state.revision : undefined);
             if (ready.phaseReady !== true || ready.captureSessionId !== entry.phase
                 || ready.nextSequence !== input.sequence+1 || typeof ready.startedAt !== 'string' || typeof ready.deadlineAt !== 'string'
                 || !Number.isFinite(first) || !Number.isFinite(start) || !Number.isFinite(end) || first < start
-                || first > now + 1500 || end <= now || end <= first || end - start > hour)
+                || !details.success || details.data.pausedAt || first > now + 1500 || end <= now || end <= first
+                || !validAssignmentWindow(start, end, revision))
                 return refuse('seed_not_confirmed',503);
-            entry.deadline = end;
+            syncLeaseClock(entry, {startedAt:ready.startedAt,deadlineAt:ready.deadlineAt,revision});
             return {recordingId:state.recordingId,sequence:input.sequence,confirmed:true,phaseReady:true,
                 captureSessionId:entry.phase,nextSequence:ready.nextSequence,firstFrameAt:ready.firstFrameAt,
-                startedAt:ready.startedAt,deadlineAt:ready.deadlineAt,serverNow:new Date(now).toISOString()};
+                startedAt:ready.startedAt,deadlineAt:ready.deadlineAt,serverNow:new Date(now).toISOString(),
+                ...details.data, ...(revision === undefined ? {} : {revision})};
         }
         return {recordingId: state.recordingId, sequence: input.sequence, confirmed: true};
     }
     const start = state.startedAt ? Date.parse(state.startedAt) : NaN;
-    const cutoff = Math.min(entry.deadline, state.stopRequestedAt ? Date.parse(state.stopRequestedAt) : entry.deadline);
     if (clock() > cutoff + drain || input.endMs <= input.startMs || input.endMs - input.startMs > 60000
         || (seed ? input.startMs !== 0 || input.endMs !== 1 || input.byteLength > 1024*1024 || clock() >= cutoff
             : !Number.isFinite(start) || start + input.endMs > Math.min(clock(), cutoff))) return refuse('segment_outside_recording', 409);

@@ -10,7 +10,7 @@ const issuer = 'https://id.ezil.work/';
 const origin = productionAssignment.universe;
 const enrollment = '/internal/assignment-repositories/enrollment';
 const media = '/internal/assignment-video/';
-const paths = new Set([enrollment, ...['preflight','begin','status','checkpoint','finalize'].map(action => media + action)]);
+const paths = new Set([enrollment, ...['preflight','begin','clock','editor-ready','status','checkpoint','finalize'].map(action => media + action)]);
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Add an OS service credential only to a server-constructed request for the current participant. */
@@ -30,7 +30,7 @@ export function osActorHeaders(identity: RetainedIdentity, endpoint: string, att
     if (path === enrollment && !['prepare','complete'].includes(body.action)) throw new Error('Invalid enrollment action');
     const expectedRepo = expectedRepositoryURL(identity.subject, 'a-' + attemptId);
     if ((path === enrollment && body.action === 'complete' && body.repositoryUrl !== expectedRepo) ||
-        (path === media + 'begin' && body.repoOpen?.repositoryUrl !== expectedRepo)) throw new Error('Assignment repository mismatch');
+        ([media + 'begin', media + 'editor-ready'].includes(path) && body.repoOpen?.repositoryUrl !== expectedRepo)) throw new Error('Assignment repository mismatch');
 
     const stamp = String(now);
     const nonce = randomUUID();

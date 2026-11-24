@@ -5,7 +5,7 @@ import { assignmentMarker } from '@/server/git/assignment-bootstrap';
 import { expectedRepositoryURL } from '@/server/git/assignment-enrollment';
 import type { PreloadChallenge } from '@/server/lib/compute/repo-open';
 import type { PrivateGitPacket } from '@/server/git/private-packet';
-import { eligible, issuer, refuse, uuid } from './contract';
+import { eligible, issuer, refuse, uuid, validAssignmentWindow } from './contract';
 import { workspaceIdentity } from './workspace-identity';
 
 export { workspaceIdentity } from './workspace-identity';
@@ -38,17 +38,19 @@ export function makeChallenge(attemptId: string, repositoryUrl: string): Preload
 export function eligibleForActor(eligible: Eligible, actor: Actor, attemptId: string, now: number): boolean {
     const original = eligible.windowStartedAt && Date.parse(eligible.windowStartedAt);
     const end = eligible.deadlineAt && Date.parse(eligible.deadlineAt);
+    const pause = eligible.pausedAt ? Date.parse(eligible.pausedAt) : null;
     return eligible.attemptId === attemptId && eligible.repositoryUrl === expectedRepositoryURL(actor.subject, 'a-' + attemptId)
         && eligible.manifestSha256 === createHash('sha256').update(assignmentMarker(eligible.repositoryUrl)).digest('hex')
         && now < Date.parse(eligible.expiresAt)
-        && ((original === null && end === null) || (typeof original === 'number' && typeof end === 'number'
-            && original <= now && now < end && end-original <= 3_600_000));
+        && ((original === null && end === null && pause === null) || (typeof original === 'number' && typeof end === 'number'
+            && original <= now && validAssignmentWindow(original, end, eligible.revision)
+            && (pause === null ? now < end : (eligible.revision ?? 0) > 0 && original <= pause && pause <= now && pause < end)));
 }
 
 export function matchesEnrollment(eligible: Eligible, packet: PrivateGitPacket, attemptId: string, now: number) {
     return eligible.attemptId === attemptId && eligible.repositoryUrl === packet.repository.canonicalURL
         && eligible.providerId === packet.repository.id && eligible.ref === packet.repository.ref
-        && (eligible.deadlineAt === null || now < Date.parse(eligible.deadlineAt)) && now < Date.parse(eligible.expiresAt);
+        && !eligible.pausedAt && (eligible.deadlineAt === null || now < Date.parse(eligible.deadlineAt)) && now < Date.parse(eligible.expiresAt);
 }
 
 const actorBinding = (actor: Actor) => createHash('sha256').update(JSON.stringify(
@@ -82,8 +84,9 @@ export function readOpen(proof: string, actor: Actor, attemptId: string, now: nu
     return refuse('assignment_open_required', 409);
 }
 
-export function signBegin(secret: string, body: string, now: number): Record<string,string> {
+export function signRepoOpen(secret: string, action: 'begin' | 'editor-ready', body: string, now: number): Record<string,string> {
     const time = String(now);
     return {'X-Ezil-Repo-Open-Timestamp':time,
-        'X-Ezil-Repo-Open-Signature':createHmac('sha256',secret).update(time + '.POST /internal/assignment-video/begin.' + body).digest('hex')};
+        'X-Ezil-Repo-Open-Signature':createHmac('sha256',secret)
+            .update(time + '.POST /internal/assignment-video/' + action + '.' + body).digest('hex')};
 }

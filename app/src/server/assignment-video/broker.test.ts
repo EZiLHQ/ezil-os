@@ -1,7 +1,7 @@
 import { assignmentMarker } from '@/server/git/assignment-bootstrap';
 import { expectedRepositoryURL } from '@/server/git/assignment-enrollment';
-import { makeChallenge, readOpen, sealOpen, signBegin } from './repo-open';
-import { createHash } from 'node:crypto';
+import { makeChallenge, readOpen, sealOpen, signRepoOpen } from './repo-open';
+import { createHash, createHmac } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { recordingAction } from './broker';
 import { checkedPut, drain, hour, issuer, objectOrigin, requestSchema, type Prepare } from './contract';
@@ -73,7 +73,7 @@ describe('assignment media broker',()=>{
         expect(JSON.parse(String(calls[0].init?.body))).toEqual({attemptId:attempt,osSessionId:identity.sessionId,
             userIdToken:identity.token,consentAccepted:true,consentVersion:1,
             repoOpen:readOpen(witness.proof,identity,attempt,clock,testSigner)});
-        expect(calls[0].init?.headers).toMatchObject(signBegin(testSigner,String(calls[0].init?.body),clock));
+        expect(calls[0].init?.headers).toMatchObject(signRepoOpen(testSigner,'begin',String(calls[0].init?.body),clock));
         expect(calls[0].url).toBe('https://universe-staging.ezil.work/internal/assignment-video/begin');
         expect(await recordingAction(identity,input,d)).toEqual(signed);
         expect(calls.at(-2)?.url).toBe('https://universe-staging.ezil.work/internal/assignment-video/status');
@@ -208,6 +208,119 @@ describe('assignment media broker',()=>{
         vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET',undefined);
         await expect(recordingAction(identity,action,{...deps(),fetcher:remote})).rejects.toMatchObject({status:503});
         expect(sent).toHaveLength(1);
+    });
+    it('reads only the authenticated, attempt-scoped clock without a recording lease',async()=>{
+        vi.stubEnv('BILLING_FUNDING_URL','https://ai.ezil.work');
+        vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN','https://universe.ezil.work');
+        vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED','1');
+        const waiting = {serverNow:time(clock),startedAt:null,deadlineAt:null,pausedAt:null,
+            pauseReason:null,remainingMs:null,revision:0};
+        const upstream = vi.fn<typeof fetch>(async()=>Response.json({...waiting, uploadToken:cap}));
+        const d = {...deps(),fetcher:upstream};
+        const request = {action:'clock' as const,attemptId:attempt};
+        expect(requestSchema.safeParse({...request,pausedAt:time(clock)}).success).toBe(false);
+        expect(await recordingAction(identity,request,d)).toEqual(waiting);
+        expect(d.leases.size).toBe(0);
+        const [url, options] = upstream.mock.calls[0];
+        expect(url).toBe('https://universe.ezil.work/internal/assignment-video/clock');
+        expect(new Headers(options?.headers).get('x-ezil-assignment-actor')).toBe(identity.subject);
+        expect(new Headers(options?.headers).get('x-ezil-assignment-signature')).toMatch(/^[a-f0-9]{64}$/);
+        expect(JSON.parse(String(options?.body))).toEqual({attemptId:attempt,userIdToken:identity.token,osSessionId:identity.sessionId});
+        upstream.mockResolvedValueOnce(Response.json({...waiting,deadlineAt:time(initial+hour)}));
+        await expect(recordingAction(identity,request,d)).rejects.toMatchObject({code:'media_unavailable'});
+        upstream.mockResolvedValueOnce(Response.json({}, {status:404}));
+        await expect(recordingAction(identity,request,d)).rejects.toMatchObject({code:'recording_unavailable',status:404});
+    });
+    it('signs editor readiness for the same retained actor and verified capture phase',async()=>{
+        vi.stubEnv('BILLING_FUNDING_URL','https://ai.ezil.work');
+        vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN','https://universe.ezil.work');
+        vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED','1');
+        const phase = '00000000-0000-4000-8000-000000000099';
+        const readiness = {startedAt:time(clock), deadlineAt:time(clock+hour), serverNow:time(clock),
+            pausedAt:null,pauseReason:null,remainingMs:hour,revision:1};
+        const upstream = vi.fn<typeof fetch>(async()=>Response.json({...readiness, uploadToken:cap}));
+        const d = {...deps(),fetcher:upstream};
+        const request = {action:'editor-ready' as const,attemptId:attempt,captureSessionId:phase,repoOpenProof:witness.proof};
+        await expect(recordingAction({...identity,sessionId:'other'},request,d)).rejects.toMatchObject({code:'assignment_open_required'});
+        await expect(recordingAction(identity,{...request,attemptId:recording},d)).rejects.toMatchObject({code:'assignment_open_required'});
+        expect(upstream).not.toHaveBeenCalled();
+        expect(requestSchema.safeParse({...request,captureSessionId:undefined}).success).toBe(false);
+        expect(requestSchema.safeParse({...request,startedAt:time(clock)}).success).toBe(false);
+        await expect(recordingAction(identity,request,d)).resolves.toEqual(readiness);
+        const [target, options] = upstream.mock.calls[0];
+        const path = '/internal/assignment-video/editor-ready';
+        const body = String(options?.body);
+        expect(target).toBe('https://universe.ezil.work'+path);
+        expect(JSON.parse(body)).toEqual({attemptId:attempt,osSessionId:identity.sessionId,userIdToken:identity.token,
+            captureSessionId:phase,repoOpen:readOpen(witness.proof,identity,attempt,clock,testSigner)});
+        const headers = new Headers(options?.headers);
+        expect(headers.get('x-ezil-assignment-actor')).toBe(identity.subject);
+        expect(headers.get('x-ezil-repo-open-timestamp')).toBe(String(clock));
+        expect(headers.get('x-ezil-repo-open-signature')).toBe(createHmac('sha256',testSigner)
+            .update(String(clock)+'.POST '+path+'.'+body).digest('hex'));
+        expect(d.leases.size).toBe(0);
+    });
+    it('blocks new uploads during a trusted pause and drains only already prepared pre-pause footage',async()=>{
+        const d = deps();
+        const later = deps();
+        await recordingAction(identity,begin,d);
+        await recordingAction(identity,begin,later);
+        await recordingAction(identity,{...input,endMs:4200},d);
+        await recordingAction(identity,input,later);
+        remoteState = {...state,revision:1,pausedAt:time(initial+4800),pauseReason:'resource_upgrade'};
+        await expect(recordingAction(identity,{...input,endMs:4200},d)).rejects.toMatchObject({code:'recording_closed'});
+        const confirm = {action:'confirm' as const,attemptId:attempt,sequence:0};
+        await expect(recordingAction(identity,confirm,d)).resolves.toMatchObject({confirmed:true});
+        await expect(recordingAction(identity,confirm,later)).rejects.toMatchObject({code:'segment_outside_recording'});
+        expect(calls.filter(call=>call.url.endsWith('/segments/confirm'))).toHaveLength(1);
+    });
+    it('accepts resumed wall-clock segments after the old deadline and rejects stale or contradictory revisions',async()=>{
+        const d = {...deps(),fetcher:async (url:RequestInfo | URL,options?:RequestInit)=>
+            String(url).endsWith('/segments') ? Response.json({...signed,expiresAt:time(clock+60000)}) : fetcher(url,options)};
+        await recordingAction(identity,begin,d);
+        const elapsed = hour+drain+10000;
+        clock = initial+elapsed;
+        const extended = {...state,revision:2,deadlineAt:time(initial+elapsed+20000)};
+        const late = {...input,startMs:elapsed-3000,endMs:elapsed};
+        remoteState = {...state,deadlineAt:extended.deadlineAt};
+        await expect(recordingAction(identity,late,d)).rejects.toMatchObject({code:'recording_state_changed'});
+        remoteState = {...extended};
+        await expect(recordingAction(identity,late,d)).resolves.toMatchObject({expiresAt:time(clock+60000)});
+        remoteState = {...state,revision:1,pausedAt:time(initial+4800)};
+        await expect(recordingAction(identity,late,d)).rejects.toMatchObject({code:'recording_state_changed'});
+        remoteState = {...extended,deadlineAt:time(initial+elapsed+21000)};
+        await expect(recordingAction(identity,late,d)).rejects.toMatchObject({code:'recording_state_changed'});
+    });
+    it('reopens a version-four seed with the original media offset and revised deadline',async()=>{
+        const phase = '00000000-0000-4000-8000-000000000099';
+        clock = initial+hour+5000;
+        const revisedDeadline = clock+60000;
+        const reopened = {...eligibility,expiresAt:time(clock+300000),deadlineAt:time(revisedDeadline),revision:2};
+        const prepared = sealOpen(identity,reopened,'qa-computer','qa-workspace',recording,clock,testSigner);
+        const workStartedAt = time(initial+30000);
+        remoteState = {...state,status:'awaiting_frame',phaseReady:false,workspaceUnlocked:false,captureSessionId:phase,
+            nextSequence:0,authorizationExpiresAt:time(clock+60000),deadlineAt:time(revisedDeadline),revision:2,workStartedAt};
+        const ack = {...remoteState,confirmed:true,sequence:0,phaseReady:true,nextSequence:1,firstFrameAt:time(clock)};
+        const d = {...deps(),fetcher:async (url:RequestInfo | URL,options?:RequestInit) =>
+            String(url).endsWith('/confirm') ? Response.json(ack) :
+                String(url).endsWith('/segments') ? Response.json({...signed,expiresAt:time(clock+60000)}) : fetcher(url,options)};
+        await expect(recordingAction(identity,{...begin,repoOpenProof:prepared.proof,captureSessionId:phase,consentVersion:4},d))
+            .resolves.toMatchObject({startedAt:time(initial),deadlineAt:time(revisedDeadline),revision:2,workStartedAt});
+        await expect(recordingAction(identity,{...input,startMs:0,endMs:1,captureSessionId:phase},d)).resolves.toMatchObject({putUrl:signed.putUrl});
+        await expect(recordingAction(identity,{action:'confirm',attemptId:attempt,sequence:0,captureSessionId:phase},d))
+            .resolves.toMatchObject({startedAt:time(initial),deadlineAt:time(revisedDeadline),revision:2,workStartedAt});
+    });
+    it('accepts revised eligibility and exposes a paused snapshot without authorizing a checkout',async()=>{
+        const reopened = {...eligibility, deadlineAt:time(initial+hour+50000),revision:2,pausedAt:null};
+        const d = {...deps(),fetcher:async()=>Response.json(reopened)};
+        const request = {action:'preflight' as const,attemptId:attempt};
+        await expect(recordingAction(identity,request,d)).resolves.toEqual(reopened);
+        await expect(recordingAction(identity,request,{...d,fetcher:async()=>Response.json({...reopened,revision:0})}))
+            .rejects.toMatchObject({code:'recording_unavailable'});
+        const paused = {...reopened,pausedAt:time(clock)};
+        await expect(recordingAction(identity,request,{...d,fetcher:async()=>Response.json(paused)})).resolves.toEqual(paused);
+        await expect(recordingAction(identity,request,{...d,fetcher:async()=>Response.json({...paused,pausedAt:time(clock+3000)})}))
+            .rejects.toMatchObject({code:'recording_unavailable'});
     });
     it('does not return upstream secret bodies/errors',async()=>{
         const broken=vi.fn(async()=>new Response(identity.token+cap,{status:503}));
