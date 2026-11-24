@@ -38,7 +38,7 @@ const assignment = {
     phase: null, seedSequence: null, nextSequence: 0, submittedAt:null, finalized:null,
     confirmed: [], prepared: new Map(), put: new Map(), pauses: [],
 };
-const migration = { id: null, phase: null, to:'std-2', assignedTier:'standard-trial', assignedProvider:'cloudflare' };
+const migration = { id: null, phase: null, to:'std-2', assignedTier:'standard-trial', assignedProvider:'cloudflare', upgradedOperation:null };
 let replayedClock;
 let firstEditorDocument = false;
 let releaseFirstEditor;
@@ -97,6 +97,7 @@ function fixtureMigration(phase, operationId) {
     if (phase === 'done') {
         migration.assignedTier = migration.to;
         migration.assignedProvider = 'aws-ec2';
+        migration.upgradedOperation = operationId;
     }
     const settledAt = Date.now();
     assignment.deadline += settledAt - assignment.pausedAt;
@@ -182,9 +183,11 @@ try {
             const repository = {id:repoId, name:'default/' + repoName, workspaceFolder, checkoutFolder};
             seen.push('checkout:' + body.assignment.phase);
             if (body.assignment.phase === 'prepare') {
-                return json({ok:true, repository, assignmentOpen:{attemptId, proof, openedAt:iso(Date.now()), workspaceId:computerId}});
+                return json({ok:true, repository, assignmentOpen:{attemptId, proof, openedAt:iso(Date.now()),
+                    windowStartedAt:iso(assignment.clockStarted), deadlineAt:iso(assignment.deadline)}});
             }
-            return json({ok:true, repository, codePreviewUrl:editor + '/?folder=' + encodeURIComponent(workspaceFolder)});
+            const url = editor + '/?folder=' + encodeURIComponent(workspaceFolder);
+            return json({ok:true, repository, codePreviewUrl:url, url});
         }
         if (url.pathname === '/api/shell/assignment-video') {
             const body = request.postDataJSON();
@@ -192,7 +195,8 @@ try {
             seen.push(body.action);
             const expiry = iso(Date.now() + 600000);
             switch (body.action) {
-            case 'preflight': return json({status:'eligible', attemptId, jobId:'1', repositoryUrl:repo, expiresAt:expiry, ...sampleClock()});
+            case 'preflight': return json({status:'eligible', attemptId, jobId:'1', repositoryUrl:repo, expiresAt:expiry, ...sampleClock(),
+                ...(migration.upgradedOperation ? {upgradedWorkspaceId:computerId,upgradeOperationId:migration.upgradedOperation} : {})});
             case 'clock': {
                 if (!replayedClock) return json(clock());
                 const replay = replayedClock;
@@ -334,7 +338,7 @@ try {
             await check('recorded footage exists before upgrade',()=>assignment.confirmed.length > 1);
 
             for (const outcome of ['failed','done']) {
-                const operationId = 'synthetic-' + outcome;
+                const operationId = outcome === 'done' ? '743985b2-8b21-4e3c-ae13-956c2e7672ef' : '8bf4fc87-a2ff-4be7-9ead-261edbba38cc';
                 const expectedTier = outcome === 'done' ? migration.to : migration.assignedTier;
                 const expectedProvider = outcome === 'done' ? 'aws-ec2' : migration.assignedProvider;
                 const priorDeadline = assignment.deadline;
