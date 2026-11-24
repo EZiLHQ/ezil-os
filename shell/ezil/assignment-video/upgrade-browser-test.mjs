@@ -21,6 +21,7 @@ const bucket = 'https://ezil-universe-' + environment + '-assignment-media-45263
 const attemptId = '2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a';
 const recordingId = '01111111-2222-4333-8444-555555555555';
 const computerId = '11111111-1111-4111-8111-111111111111';
+const workspaceId = 'a'.repeat(64);
 const repoId = '12222222-3333-4444-8555-666666666666';
 const repoName = 'u-0482ba160482ba16-a-' + attemptId;
 const repo = 'https://github.ezil.work/default/' + repoName + '.git';
@@ -196,7 +197,7 @@ try {
             const expiry = iso(Date.now() + 600000);
             switch (body.action) {
             case 'preflight': return json({status:'eligible', attemptId, jobId:'1', repositoryUrl:repo, expiresAt:expiry, ...sampleClock(),
-                ...(migration.upgradedOperation ? {upgradedWorkspaceId:computerId,upgradeOperationId:migration.upgradedOperation} : {})});
+                ...(migration.upgradedOperation ? {upgradedWorkspaceId:workspaceId,upgradeOperationId:migration.upgradedOperation} : {})});
             case 'clock': {
                 if (!replayedClock) return json(clock());
                 const replay = replayedClock;
