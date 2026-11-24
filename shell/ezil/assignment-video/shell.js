@@ -29,6 +29,9 @@ export const FRESH_FRAME_MS=8000;
 /** How often the server's clock is asked for: while a share is live (a pause reaches capture within seconds) and between shares. */
 export const CLOCK_LIVE_MS=3000;
 export const CLOCK_IDLE_MS=15000;
+/** `editor-ready` is retried (editor still covered) on these answers, a few times, before it offers "Check again". */
+const EDITOR_READY_TRANSIENT=['media_unavailable','recording_unavailable','assignment_open_unavailable'];
+const EDITOR_READY_TRIES=4;
 /** How long an unpaused share waits for its editor to be re-verified before it offers to reconnect it. */
 export const RECONNECT_OFFER_MS=15000;
 /**
@@ -149,21 +152,29 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         else showIndicator(reason==='timeout'?'ended':'stopped');
     }
     /**
-     * A server report of the clock: the shell route's `clock` action, or the begin / confirm / status answers that carry
-     * a deadline. Redraws the control, moves the recorder's deadline, re-arms the deadline timer and applies the server's
-     * pause. Only the server starts, pauses or extends the clock: nothing local (checkout, a resize, progress) does.
+     * A report of the canonical assignment countdown: the shell route's `clock` action, or the `editor-ready` answer.
+     * Redraws the control and applies the server's pause. Only the server starts, pauses or extends this clock: nothing
+     * local (checkout, a resize, progress) does, and the media window of the recording (below) never feeds it.
      */
     function applyClock(report){
         if(disposed || !countdown.sync(report))return;
         const item=activity&&!activity.ended&&isHere()?activity:null;
-        if(item){
-            item.recorder?.setDeadline(countdown.serverDeadlineAt());
-            armDeadline(item);
-            applyGate(item);
-        }else if(!indicator && !over && countdown.started())showIndicator(countdown.state()==='ended'?'ended':'idle');
+        if(item)applyGate(item);
+        else if(!indicator && !over && countdown.started())showIndicator(countdown.state()==='ended'?'ended':'idle');
         indicator?.sync();
     }
-    const syncClock=(item,report)=>{if(samePhase(item))applyClock(report);};
+    /**
+     * The recording's own window (begin / seed confirm / status: `startedAt`, `deadlineAt`, in server time). It bounds the
+     * recording only: it moves the recorder's deadline and the share's deadline timer, never the countdown.
+     */
+    function syncMedia(item,report){
+        const deadline=Date.parse(report?.deadlineAt),start=Date.parse(report?.startedAt);
+        if(!samePhase(item)||!Number.isFinite(deadline))return;
+        if(Number.isFinite(start))item.mediaStart=start;
+        item.mediaDeadline=deadline;
+        item.recorder?.setDeadline(deadline);
+        armDeadline(item);
+    }
     async function refreshClock(){
         if(disposed)return;
         try{applyClock(await checkAssignmentClock(attemptId));}catch{/* the next poll asks again; the shown time keeps counting */}
@@ -178,16 +189,16 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     function armDeadline(item){
         clearTimeout(item.deadline);
         // A server-stopped clock has no deadline to meet; the resume report re-arms it.
-        if(countdown.state()==='paused' || countdown.deadlineAt()===null)return;
-        item.deadline=setTimeout(()=>void deadlineReached(item),Math.max(0,countdown.deadlineAt()-Date.now()));
+        if(countdown.state()==='paused' || item.mediaDeadline===undefined || item.offset===undefined)return;
+        item.deadline=setTimeout(()=>void deadlineReached(item),Math.max(0,item.mediaDeadline-item.offset-Date.now()));
     }
-    /** The local copy of the deadline passed: ask the server first, since it may have given back time it stopped. */
+    /** The local copy of the recording's deadline passed: ask the server first, since it may have moved it. */
     async function deadlineReached(item){
         if(!samePhase(item))return;
-        await refreshClock();
+        await Promise.all([refreshClock(),item.transport.status().catch(()=>{})]);
         if(!samePhase(item))return;
-        if(countdown.state()==='paused' || countdown.remaining()>1500){armDeadline(item);return;}
-        void finish(item,'timeout',{at:new Date(countdown.serverDeadlineAt()).toISOString(),cause:'deadline'});
+        if(countdown.state()==='paused' || item.mediaDeadline-item.offset-Date.now()>1500){armDeadline(item);return;}
+        void finish(item,'timeout',{at:new Date(item.mediaDeadline).toISOString(),cause:'deadline'});
     }
     /**
      * The server's pause gates capture. Paused: recording stops (the clip so far is sealed and kept), the editor is
@@ -225,8 +236,6 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     function revealEditor(item){
         if(!recordingSource(item)||!item.editorFrame?.isConnected)return;
         locked=false;park(false);ui.reveal();item.editor?.resolve();
-        // The first usable editor is what starts the server's clock: ask for it now rather than at the next poll.
-        void refreshClock();
     }
     function pauseCapture(item){
         if(!sameTab(item)||item.paused)return;
@@ -335,9 +344,14 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             }
             item.stage='begin';
             item.transport=createAssignmentVideoTransport({attemptId,repoOpenProof:item.proof,captureSessionId:item.id,consentVersion:4,
-                onClock:report=>syncClock(item,report),paused:()=>countdown.state()==='paused',
+                onClock:report=>syncMedia(item,report),paused:()=>countdown.state()==='paused',
                 // The timeline is the real wall clock: time the server gave back after a pause lets a clip end past the first hour.
-                maxEndMs:()=>countdown.startedAtMs()!==null&&countdown.serverDeadlineAt()!==null?countdown.serverDeadlineAt()-countdown.startedAtMs():0,
+                maxEndMs:()=>{
+                    if(item.mediaStart===undefined)return 0;
+                    const media=item.mediaDeadline===undefined?0:item.mediaDeadline-item.mediaStart;
+                    const canonicalEnd=countdown.serverDeadlineAt();
+                    return Math.max(media,canonicalEnd===null?0:canonicalEnd-item.mediaStart);
+                },
                 onStop:(why,at)=>void finish(item,why==='submitted'||why==='timeout'?why:'connection_lost',{at,cause:'universe_'+why})});
             // A stop while this is in flight still checkpoints the phase it opens once it lands (`save`), never orphans it.
             item.beginning=retry(()=>item.transport.begin(),['media_unavailable'],2,live);
@@ -360,7 +374,9 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             const offset=Number.isFinite(serverNow)?serverNow-Date.now():0;
             if(!Number.isFinite(startAt)||!Number.isFinite(deadline)||deadline<=Date.now()+offset||deadline<=startAt||deadline-startAt>3600000)
                 throw failure('recording_closed');
-            syncClock(item,ack);
+            // The seed's window bounds the recording only; the countdown starts at the verified editor (`ready`).
+            item.offset=offset;
+            syncMedia(item,ack);
             item.stage='record';
             item.recorder=await encodeTabSegments({win,stream:source.stream,matches:()=>sameTab(item),windowStart:startAt,deadline,
                 signal:item.captureCtl.signal,
@@ -421,9 +437,43 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             return;
         }
         item.editorFrame=frame;
-        // Re-verified on the assigned checkout. While the server's clock is paused the gate stays; once it allows, capture resumes.
-        if(item.gated){item.reverified=true;if(countdown.state()!=='paused')resumeGated(item);}
-        else revealEditor(item);
+        void ready(item,frame);
+    }
+    /**
+     * The interactive assigned editor was validated. Before it is shown, Universe is told (`editor-ready`): that is what
+     * starts the canonical countdown (and, after a pause, lets the server resume it). The answer is the clock; the browser
+     * sends no time. A transient failure is retried with the editor still covered, never released unverified. While the
+     * server's clock is paused the gate stays; once it allows, capture resumes.
+     */
+    async function ready(item,frame){
+        if(item.readying===frame)return;
+        item.readying=frame;
+        const live=()=>samePhase(item)&&item.editorFrame===frame&&frame.isConnected;
+        ui.clear();
+        if(!item.gated)ui.set('Checking your editor','Confirming your editor with Universe before it opens…');
+        try{
+            const clock=await retry(()=>item.transport.editorReady(),EDITOR_READY_TRANSIENT,EDITOR_READY_TRIES,live);
+            if(!live())return;
+            if(item.gated)item.reverified=true;
+            const wasGated=item.gated;
+            applyClock(clock);
+            if(wasGated){
+                // Still paused: stay covered. Allowed: capture is resuming and the recorder's first fresh frame reveals the editor.
+                if(item.gated&&countdown.state()!=='paused')resumeGated(item);
+                return;
+            }
+            revealEditor(item);
+        }catch(error){
+            if(!live())return;
+            const cause=error.code||'editor_ready_failed';
+            if(EDITOR_READY_TRANSIENT.includes(cause)){
+                ui.set('Checking your editor','Universe could not confirm your editor yet. Your editor stays closed until it does.');
+                ui.action('Check again',()=>{if(live()){item.readying=null;void ready(item,frame);}});
+                return;
+            }
+            report('editor-ready',cause,item,{reason:error.reason,correlationId:error.correlationId});
+            void finish(item,'connection_lost',{cause,message:causeMessage(cause,error,item)});
+        }finally{if(item.readying===frame)item.readying=null;}
     }
     /** The gate's screen for an ended share. `saved` null: its footage is still being saved, so nothing is claimed yet. */
     function showEnded(item,reason,saved){

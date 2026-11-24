@@ -32,7 +32,7 @@ export async function checkAssignmentVideoEligibility(attemptId, {fetcher = glob
     return result;
 }
 
-/** A report of the server's clock: the answers that carry `deadlineAt` (begin, the seed's confirm, status). */
+/** A report of the recording's own media window: the answers that carry `deadlineAt` (begin, the seed's confirm, status). It is not the countdown. */
 const hasClock = data => data && typeof data === 'object' && typeof data.deadlineAt === 'string';
 
 /**
@@ -97,6 +97,16 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         try { await status(); misses = 0; }
         catch { if (++misses >= 2) stop('unavailable'); }
         if (!disposed && !stopped) poll = setTimeout(watch, pollMs);
+    }
+    /**
+     * The validated interactive assigned editor is open: Universe starts (or resumes) the canonical countdown from it and
+     * answers with its clock. The browser sends no time, only the attempt, this capture phase and its open proof.
+     */
+    async function editorReady() {
+        if (!recording || disposed) throw failure('recording_unavailable');
+        const data = await control('editor-ready', {repoOpenProof});
+        if (!data || typeof data !== 'object' || !Number.isSafeInteger(data.revision)) throw failure('recording_unavailable');
+        return data;
     }
     async function preflight() {
         if (disposed) throw failure('transport_disposed');
@@ -167,5 +177,5 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
             body:JSON.stringify({action:'checkpoint',attemptId,captureSessionId,reason})}).catch(()=>{});
     }
     function dispose() { disposed = true; clearTimers(); recording = null; }
-    return {preflight, begin, status, upload, checkpoint, checkpointOnExit, finalize, dispose};
+    return {preflight, begin, status, editorReady, upload, checkpoint, checkpointOnExit, finalize, dispose};
 }

@@ -3,8 +3,9 @@
  * clock on its own, and neither does a local checkout, resize or progress event: `sync` takes the report of the shell
  * route's `clock` action (`{serverNow, startedAt, deadlineAt, pausedAt, pauseReason, remainingMs, revision}`, every
  * field nullable until the clock starts) and `remaining` counts down from its deadline against the offset between the
- * server's clock and this one. Reports are ordered by `revision`; the begin / confirm / status answers carry none and
- * only seed the clock until the first revisioned report arrives.
+ * server's clock and this one. Reports are ordered by `revision`; one without a revision never moves a clock that has
+ * seen a revisioned one. The `editor-ready` answer is the same report. The recording's own media window (begin / seed /
+ * status `startedAt`, `deadlineAt`) is not this clock and is never fed to it.
  *
  * The one place that reads a report is `clockOf`. A paused clock (`pausedAt` or `pauseReason`) shows `remainingMs`.
  * `status:'paused'` alone is NOT a system pause: Universe uses it for a phase that was checkpointed between shares.
