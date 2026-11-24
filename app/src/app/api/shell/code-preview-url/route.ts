@@ -505,6 +505,16 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     if (!state || state.captureSessionId !== operation.captureSessionId || state.repositoryOpenReceiptId !== proof.eventId || state.phaseReady !== true || state.workspaceUnlocked !== true
         || state.status !== 'recording' || state.revoked !== false || state.stopRequestedAt !== null || typeof state.firstFrameAt !== 'string'
         || typeof state.startedAt !== 'string' || typeof state.deadlineAt !== 'string' || Date.parse(state.deadlineAt) <= Date.now() || !(await sameSession())) return assignmentLocked();
+    // A usable Code URL is itself a capability. Commit the clock for this exact verified capture
+    // phase and checkout before releasing it, even if the browser is reloading or drops its reply.
+    const ready = await universeCall(() => recordingAction(identity, {
+        action: 'editor-ready', attemptId, captureSessionId: operation.captureSessionId, repoOpenProof: operation.repoOpenProof,
+    }, { signal: deadline }));
+    if (!ready.ok) return ready.kind === 'unavailable' ? assignmentUnavailable()
+        : ready.kind === 'identity' ? assignmentIdentity() : assignmentLocked();
+    if (typeof ready.value.startedAt !== 'string' || typeof ready.value.deadlineAt !== 'string'
+        || ready.value.pausedAt !== null || Date.parse(ready.value.deadlineAt) <= Date.now() || !(await sameSession()))
+        return assignmentLocked();
     return shellJson({...preview,codePreviewUrl:url,url,repository});
 
 }
