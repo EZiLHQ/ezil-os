@@ -466,11 +466,20 @@ describe('the enrolled checkout signals the protected top-level shell only after
         let ready = false;
         let repositoryOpenReceiptId = recordingId;
         let boundProvider = enrolled.providerId;
-        s.universe = () => Response.json(s.requests.at(-1)?.url.pathname.endsWith('/status')
-            ? {captureSessionId,recordingId,repositoryOpenReceiptId,status:'recording',revoked:false,stopRequestedAt:null,
-                startedAt:new Date(now-1000).toISOString(), deadlineAt:new Date(now+3400000).toISOString(),
-                firstFrameAt:ready ? new Date(now-1000).toISOString() : null,phaseReady:ready,workspaceUnlocked:ready}
-            : {...enrolled,providerId:boundProvider,windowStartedAt:null,deadlineAt:null});
+        let clockReady = false;
+        s.universe = () => {
+            const path = s.requests.at(-1)?.url.pathname;
+            if (path?.endsWith('/editor-ready')) {
+                return clockReady ? Response.json({serverNow:new Date(now).toISOString(), startedAt:new Date(now-1000).toISOString(),
+                    deadlineAt:new Date(now+3400000).toISOString(), revision:1, remainingMs:3400000, pausedAt:null, pauseReason:null})
+                    : new Response(null, {status: 503});
+            }
+            return Response.json(path?.endsWith('/status')
+                ? {captureSessionId,recordingId,repositoryOpenReceiptId,status:'recording',revoked:false,stopRequestedAt:null,
+                    startedAt:new Date(now-1000).toISOString(), deadlineAt:new Date(now+3400000).toISOString(),
+                    firstFrameAt:ready ? new Date(now-1000).toISOString() : null,phaseReady:ready,workspaceUnlocked:ready}
+                : {...enrolled,providerId:boundProvider,windowStartedAt:null,deadlineAt:null});
+        };
         s.gateway = scope => {const packet=standalonePacket(scope);packet.repository.canonicalURL=repositoryUrl;return Response.json(packet);};
         let ack: 'good'|'missing'|'wrong'|'wrong-folder' = 'good';
         s.worker = body => {
@@ -505,7 +514,12 @@ describe('the enrolled checkout signals the protected top-level shell only after
         await locked(await open({...enter,repoOpenProof:'A'.repeat(80)}));
         await locked(await open({...enter,captureSessionId:recordingId}));
         await locked(await open(enter));
+        expect(s.requests.some(request => request.url.pathname.endsWith('/editor-ready'))).toBe(false);
         repositoryOpenReceiptId=readOpen(proof.proof,actor,attemptId,Date.now(),signingKey).eventId;
+        const unavailable = await open(enter);
+        expect(unavailable.status).toBe(503);
+        expect(await unavailable.text()).not.toContain('preview-bootstrap');
+        clockReady = true;
         const confirmed=await open(enter);
         expect(confirmed.status).toBe(200);
         const unlocked=await confirmed.json();
@@ -541,8 +555,12 @@ describe('a reserved assignment repository whose computer or Universe is not rea
         const enrolled = { status: 'eligible', attemptId, jobId: '9', repositoryUrl, ref: 'refs/heads/main',
             manifestSha256: makeChallenge(attemptId, repositoryUrl).manifestSha256, providerId: 'fg1wtcrexaf7acl0',
             windowStartedAt: null, deadlineAt: null, expiresAt: new Date(now + 120000).toISOString() };
-        const universe = { preflight: () => Response.json(enrolled) as Response, status: () => Response.json({}) as Response };
-        s.universe = () => (s.requests.at(-1)?.url.pathname.endsWith('/status') ? universe.status : universe.preflight)();
+        const universe = { preflight: () => Response.json(enrolled) as Response, status: () => Response.json({}) as Response,
+            ready: () => new Response(null, {status: 503}) };
+        s.universe = () => {
+            const path = s.requests.at(-1)?.url.pathname;
+            return (path?.endsWith('/status') ? universe.status : path?.endsWith('/editor-ready') ? universe.ready : universe.preflight)();
+        };
         s.gateway = scope => { const packet = standalonePacket(scope); packet.repository.canonicalURL = repositoryUrl; return Response.json(packet); };
         s.worker = body => {
             const request = JSON.parse(body), challenge = request.assignmentPreload;
@@ -557,8 +575,8 @@ describe('a reserved assignment repository whose computer or Universe is not rea
     }
 
     it('prepares a migrated AWS assignment only with exact trusted upgrade, placement and private host evidence', async () => {
-        const { open, prep, universe, enrolled, repositoryUrl } = await enrolledFixture();
-        const { workspaceIdentity } = await import('@/server/assignment-video/repo-open');
+        const { open, prep, universe, enrolled, repositoryUrl, now } = await enrolledFixture();
+        const { readOpen, workspaceIdentity } = await import('@/server/assignment-video/repo-open');
         vi.stubEnv('AWS_STANDALONE_REPO_OPEN_ENABLED', '1');
         const operation = '99999999-9999-4999-8999-999999999999';
         const verified = { ...enrolled, upgradedWorkspaceId: workspaceIdentity(USER, COMPUTER, SANDBOX), upgradeOperationId: operation };
@@ -586,7 +604,23 @@ describe('a reserved assignment repository whose computer or Universe is not rea
         };
         const prepared = await prepare();
         expect(prepared.status).toBe(200);
-        expect(await prepared.json()).toMatchObject({ok: true, assignmentOpen: {attemptId}});
+        const preparation = await prepared.json();
+        expect(preparation).toMatchObject({ok: true, assignmentOpen: {attemptId}});
+        expect(preparation.codePreviewUrl).toBeUndefined();
+        const proof = preparation.assignmentOpen.proof;
+        const actor = { userId: USER, issuer: 'https://id.ezil.work/', subject, sessionId: s.sessionId, expiresAt: now + 600000 };
+        const receipt = readOpen(proof, actor, attemptId, Date.now(), signingKey).eventId;
+        universe.status = () => Response.json({captureSessionId, recordingId, repositoryOpenReceiptId: receipt, status: 'recording',
+            revoked: false, stopRequestedAt: null, startedAt: new Date(now-1000).toISOString(),
+            deadlineAt: new Date(now+3480000).toISOString(), firstFrameAt: new Date(now-1000).toISOString(),
+            phaseReady: true, workspaceUnlocked: true});
+        universe.ready = () => Response.json({startedAt: new Date(now).toISOString(), deadlineAt: new Date(now+3480000).toISOString(),
+            serverNow: new Date(now).toISOString(), revision: 2, remainingMs: 3480000, pausedAt: null, pauseReason: null});
+        s.aws = Array<boolean>(6).fill(true);
+        const reopened = await open({phase: 'open', attemptId, captureSessionId, repoOpenProof: proof});
+        expect(reopened.status).toBe(200);
+        expect(new URL((await reopened.json()).codePreviewUrl).searchParams.get('folder')).toBe(preparation.repository.workspaceFolder);
+        expect(s.requests.at(-1)?.url.pathname).toBe('/internal/assignment-video/editor-ready');
         // Old host results never mint proof or expose the preloaded Code URL.
         s.worker = body => Response.json({ ok: true, status: 'fetched',
             folder: '/workspace/projects/' + JSON.parse(body).repositoryId });
