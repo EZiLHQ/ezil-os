@@ -33,24 +33,37 @@ const MIN=60000;
  * Scripted broker: the recording protocol (begin, seed, prepare/confirm, status, checkpoint, finalize) and the clock.
  * `clock` is the server's state; `setClock` bumps its revision the way the server does.
  */
-function broker(){
-    const startedAt=new Date().toISOString();
-    const clock={startedAt,deadlineAt:new Date(Date.now()+50*MIN).toISOString(),pausedAt:null,pauseReason:null,remainingMs:null,revision:1};
-    let phase;const prepared=[],clockCalls=[];
+function broker({started=false}={}){
+    // The media window (begin / seed) bounds the recording; the canonical countdown is `clock`, started by `editor-ready`.
+    const startedAt=new Date().toISOString(),mediaDeadlineAt=new Date(Date.now()+10*MIN).toISOString();
+    const clock={startedAt:null,deadlineAt:null,pausedAt:null,pauseReason:null,remainingMs:null,revision:1};
+    let phase;const prepared=[],clockCalls=[],readyCalls=[],readyScript=[];
+    const state={resumeOnReady:false};
+    const start=()=>Object.assign(clock,{startedAt:new Date().toISOString(),deadlineAt:new Date(Date.now()+50*MIN).toISOString(),revision:clock.revision+1});
+    if(started)start();
     const control={
         clock:()=>{clockCalls.push(1);return Response.json({serverNow:new Date().toISOString(),...clock});},
+        'editor-ready':async body=>{
+            readyCalls.push(body);
+            const scripted=readyScript.shift();
+            if(scripted)return await scripted(body);
+            if(clock.startedAt===null)start();
+            if(state.resumeOnReady&&clock.pauseReason){Object.assign(clock,{pausedAt:null,pauseReason:null,remainingMs:null,
+                deadlineAt:new Date(Date.now()+40*MIN).toISOString(),revision:clock.revision+1});}
+            return Response.json({serverNow:new Date().toISOString(),...clock});
+        },
         begin:body=>{phase=body.captureSessionId;return Response.json({recordingId,status:'awaiting_frame',captureSessionId:phase,nextSequence:0,
             authorizationExpiresAt:new Date(Date.now()+600000).toISOString(),startedAt:null,deadlineAt:null,revoked:false,stopRequestedAt:null});},
         prepare:body=>{prepared.push({sequence:body.sequence,startMs:body.startMs,endMs:body.endMs});
             return Response.json({putUrl:BUCKET+'/universe-staging/assignment-media/v1/x/'+id+'/'+recordingId+'/segments/'+body.sequence+'/'+body.sha256+'.webm',headers:{}});},
         confirm:body=>Response.json(body.sequence===0?{confirmed:true,recordingId,sequence:0,phaseReady:true,captureSessionId:phase,nextSequence:1,
-            firstFrameAt:startedAt,startedAt,deadlineAt:clock.deadlineAt,serverNow:new Date().toISOString()}:{confirmed:true,recordingId,sequence:body.sequence}),
+            firstFrameAt:startedAt,startedAt,deadlineAt:mediaDeadlineAt,serverNow:new Date().toISOString()}:{confirmed:true,recordingId,sequence:body.sequence}),
         status:()=>Response.json({recordingId,captureSessionId:phase,status:'recording',phaseReady:true,workspaceUnlocked:true,
-            startedAt,deadlineAt:clock.deadlineAt,firstFrameAt:startedAt,revoked:false,stopRequestedAt:null}),
+            startedAt,deadlineAt:mediaDeadlineAt,firstFrameAt:startedAt,revoked:false,stopRequestedAt:null}),
         checkpoint:()=>Response.json({status:'paused'}),
         finalize:()=>Response.json({status:'complete'}),
     };
-    return {control,clock,prepared,clockCalls,
+    return {control,clock,prepared,clockCalls,readyCalls,readyScript,state,start,
         set(fields){Object.assign(clock,fields,{revision:fields.revision??clock.revision+1});}};
 }
 const encoded={count:0};
@@ -123,7 +136,7 @@ const pause=(over={})=>({pausedAt:new Date().toISOString(),pauseReason:'system_u
 const resume=(over={})=>({pausedAt:null,pauseReason:null,remainingMs:null,deadlineAt:new Date(Date.now()+40*MIN).toISOString(),...over});
 
 test('a refresh shows the server time before any share and Stop is not offered', async t=>{
-    const h=harness(t);
+    const h=harness(t,{server:broker({started:true})});
     try{
         await waitFor(()=>h.root());
         assert.equal(h.root().attrs['data-state'],'idle');
@@ -319,4 +332,94 @@ test('an ordinary Code window gets no gate, no control and no clock traffic', as
     assert.equal(h.root(),undefined);
     assert.equal(server.clockCalls.length,0);
     assert.equal(h.elements.filter(e=>e.className?.startsWith('ezil-assignment')).length,0);
+});
+
+const confirmedBody=body=>{assert.deepEqual(Object.keys(body).sort(),['action','attemptId','captureSessionId','repoOpenProof']);return body;};
+const failing=(status,code)=>async()=>Response.json({error:{code}},{status});
+
+test('the seed window bounds the recording only: the countdown starts at the verified editor, from Universe, with no browser time', async t=>{
+    const h=harness(t);
+    try{
+        await h.share();await waitFor(()=>h.opened()>=1);
+        await waitFor(()=>h.root());
+        assert.equal(h.time(),'--:--','the media seed (a ten-minute window here) never starts the countdown');
+        assert.equal(h.label(),'Recording');
+        assert.equal(h.server.readyCalls.length,0,'no editor-ready before an editor was validated');
+        let release;const held=new Promise(r=>{release=r;});
+        h.server.readyScript.push(async()=>{await held;return Response.json({serverNow:new Date().toISOString(),...h.server.start()&&h.server.clock});});
+        const {captureSessionId}=h.gate.access();
+        h.reveal();
+        await waitFor(()=>h.server.readyCalls.length===1);
+        const body=confirmedBody(h.server.readyCalls[0]);
+        assert.equal(body.attemptId,id);assert.equal(body.captureSessionId,captureSessionId);assert.equal(body.repoOpenProof,checkout.assignmentOpen.proof);
+        await tick(150);
+        assert.equal(h.gate.locked(),true,'the editor stays covered until Universe has answered');
+        assert.equal(h.time(),'--:--');
+        release();
+        await waitFor(()=>!h.gate.locked());
+        assert.match(h.time(),/^(49|50):\d\d$/,'the canonical 50 minutes, not the 10-minute media window');
+        assert.equal(h.server.readyCalls.length,1);
+    }finally{await h.gate.close();}
+});
+
+test('a transient editor-ready failure is retried with the editor still covered and never released unverified', async t=>{
+    const h=harness(t);
+    try{
+        h.server.readyScript.push(failing(503,'media_unavailable'),failing(503,'media_unavailable'));
+        await h.share();await waitFor(()=>h.opened()>=1);
+        h.reveal();
+        await waitFor(()=>h.server.readyCalls.length>=2);
+        assert.equal(h.gate.locked(),true);
+        await waitFor(()=>!h.gate.locked(),6000);
+        assert.equal(h.server.readyCalls.length,3);
+        assert.equal(h.calls.includes('checkpoint'),false,'the share survived the retries');
+    }finally{await h.gate.close();}
+});
+
+test('when retries run out the editor stays covered and "Check again" asks once more', async t=>{
+    const h=harness(t);
+    try{
+        h.server.readyScript.push(...Array.from({length:4},()=>failing(503,'media_unavailable')));
+        await h.share();await waitFor(()=>h.opened()>=1);
+        h.reveal();
+        await waitFor(()=>h.elements.some(e=>e.tag==='button'&&e.textContent==='Check again'),8000);
+        assert.equal(h.gate.locked(),true);
+        assert.equal(h.server.readyCalls.length,4);
+        h.elements.findLast(e=>e.tag==='button'&&e.textContent==='Check again').onclick({isTrusted:true});
+        await waitFor(()=>!h.gate.locked());
+        assert.equal(h.server.readyCalls.length,5);
+    }finally{await h.gate.close();}
+});
+
+test('a refusal of editor-ready ends the share without ever showing the editor', async t=>{
+    const h=harness(t);
+    try{
+        h.server.readyScript.push(failing(409,'recording_refused'));
+        await h.share();await waitFor(()=>h.opened()>=1);
+        h.reveal();
+        await waitFor(()=>h.calls.includes('checkpoint'));
+        assert.equal(h.gate.locked(),true);
+        assert.equal(h.server.readyCalls.length,1,'not retried');
+        assert.equal(h.server.clock.startedAt,null,'nothing started the countdown');
+        assert.equal(h.calls.includes('finalize'),false);
+    }finally{await h.gate.close();}
+});
+
+test('the server can resume the pause when the re-verified editor reports ready: capture resumes with no further poll needed', async t=>{
+    const h=harness(t);
+    try{
+        await h.recording();
+        await tick(1300);
+        h.server.set(pause());
+        h.server.state.resumeOnReady=true;
+        await waitFor(()=>h.gate.locked()&&h.label()==='Paused for system upgrade');
+        const readyBefore=h.server.readyCalls.length;
+        h.reveal();
+        await waitFor(()=>h.server.readyCalls.length===readyBefore+1);
+        confirmedBody(h.server.readyCalls.at(-1));
+        await waitFor(()=>!h.gate.locked());
+        assert.equal(h.label(),'Recording');
+        assert.match(h.time(),/^(39|40):\d\d$/);
+        assert.equal(h.calls.filter(c=>c==='begin').length,1);
+    }finally{await h.gate.close();}
 });

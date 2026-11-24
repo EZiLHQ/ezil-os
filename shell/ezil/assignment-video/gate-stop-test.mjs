@@ -86,9 +86,12 @@ function harness(t,{prepare,control={},video,media=false,settleMs=40,saveCeiling
             return await control.put?.(sequence)??new Response(null,{status:200});
         }
         const body=JSON.parse(options.body);
-        // The server clock is asked for on its own schedule (`clock`); `calls` is the recording protocol only.
-        if(body.action!=='clock')calls.push(body.action+(Number.isInteger(body.sequence)?':'+body.sequence:''));
+        // The canonical countdown is asked for on its own schedule (`clock`, `editor-ready`); `calls` is the recording protocol only.
+        if(!['clock','editor-ready'].includes(body.action))calls.push(body.action+(Number.isInteger(body.sequence)?':'+body.sequence:''));
         if(control[body.action])return control[body.action](body);
+        // Universe answers the verified editor with the canonical countdown's clock.
+        if(body.action==='editor-ready')return Response.json({serverNow:new Date().toISOString(),startedAt:new Date().toISOString(),
+            deadlineAt:new Date(Date.now()+3600000).toISOString(),pausedAt:null,pauseReason:null,remainingMs:null,revision:1});
         if(body.action==='preflight')return Response.json({status:'eligible',attemptId:id,repositoryUrl:repo,expiresAt:new Date(Date.now()+60000).toISOString()});
         return Response.json({});
     });
@@ -476,7 +479,9 @@ test('a mute parks the editor and a fresh frame restores it on the same capture 
         const {captureSessionId}=h.gate.access();
         const url='https://fixture.test/?'+new URLSearchParams({folder:checkout.repository.checkoutFolder});
         h.gate.confirm(frame,url,checkout.repository.checkoutFolder);
-        assert.equal(h.gate.locked(),false);
+        // The editor is shown once Universe has answered `editor-ready`, never before.
+        assert.equal(h.gate.locked(),true);
+        await waitFor(()=>!h.gate.locked());
         track.mute();
         assert.equal(h.title(),'Recording paused');
         assert.equal(h.gate.locked(),true);
