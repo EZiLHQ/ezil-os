@@ -33,9 +33,10 @@ const MIN=60000;
  * Scripted broker: the recording protocol (begin, seed, prepare/confirm, status, checkpoint, finalize) and the clock.
  * `clock` is the server's state; `setClock` bumps its revision the way the server does.
  */
-function broker({started=false}={}){
+function broker({started=false,mediaWindow}={}){
     // The media window (begin / seed) bounds the recording; the canonical countdown is `clock`, started by `editor-ready`.
-    const startedAt=new Date().toISOString(),mediaDeadlineAt=new Date(Date.now()+10*MIN).toISOString();
+    const startedAt=mediaWindow?.startedAt??new Date().toISOString();
+    const mediaDeadlineAt=mediaWindow?.deadlineAt??new Date(Date.now()+10*MIN).toISOString();
     const clock={startedAt:null,deadlineAt:null,pausedAt:null,pauseReason:null,remainingMs:null,revision:1};
     let phase;const prepared=[],clockCalls=[],readyCalls=[],readyScript=[];
     const state={resumeOnReady:false};
@@ -421,5 +422,32 @@ test('the server can resume the pause when the re-verified editor reports ready:
         assert.equal(h.label(),'Recording');
         assert.match(h.time(),/^(39|40):\d\d$/);
         assert.equal(h.calls.filter(c=>c==='begin').length,1);
+    }finally{await h.gate.close();}
+});
+
+test('starting a new share accepts the original media origin with a trusted extended deadline', async t=>{
+    const now=Date.now(), startedAt=new Date(now-40*MIN).toISOString(), deadlineAt=new Date(now+35*MIN).toISOString();
+    const server=broker({started:true,mediaWindow:{startedAt,deadlineAt}});
+    server.set({startedAt, deadlineAt});
+    const h=harness(t,{server});
+    try{
+        await h.recording();
+        assert.equal(h.gate.locked(),false);
+        assert.equal(h.opened(),1);
+        assert.equal(server.clock.startedAt,startedAt,'the original clock was not restarted');
+        assert.equal(server.clock.deadlineAt,deadlineAt,'the extended deadline was rehydrated without adding time');
+        assert.match(h.time(),/^(34|35):\d\d$/);
+    }finally{await h.gate.close();}
+});
+
+test('a purported window with more than an hour left still fails the seed confirmation gate', async t=>{
+    const now=Date.now(), startedAt=new Date(now-40*MIN).toISOString(), deadlineAt=new Date(now+65*MIN).toISOString();
+    const server=broker({started:true,mediaWindow:{startedAt,deadlineAt}});
+    const h=harness(t,{server});
+    try{
+        await h.share();
+        await waitFor(()=>h.calls.includes('checkpoint'));
+        assert.equal(h.gate.locked(),true);
+        assert.equal(h.opened(),0);
     }finally{await h.gate.close();}
 });
