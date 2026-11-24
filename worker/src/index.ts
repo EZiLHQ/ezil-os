@@ -5605,8 +5605,8 @@ async function handleNativeSession(request: Request, env: Env, sandboxName: stri
  * sandbox), so a v1-signed open is refused outright with `hmac_v2_required`,
  * as `/internal/aws/tunnels` does. `preauthorizeV2` (top of `fetch`) has
  * already verified the signature over these exact body bytes and that the
- * claims name THIS sandbox. Cloudflare computers only: an AWS computer's
- * container is not reachable from here.
+ * claims name THIS sandbox. Cloudflare opens go to the sandbox. AWS opens
+ * use the enrolled host's narrow repository operation.
  *
  * The caller (the OS server) calls this only after `/sandbox/preview` has
  * answered for the computer, so the workspace is hydrated and the desktop up;
@@ -5623,12 +5623,16 @@ async function handleRepoOpen(request: Request, env: Env, sandboxName: string): 
     const registry = awsRegistryFor(env);
     const read = await readProjectFilesBody(request, REPO_OPEN_MAX_BODY_BYTES);
     if (!read.ok) return read.response;
-    // AWS's host-agent protocol has no assignment preload notification yet.
-    return openAwsStandaloneRepo(request, v2, sandboxName, splitAssignmentPreload(read.body).repoBody, {
+    const assignmentEnabled = env.EZIL_PRODUCTION_ASSIGNMENT_PRELOAD === '1';
+    const body = assignmentEnabled ? read.body : splitAssignmentPreload(read.body).repoBody;
+    return openAwsStandaloneRepo(request, v2, sandboxName, body, {
       enabled: awsRoutingEnabled(env.AWS_ROUTING_ENABLED) && awsRoutingEnabled(env.AWS_STANDALONE_REPO_OPEN_ENABLED),
       zone: resolveAwsOriginZone(env),
       lookup: sid => registry ? lookupAwsTunnel(registry, sid) : Promise.resolve(null),
       fetch: (input, init) => fetch(input, init),
+      authorizeAssignment: assignmentEnabled
+        ? (input, op) => authorizeAssignmentPreload(input, op, env, new URL(request.url).origin)
+        : undefined,
     });
   }
   if (v2.provider !== 'cloudflare') {

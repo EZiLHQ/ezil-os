@@ -1,7 +1,8 @@
 /** Narrow standalone Git transport: no generic exec or Cloudflare fallback. */
 import { awsOriginHostname, decodeControlKey, isComputerId, signGatewayHeader, type AwsTunnelRecord, type FetchLike } from './aws-origin';
 import type { PreviewTokenV2Claims } from './hmac';
-import { parseRepoOpenRequest } from './repo-open';
+import { ASSIGNMENT_PRELOAD_PORT, splitAssignmentPreload, type AssignmentPreloadWitness } from './assignment-preload';
+import { parseRepoOpenRequest, type RepoOpenRequest } from './repo-open';
 /** Only these fixed reasons may cross the host/Worker boundary; never provider text or CLI stderr. */
 export const REPO_OPEN_DIAGNOSTIC_REASONS = [
   'bootstrap_unavailable', 'workspace_unavailable', 'workspace_not_ready', 'folder_conflict',
@@ -51,6 +52,7 @@ export interface AwsRepoOpenDeps {
   now?: () => number;
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   jobId?: () => string;
+  authorizeAssignment?: (input: unknown, request: RepoOpenRequest) => Promise<{ witness: AssignmentPreloadWitness; nonce: string } | null>;
 }
 export async function openAwsStandaloneRepo(request: Request, claims: PreviewTokenV2Claims, sandbox: string,
   raw: unknown, deps: AwsRepoOpenDeps): Promise<Response> {
@@ -60,9 +62,15 @@ export async function openAwsStandaloneRepo(request: Request, claims: PreviewTok
     || claims.sandboxId !== sandbox || derived !== sandbox || !Number.isSafeInteger(claims.generation) || claims.generation < 1
     || !Number.isSafeInteger(claims.leaseEpoch) || claims.leaseEpoch < 1) return json('repo_open_invalid_request', 401);
   const now = deps.now ?? Date.now;
-  const parsed = parseRepoOpenRequest(raw, now());
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return json('repo_open_invalid_request', 400);
+  const bodyWithAssignment = raw as Record<string, unknown>;
+  const { repoBody, preload } = splitAssignmentPreload(bodyWithAssignment);
+  const parsed = parseRepoOpenRequest(repoBody, now());
   if (!parsed.ok) return json(parsed.error, 400);
   const op = parsed.request;
+  const assignment = Object.hasOwn(bodyWithAssignment, 'assignmentPreload')
+    ? await deps.authorizeAssignment?.(preload, op) : undefined;
+  if (Object.hasOwn(bodyWithAssignment, 'assignmentPreload') && !assignment) return json('repo_open_invalid_request', 400);
   if (!op.privatePacket || !/^https:\/\/github\.ezil\.work\/default\//.test(op.canonicalURL)
     || /[^A-Za-z0-9._~+/=?-]/.test(op.token)) return json('repo_open_unsupported_provider', 409);
   const started = now();
@@ -72,7 +80,8 @@ export async function openAwsStandaloneRepo(request: Request, claims: PreviewTok
   const jobId = (deps.jobId ?? (() => hex(crypto.getRandomValues(new Uint8Array(32)))))();
   if (!/^[0-9a-f]{64}$/.test(jobId)) return json('repo_open_failed');
   const body = JSON.stringify({ v: 1, jobId, repositoryId: op.repositoryId, privatePacket: op.privatePacket, timeoutMs: op.timeoutMs,
-    ...(op.gitAuthor ? { gitAuthor: op.gitAuthor } : {}), ...(op.refreshOnly ? { refreshOnly: true } : {}) });
+    ...(op.gitAuthor ? { gitAuthor: op.gitAuthor } : {}), ...(op.refreshOnly ? { refreshOnly: true } : {}),
+    ...(assignment ? { assignmentPreload: { ...assignment.witness, nonce: assignment.nonce } } : {}) });
   const encoded = new TextEncoder().encode(body);
   if (encoded.byteLength > 20_480) return json('repo_open_invalid_request', 400);
   const digest = hex(new Uint8Array(await crypto.subtle.digest('SHA-256', encoded)));
@@ -130,9 +139,20 @@ export async function openAwsStandaloneRepo(request: Request, claims: PreviewTok
         return json('repo_open_failed', 502, 'status_invalid');
       await current(); // Old placements cannot become Code URLs.
       const result = status.result;
-      if (exact(result, ['ok', 'folder', 'status']) && result.ok === true
-        && result.folder === `/workspace/projects/${op.repositoryId}` && (result.status === 'cloned' || result.status === 'fetched'))
+      const fields = assignment ? ['ok', 'folder', 'status', 'checkoutFolder', 'assignmentPreload'] : ['ok', 'folder', 'status'];
+      const folder = `/workspace/projects/${op.repositoryId}`;
+      if (exact(result, fields) && result.ok === true && result.folder === folder
+        && (result.status === 'cloned' || result.status === 'fetched')) {
+        if (assignment) {
+          const expectedCheckout = folder + '/' + op.canonicalURL.split('/').at(-1)!.slice(0, -4);
+          const ack = result.assignmentPreload;
+          if (result.checkoutFolder !== expectedCheckout || !exact(ack, ['eventId', 'nonce', 'port', 'status'])
+            || ack.eventId !== assignment.witness.eventId || ack.nonce !== assignment.nonce
+            || ack.port !== ASSIGNMENT_PRELOAD_PORT || ack.status !== 'acknowledged')
+            return json('repo_open_failed', 502, 'invalid_result');
+        }
         return Response.json(result, { headers: { 'cache-control': 'no-store' } });
+      }
       if ((exact(result, ['ok', 'error']) || (exact(result, ['ok', 'error', 'diagnosticReason'])
         && typeof result.diagnosticReason === 'string' && diagnosticReasons.has(result.diagnosticReason)))
         && result.ok === false && failures.has(result.error as string))

@@ -7,7 +7,7 @@
  */
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { describe, expect, it, mock } from 'bun:test';
+import { describe, expect, it, mock, spyOn } from 'bun:test';
 
 mock.module('cloudflare:workers', () => ({
   DurableObject: class {},
@@ -294,6 +294,68 @@ describe('staging assignment repo-open preload', () => {
       const response = await res.json() as { assignmentPreload?: unknown };
       expect(!!response.assignmentPreload).toBe(allowed);
       expect(!!calls[0]?.preload).toBe(allowed);
+    }
+  });
+
+  it('gates AWS assignment checkout on production authority and the enrolled host acknowledgment', async () => {
+    const worker = await loadWorker();
+    const { binding, calls } = fakeNamespace();
+    const userId = '11111111-1111-4111-8111-111111111111';
+    const computerId = '22222222-2222-4222-8222-222222222222';
+    const sandboxId = 'guac-1111111111114111-2222222222224222';
+    const path = `/sandbox/${sandboxId}/repo-open`;
+    const record = { computerId, sandboxId, generation: 2, leaseEpoch: 4, originVerified: true, controlKey: btoa('k'.repeat(32)) };
+    const request = (origin = 'https://api-desktop.ezil.org') => signed({
+      claims: claims({ userId, computerId, sandboxId, provider: 'aws-ec2', generation: 2, leaseEpoch: 4 }),
+      path, url: origin + path, signBody: body(),
+    });
+    const routes = {
+      AWS_ROUTING_ENABLED: 'on', AWS_STANDALONE_REPO_OPEN_ENABLED: 'on',
+      AWS_ORIGIN_ZONE: 'ezil.org', AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.org',
+      AWS_TUNNELS: { idFromName: (id: string) => id, get: () => ({ fetch: async () => Response.json({ record }) }) },
+    };
+    const production = { EZIL_AI_GATEWAY_URL: 'https://ai.ezil.work', EZIL_PRODUCTION_ASSIGNMENT_PRELOAD: '1' };
+    const ordinary = { ok: true, folder, status: 'cloned' };
+    const qualified = { ...ordinary, checkoutFolder,
+      assignmentPreload: { eventId, nonce, port: 5679, status: 'acknowledged' } };
+    let result = ordinary;
+    const host = spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => init?.method === 'POST'
+      ? Response.json({ ok: true, state: 'running' }, { status: 202 })
+      : Response.json({ ok: true, state: 'done', result }));
+    try {
+      for (const [origin, gateway] of [
+        ['https://api-desktop-staging.ezil.work', production.EZIL_AI_GATEWAY_URL],
+        ['https://api-desktop.ezil.org', 'https://ai-staging.ezil.work'],
+      ]) {
+        const refused = await worker.fetch(await request(origin), env(binding, { ...routes, ...production, EZIL_AI_GATEWAY_URL: gateway }));
+        expect(refused.status).toBe(400);
+        expect(host).not.toHaveBeenCalled();
+      }
+
+      const disabled = await worker.fetch(await request(), env(binding, { ...routes, ...production, EZIL_PRODUCTION_ASSIGNMENT_PRELOAD: '0' }));
+      expect(await disabled.json()).toEqual(ordinary);
+      expect(JSON.parse(String(host.mock.calls[0]![1]?.body))).not.toHaveProperty('assignmentPreload');
+      host.mockClear();
+
+      const missingAck = await worker.fetch(await request(), env(binding, { ...routes, ...production }));
+      expect(missingAck.status).toBe(502);
+      host.mockClear();
+
+      result = qualified;
+      const response = await worker.fetch(await request(), env(binding, { ...routes, ...production }));
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(JSON.parse(text)).toEqual(qualified);
+      expect(text).not.toContain(gitPassword);
+      expect(calls).toHaveLength(0);
+      expect(host.mock.calls.map(([, init]) => init?.method)).toEqual(['POST', 'GET']);
+      const [target, init] = host.mock.calls[0]!;
+      expect(new URL(String(target)).hostname).toBe(`c-${sandboxId}-g2-e4.ezil.org`);
+      expect(JSON.parse(String(init?.body)).assignmentPreload).toEqual({
+        eventId, attemptId, nonce, ownerSha256, canonicalURL, repositoryId: folderId, ref, manifestSha256,
+      });
+    } finally {
+      host.mockRestore();
     }
   });
 
