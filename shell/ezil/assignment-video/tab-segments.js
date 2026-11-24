@@ -4,32 +4,82 @@ import {createVP8Muxer} from './vp8-webm.js';
  * `play()` on a capture track can stay pending (an ended or stopped share). Bounded like the frame wait after it, so a
  * share can never hang on it: it rejects `no_current_frame`, the same as a tab that presents no frame.
  */
-export function playWithin(video, ms, timers = globalThis) {
-    let timer;
-    return Promise.race([Promise.resolve().then(() => video.play()),
-        new Promise((_, reject) => { timer = timers.setTimeout(() => reject(new Error('no_current_frame')), ms); })])
-        .finally(() => timers.clearTimeout(timer));
+export function playWithin(video, ms, timers = globalThis, signal) {
+    let timer, cancelled;
+    return Promise.race([Promise.resolve().then(() => {
+        if (signal?.aborted) throw new Error('cancelled');
+        return video.play();
+    }), new Promise((_, reject) => {
+        cancelled = () => reject(new Error('cancelled'));
+        signal?.addEventListener('abort', cancelled, {once:true});
+        timer = timers.setTimeout(() => reject(new Error('no_current_frame')), ms);
+    })]).finally(() => {
+        timers.clearTimeout(timer);
+        signal?.removeEventListener('abort', cancelled);
+    });
 }
 
-export async function encodeTabSegments({win, stream, matches, windowStart, deadline, upload, cutoff, onFault, onFrame, onAwaitFrame, firstSequence=0, clockOffset=0}) {
+/**
+ * Wait for a new compositor frame and an unmuted track. Startup accepts the frame that triggered Chrome's unmute.
+ * Recovery needs a frame presented after unmute. Never take the pre-armed track's cached image.
+ */
+export function freshFrame(video, track, ms, onWaiting, timers = globalThis, signal, afterUnmute=false) {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) { reject(new Error('cancelled')); return; }
+        let presented = false, request, frameRequest = 0;
+        const ready = () => { if (presented && !track.muted) { done(); resolve(); } };
+        const cancelled = () => { done(); reject(new Error('cancelled')); };
+        const timeout = timers.setTimeout(() => { done(); reject(new Error('no_current_frame')); }, ms);
+        function clearFrame() {
+            frameRequest++;
+            if (request !== undefined) video.cancelVideoFrameCallback?.(request);
+            request = undefined;
+        }
+        function done() {
+            timers.clearTimeout(timeout);
+            track.removeEventListener('unmute', unmuted);
+            signal?.removeEventListener('abort', cancelled);
+            clearFrame();
+        }
+        function requestFrame() {
+            clearFrame();
+            const generation = frameRequest;
+            request = video.requestVideoFrameCallback(() => {
+                if (generation !== frameRequest) return;
+                request = undefined;
+                if (afterUnmute && track.muted) return;
+                presented = true;
+                ready();
+            });
+        }
+        function unmuted() {
+            if (afterUnmute) requestFrame();
+            else ready();
+        }
+        track.addEventListener('unmute', unmuted);
+        signal?.addEventListener('abort', cancelled, {once:true});
+        if (!afterUnmute || !track.muted) requestFrame();
+        onWaiting?.();
+    });
+}
+
+export async function encodeTabSegments({win, stream, matches, windowStart, deadline, upload, cutoff,
+    onFault, onFrame, onAwaitFrame, onPause, onResume, signal, recoveryMs=4500, firstSequence=0, clockOffset=0}) {
+    const track = stream.getVideoTracks()[0];
     const video = win.document.createElement('video');
     video.muted = true;
     video.playsInline = true;
     video.srcObject = stream;
-    let active = true, timer, segment, pendingUpload, sequence = firstSequence, last = null, stopped;
+    let active = true, timer, segment, pendingUpload, sequence = firstSequence, last = null, stopped, recovery;
+    let uploadsQueued = 0;
     const wall = Date.now()+clockOffset, mono = win.performance.now();
     const time = () => Math.floor(wall + win.performance.now() - mono - windowStart);
     const limit = deadline - windowStart;
     const canvas = win.document.createElement('canvas');
     const ctx = canvas.getContext('2d', {alpha:false});
     try {
-        await playWithin(video, 4500, win);
-        // Wait for a compositor frame presented after authorization. Never encode the pre-armed track's cached image.
-        await new Promise((resolve, reject) => {
-            const timeout = win.setTimeout(() => reject(new Error('no_current_frame')), 4500);
-            video.requestVideoFrameCallback(() => { win.clearTimeout(timeout); resolve(); });
-            onAwaitFrame?.();
-        });
+        await playWithin(video, 4500, win, signal);
+        await freshFrame(video, track, 4500, onAwaitFrame, win, signal);
         if (!matches() || !ctx || !video.videoWidth || !video.videoHeight) throw new Error('source_lost');
         const scale = Math.min(1, 1920/video.videoWidth, 1080/video.videoHeight);
         canvas.width = Math.max(2, 2*Math.floor(video.videoWidth*scale/2));
@@ -54,30 +104,84 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
                 await upload({sequence:sequence++, startMs:current.start, endMs:end, mimeType:'video/webm', bytes});
             } finally { if (current.encoder.state !== 'closed') current.encoder.close(); }
         }
-        function rotate(end) {
-            if (pendingUpload) throw new Error('upload_backpressure');
-            const old = segment;
+        function rotate(end, interrupted=false) {
+            // The interrupted clip can wait behind one in-flight upload. Keep both ordered and bounded.
+            if (uploadsQueued && (!interrupted || uploadsQueued >= 2)) throw new Error('upload_backpressure');
+            const old = segment, previous = pendingUpload;
             segment = undefined;
-            pendingUpload = seal(old, end).catch(err => { fault('upload_failed'); throw err; })
-                .finally(() => { pendingUpload = undefined; });
+            uploadsQueued++;
+            const task = (async () => {
+                try {
+                    if (previous) await previous;
+                    await seal(old, end);
+                } catch (err) {
+                    if (old.encoder.state !== 'closed') old.encoder.close();
+                    fault('upload_failed');
+                    throw err;
+                }
+            })().finally(() => {
+                uploadsQueued--;
+                if (pendingUpload === task) pendingUpload = undefined;
+            });
+            pendingUpload = task;
             // Promise is also explicitly joined at Stop.
-            pendingUpload.catch(() => {});
+            task.catch(() => {});
         }
-        // `cause`: why the recorder stopped itself, for the gate's diagnostics (a code, never a message).
+        const faultCode = err => /^[a-z_]{1,40}$/.test(err?.message ?? '') ? err.message : 'sample_failed';
         function fault(cause) {
             if (!active) return;
             active = false;
             win.clearTimeout(timer);
+            recovery?.abort();
             onFault(cause);
         }
-        function sample() {
-            if (!active) return;
+        function usableTime() {
             const t = time();
-            if (!matches() || stream.getVideoTracks()[0].muted || video.readyState < 2
-                || t < 0 || t >= limit || (last !== null && t-last > 2700))
-                throw new Error('source_lost');
+            if (!matches() || t < 0) throw new Error('source_lost');
+            if (t >= limit) throw new Error('deadline');
+            return t;
+        }
+        async function resume(wait, pausedAt) {
+            const cancel = () => wait.abort();
+            signal?.addEventListener('abort', cancel, {once:true});
+            try {
+                if (signal?.aborted) return;
+                await freshFrame(video, track, recoveryMs, undefined, win, wait.signal, true);
+                if (!active || wait.signal.aborted) return;
+                const t = usableTime();
+                if (t-pausedAt >= recoveryMs || track.muted || video.readyState < 2) throw new Error('no_current_frame');
+                record(t);
+                recovery = undefined;
+                onResume?.();
+                if (active && !recovery) timer = win.setTimeout(tick, 1001);
+            } catch (err) {
+                if (active && !signal?.aborted) fault(faultCode(err));
+            } finally {
+                signal?.removeEventListener('abort', cancel);
+            }
+        }
+        function pause(cause='track_muted') {
+            if (!active || recovery || signal?.aborted) return;
+            try {
+                const t = usableTime();
+                const wait = new AbortController();
+                recovery = wait;
+                win.clearTimeout(timer);
+                onPause?.(cause);
+                // Do not extend the previous clip over media the browser never supplied.
+                if (segment) rotate(Math.min(t, last+1000), true);
+                if (active) void resume(wait, t);
+            } catch (err) { fault(faultCode(err)); }
+        }
+        function sample() {
+            const t = usableTime();
+            if (track.muted || video.readyState < 2) { pause('no_current_frame'); return; }
+            if (last !== null && t-last > 2700) { pause('sample_delayed'); return; }
             if (last !== null && t-last < 1000) return;
             if (segment && t-segment.start >= (sequence === firstSequence ? 3500 : 11000)) rotate(t);
+            record(t);
+        }
+        function record(t) {
             if (!segment) segment = open(t);
             if (segment.encoder.encodeQueueSize > 2) throw new Error('encoder_backpressure');
             // Drawing the browser-issued tab track preserves the composited Code, Settings and Browser pixels.
@@ -87,19 +191,21 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
             ctx.drawImage(video, (canvas.width-width)/2, (canvas.height-height)/2, width,height);
             const frame = new win.VideoFrame(canvas, {timestamp:(t-segment.start)*1000});
             try { segment.encoder.encode(frame, {keyFrame:t===segment.start}); } finally { frame.close(); }
-            if (last === null) onFrame();
+            if (last === null) onFrame?.();
             last = t;
         }
         function tick() {
+            if (!active || signal?.aborted) return;
             try { sample(); }
-            catch (err) { fault(/^[a-z_]{1,40}$/.test(err?.message ?? '') ? err.message : 'sample_failed'); return; }
-            if (active) timer = win.setTimeout(tick, 1001);
+            catch (err) { fault(faultCode(err)); return; }
+            if (active && !recovery) timer = win.setTimeout(tick, 1001);
         }
         sample();
-        timer = win.setTimeout(tick, 1001);
-        return {stop(effectiveAt) {
+        if (active && !recovery) timer = win.setTimeout(tick, 1001);
+        return {pause, stop(effectiveAt) {
             if (stopped) return stopped;
             active = false; win.clearTimeout(timer);
+            recovery?.abort();
             const cutoffAt = Date.parse(effectiveAt);
             const end = Math.min(limit,time(), (last ?? 0)+1000,
                 Number.isFinite(cutoffAt) ? cutoffAt-windowStart : limit);
@@ -119,23 +225,19 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
             return stopped;
         }};
     } catch (err) {
-        active = false; win.clearTimeout(timer); video.pause(); video.srcObject = null;
+        active = false; win.clearTimeout(timer); recovery?.abort(); video.pause(); video.srcObject = null;
         if (segment?.encoder.state !== 'closed') segment?.encoder.close();
         throw err;
     }
 }
 
-export async function seedFrame(stream,valid,onWaiting) {
+export async function seedFrame(stream,valid,onWaiting,ms=8000,signal) {
     const video=document.createElement('video');
     video.srcObject=stream; video.muted=true; video.playsInline=true;
     let encoder;
     try {
-        await playWithin(video,8000);
-        await new Promise((resolve,reject)=>{
-            const timeout=setTimeout(()=>reject(new Error('no_current_frame')),8000);
-            video.requestVideoFrameCallback(()=>{clearTimeout(timeout);resolve();});
-            onWaiting();
-        });
+        await playWithin(video,ms,globalThis,signal);
+        await freshFrame(video,stream.getVideoTracks()[0],ms,onWaiting,globalThis,signal);
         if (!valid() || !video.videoWidth || !video.videoHeight) throw new Error('source_lost');
         const scale=Math.min(1,640/video.videoWidth,480/video.videoHeight);
         const canvas=document.createElement('canvas');

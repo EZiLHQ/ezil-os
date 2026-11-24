@@ -76,7 +76,8 @@ function installMedia(t){
 
 /** One OS tab on os-staging with the gate armed. `control[action]` answers the assignment-video route; preflight is eligible. */
 // `saveCeilingMs`: short, so a failing test's unfinished save (module state) cannot stall the next test for minutes.
-function harness(t,{prepare,control={},video,media=false,settleMs=40,saveCeilingMs=3000}={}){
+// `muted`: the shared track starts muted (Chrome may present no frame yet when the picker closes).
+function harness(t,{prepare,control={},video,media=false,settleMs=40,saveCeilingMs=3000,frameMs,muted=false}={}){
     const calls=[],elements=[];
     if(media)installMedia(t);
     t.mock.method(globalThis,'fetch',async(url,options)=>{
@@ -91,10 +92,15 @@ function harness(t,{prepare,control={},video,media=false,settleMs=40,saveCeiling
     });
     let handle;
     class Track{
-        readyState='live';muted=false;listeners={};
-        getCaptureHandle(){return {origin:'https://os-staging.ezil.work',handle};}
+        readyState='live';muted=muted;listeners={};handlers={};handle;
+        getCaptureHandle(){return {origin:'https://os-staging.ezil.work',handle:this.handle??handle};}
         getSettings(){return {displaySurface:'browser'};}
-        addEventListener(n,f){this.listeners[n]=f;} stop(){this.readyState='ended';}
+        // `listeners[n]()` dispatches to every listener of `n`, as the browser does.
+        addEventListener(n,f){(this.handlers[n]??=new Set()).add(f);this.listeners[n]=()=>[...this.handlers[n]].forEach(h=>h());}
+        removeEventListener(n,f){this.handlers[n]?.delete(f);}
+        stop(){this.readyState='ended';}
+        mute(){this.muted=true;this.listeners.mute?.();}
+        unmute(){this.muted=false;this.listeners.unmute?.();}
     }
     const tracks=[];
     const stream=()=>{const track=new Track();tracks.push(track);return {getTracks:()=>[track],getVideoTracks:()=>[track],getAudioTracks:()=>[]};};
@@ -108,7 +114,7 @@ function harness(t,{prepare,control={},video,media=false,settleMs=40,saveCeiling
     win.top=win;win.parent=win;Object.assign(globalThis,{window:win,document:doc});
     let opened=0;
     const gate=openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>'owner',computerId:'fixture',body:new Element(),
-        park(){},open(){opened++;},prepare,settleMs,saveCeilingMs});
+        park(){},open(){opened++;},prepare,settleMs,saveCeilingMs,...frameMs&&{frameMs}});
     const buttons=()=>elements.filter(e=>e.tag==='button'&&e.textContent===SHARE);
     return {gate,calls,tracks,opened:()=>opened,panel:()=>elements.find(e=>e.tag==='section'),
         title:()=>elements.filter(e=>e.tag==='h2').at(-1)?.textContent,
@@ -184,6 +190,34 @@ test('a stop while the seed frame hangs hands the gate back within the bound and
         assert.equal(finish.length,1,'one finish report, once the footage is settled');
         assert.match(finish[0].detail,/stage:seed;reason:sharing_stopped;began:1;accepted:0;saved:1;late:1/);
     }finally{rejectPlay?.(new Error('aborted'));await h.gate.close();}
+});
+
+test('a stopped seed cannot replace the retry prompt when playback resolves late', async t=>{
+    let resumePlayback, presentFrame;
+    const video=()=>Object.assign(new Element(),{muted:false,playsInline:false,srcObject:null,pause(){},
+        play:()=>new Promise(resolve=>{resumePlayback=resolve;}),
+        requestVideoFrameCallback(callback){presentFrame=callback;}});
+    const h=harness(t,{prepare:async()=>checkout,video,
+        control:{begin:begun,checkpoint:()=>Response.json({status:'paused'})}});
+    try{
+        await h.share();
+        await waitFor(()=>typeof resumePlayback==='function');
+        h.stop();
+        await waitFor(()=>h.title()==='Record this assignment tab');
+        const retryStatus=h.status();
+        resumePlayback();
+        await waitFor(()=>typeof presentFrame==='function'||h.calls.includes('checkpoint'));
+        assert.equal(h.title(),'Record this assignment tab');
+        assert.equal(h.status(),retryStatus);
+        presentFrame?.();
+        await waitFor(()=>h.calls.includes('checkpoint'));
+        assert.equal(h.calls.filter(call=>call==='checkpoint').length,1);
+        assert.equal(h.opened(),0);
+    }finally{
+        resumePlayback?.();
+        presentFrame?.();
+        await h.gate.close();
+    }
 });
 
 /** Shares and records (real seed, recorder and transport) until Code opens. */
@@ -335,5 +369,142 @@ test('an identity lapse during the share asks for sign-in, not another share', a
         await h.share();
         await waitFor(()=>h.title()==='Sign in to EZiL OS');
         assert.equal(h.status(),'Return to this assignment after signing in.');
+    }finally{await h.gate.close();}
+});
+
+// A track mute means the tab is presenting no new frames (Chrome mutes a captured tab that sends none), not that the
+// share is gone. Before the recorder's first frame the workspace is parked anyway: a mute there waits, bounded, for a
+// fresh frame. A wrong tab or a stopped track still ends capture immediately.
+const held=(prepared=checkout)=>{let release;return {prepare:()=>new Promise(resolve=>{release=()=>resolve(prepared);}),release:()=>release()};};
+
+test('a share whose track starts muted waits, parked, for a fresh frame and then opens the editor', async t=>{
+    const wake=held();
+    const h=harness(t,{prepare:wake.prepare,media:true,muted:true,control:recorded()});
+    try{
+        const since=recentEvents().length;
+        await h.share();
+        await waitFor(()=>h.title()==='Preparing assignment');
+        await tick(1300);
+        assert.equal(h.title(),'Preparing assignment','a muted track past the 1.1 s watch is not a lost share');
+        assert.equal(h.gate.locked(),true);assert.equal(h.gate.access(),null);
+        wake.release();
+        await waitFor(()=>h.calls.includes('begin'));await tick(100);
+        assert.equal(h.calls.includes('confirm:0'),false,'no seed frame while the tab presents none');
+        h.tracks[0].unmute();
+        await waitFor(()=>h.opened()===1,3000);
+        assert.equal(h.tracks[0].readyState,'live');
+        assert.equal(gateEvents(since).some(e=>e.site==='ezil-os:assignment#finish'),false);
+    }finally{await h.gate.close();}
+});
+
+test('a mute during the computer wake that clears opens the editor', async t=>{
+    const wake=held();
+    const h=harness(t,{prepare:wake.prepare,media:true,control:recorded()});
+    try{
+        await h.share();
+        await waitFor(()=>h.title()==='Preparing assignment');
+        h.tracks[0].mute();
+        await tick(1300);
+        assert.equal(h.title(),'Preparing assignment','the mute event alone does not end the share');
+        h.tracks[0].unmute();
+        wake.release();
+        await waitFor(()=>h.opened()===1,3000);
+    }finally{await h.gate.close();}
+});
+
+test('a mute between the seed frame and the recorder waits for a fresh frame', async t=>{
+    const control=recorded();
+    const confirm=control.confirm;let track;
+    control.confirm=body=>{
+        if(body.sequence===0){track=h.tracks[0];track.mute();setTimeout(()=>track.unmute(),300);}
+        return confirm(body);
+    };
+    const h=harness(t,{prepare:async()=>checkout,media:true,control});
+    try{
+        await h.share();
+        await waitFor(()=>h.opened()===1,3000);
+        assert.equal(track.muted,false);
+    }finally{await h.gate.close();}
+});
+
+test('a sustained mute fails within the fresh-frame bound, names the cause and claims no footage', async t=>{
+    const h=harness(t,{prepare:async()=>checkout,media:true,muted:true,frameMs:300,control:recorded()});
+    try{
+        const since=recentEvents().length;
+        const sharedAt=Date.now();
+        await h.share();
+        await waitFor(()=>h.title()==='Record this assignment tab'&&h.calls.includes('checkpoint'),3000);
+        assert.ok(Date.now()-sharedAt<2500,'bounded by the fresh-frame wait');
+        assert.equal(h.status(),'This tab stopped sending video to the recorder. Keep this EZiL OS tab in front while it is shared.'
+            +' Share this OS tab again to open your assignment.'+CONSENT_TAIL);
+        assert.equal(h.calls.includes('confirm:0'),false,'no seed frame was uploaded');
+        assert.equal(h.opened(),0);assert.equal(h.tracks[0].readyState,'ended');
+        const finish=gateEvents(since).filter(e=>e.site==='ezil-os:assignment#finish');
+        assert.equal(finish.length,1);assert.equal(finish[0].code,'no_current_frame');assert.equal(finish[0].outcome,'error');
+        assert.match(finish[0].detail,/stage:seed;reason:connection_lost;began:1;accepted:0/);
+    }finally{await h.gate.close();}
+});
+
+test('the wrong tab and a stopped share still end a muted share at once', async t=>{
+    for(const end of ['capturehandlechange','ended']){
+        const wake=held();
+        const h=harness(t,{prepare:wake.prepare,media:true,muted:true,control:recorded()});
+        try{
+            const since=recentEvents().length;
+            await h.share();
+            await waitFor(()=>h.title()==='Preparing assignment');
+            const track=h.tracks[0];
+            if(end==='capturehandlechange')track.handle='another-document';
+            track.listeners[end]();
+            assert.equal(h.title(),'Record this assignment tab',end+' releases the gate synchronously');
+            assert.equal(track.readyState,'ended');
+            const finish=gateEvents(since).filter(e=>e.site==='ezil-os:assignment#finish');
+            assert.equal(finish[0]?.code,end==='ended'?'track_ended':'capture_handle_changed',end);
+            wake.release();await tick(50);
+            assert.equal(h.calls.includes('begin'),false,end);assert.equal(h.opened(),0,end);
+        }finally{wake.release();await h.gate.close();}
+    }
+});
+
+test('a mute parks the editor and a fresh frame restores it on the same capture phase', async t=>{
+    const h=harness(t,{prepare:async()=>checkout,media:true,control:recorded()});
+    try{
+        await recording(h);
+        const track=h.tracks[0], frame=new Element();
+        const {captureSessionId}=h.gate.access();
+        const url='https://fixture.test/?'+new URLSearchParams({folder:checkout.repository.checkoutFolder});
+        h.gate.confirm(frame,url,checkout.repository.checkoutFolder);
+        assert.equal(h.gate.locked(),false);
+        track.mute();
+        assert.equal(h.title(),'Recording paused');
+        assert.equal(h.gate.locked(),true);
+        assert.equal(h.gate.access(),null);
+        assert.equal(track.readyState,'live');
+        track.unmute();
+        await waitFor(()=>!h.gate.locked());
+        assert.equal(h.gate.access().captureSessionId,captureSessionId);
+        assert.equal(h.opened(),1);
+        assert.equal(h.calls.filter(action=>action==='begin').length,1);
+        assert.equal(h.calls.includes('checkpoint'),false);
+        h.stop();
+        await waitFor(()=>h.calls.includes('checkpoint'));
+        assert.equal(h.calls.filter(action=>action==='checkpoint').length,1);
+        assert.equal(h.gate.locked(),true);
+    }finally{await h.gate.close();}
+});
+
+test('an editor receipt received while muted unlocks only after capture resumes', async t=>{
+    const h=harness(t,{prepare:async()=>checkout,media:true,control:recorded()});
+    try{
+        await recording(h);
+        const track=h.tracks[0], frame=new Element();
+        const url='https://fixture.test/?'+new URLSearchParams({folder:checkout.repository.checkoutFolder});
+        track.mute();
+        h.gate.confirm(frame,url,checkout.repository.checkoutFolder);
+        assert.equal(h.gate.locked(),true);
+        assert.equal(h.gate.access(),null);
+        track.unmute();
+        await waitFor(()=>!h.gate.locked());
+        assert.equal(h.opened(),1);
     }finally{await h.gate.close();}
 });

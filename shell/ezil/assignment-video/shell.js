@@ -19,6 +19,12 @@ export const STOP_SETTLE_MS=5000;
  */
 export const STOP_SAVE_CEILING_MS=150000;
 /**
+ * How long the seed frame waits for the shared tab to present a fresh, unmuted frame. It bounds a muted share before
+ * recording: Chrome mutes a captured tab that sends no new frames (the picker's focus, a still screen), and a mute that
+ * outlasts this fails as `no_current_frame`.
+ */
+export const FRESH_FRAME_MS=8000;
+/**
  * The stopped share whose footage is still being saved (`{item,done}`), in any gate of this document. A new share sends
  * no begin until it is done: the broker holds one capture lease per attempt and OS session, so a new phase would refuse
  * the old phase's last confirm.
@@ -97,7 +103,7 @@ async function retry(operation, codes, times=2, live=()=>true) {
 }
 
 export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare, computerProvider, settleMs=STOP_SETTLE_MS,
-    saveCeilingMs=STOP_SAVE_CEILING_MS}) {
+    saveCeilingMs=STOP_SAVE_CEILING_MS, frameMs=FRESH_FRAME_MS}) {
     const win=globalThis.window, repo=project?.repoUrl;
     if(!win || !assignmentOsOrigin(win.location.origin)){queueMicrotask(open);return null;}
     const address=new URL(win.location.href);
@@ -112,7 +118,9 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     const isOwner=()=>Boolean(owner) && actor()===owner;
     const isHere=()=>!disposed && current===gate && isOwner() && win===win.top;
     const samePhase=item=>isHere() && activity===item && !item.ended;
-    const recordingSource=item=>samePhase(item) && Boolean(item.source?.matches()) && !item.source.stream.getVideoTracks()[0].muted;
+    // The exact tab is still shared. A muted track is still this tab; it only presents no new frames.
+    const sameTab=item=>samePhase(item) && Boolean(item.source?.matches());
+    const recordingSource=item=>sameTab(item) && !item.paused && !item.source.stream.getVideoTracks()[0].muted;
     function lockedView(title,message) {
         locked=true;park(true);ui.clear();ui.set(title,message);
     }
@@ -128,7 +136,32 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         indicator.textContent=message+' · Stop';
     }
     function removeIndicator(){indicator?.remove();indicator=null;}
-    function check(item){if(!recordingSource(item))throw failure('source_lost');}
+    function check(item){if(!sameTab(item))throw failure('source_lost');}
+    function revealEditor(item){
+        if(!recordingSource(item)||!item.editorFrame?.isConnected)return;
+        locked=false;park(false);ui.reveal();item.editor?.resolve();
+    }
+    function pauseCapture(item){
+        if(!sameTab(item)||item.paused)return;
+        let resolve;
+        const promise=new Promise(done=>{resolve=done;});
+        item.paused={promise,resolve};
+        lockedView('Recording paused','Waiting for a fresh frame from this EZiL OS tab…');
+        showIndicator('Recording paused');
+    }
+    function clearPause(item){
+        item.paused?.resolve();
+        item.paused=null;
+    }
+    function resumeCapture(item){
+        if(!sameTab(item)||!item.paused)return;
+        clearPause(item);
+        showIndicator('Recording');
+        if(item.editorFrame?.isConnected)revealEditor(item);
+        else if(item.editorFrame)void finish(item,'connection_lost',{cause:'assigned_checkout_unverified',
+            message:causeMessage('assigned_checkout_unverified',null,item)});
+        else ui.set('Opening assigned editor','Recording is active. Checking your workspace…');
+    }
     function displayConsent(message) {
         lockedView('Record this assignment tab',message || 'Share only this EZiL OS tab to open the assignment. The job creator can review saved work even if you do not submit.');
         if(message)ui.set('Record this assignment tab',message+' The job creator can review saved work even if you do not submit.');
@@ -168,7 +201,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     }
     function share() {
         if(!isHere()||!picker||activity)return;
-        const item={id:win.crypto.randomUUID(),expected:0};
+        const item={id:win.crypto.randomUUID(),expected:0,captureCtl:new AbortController()};
         activity=item;
         // choose invokes the native picker synchronously inside the trusted user's action.
         const selection=picker.choose();
@@ -184,9 +217,13 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             item.source=source;
             const track=source.stream.getVideoTracks()[0];
             track.addEventListener('ended',()=>void finish(item,'sharing_stopped',{cause:'track_ended'}),{once:true});
-            track.addEventListener('mute',()=>void finish(item,'connection_lost',{cause:'track_muted'}),{once:true});
-            track.addEventListener('capturehandlechange',()=>{if(!recordingSource(item))void finish(item,'connection_lost',{cause:'capture_handle_changed'});});
-            item.watch=setInterval(()=>{if(!recordingSource(item))void finish(item,'connection_lost',{cause:'source_lost'});},1100);
+            track.addEventListener('mute',()=>{
+                if(!samePhase(item))return;
+                if(item.recorder)item.recorder.pause();
+                else report(item.stage,'track_muted',item,{outcome:'skipped'});
+            });
+            track.addEventListener('capturehandlechange',()=>{if(!sameTab(item))void finish(item,'connection_lost',{cause:'capture_handle_changed'});});
+            item.watch=setInterval(()=>{if(!sameTab(item))void finish(item,'connection_lost',{cause:'source_lost'});},1100);
             showIndicator('Sharing');lockedView('Preparing assignment','Verifying the assigned repository…');
             item.stage='prepare';item.prepareCtl=new AbortController();
             const result=await retry(()=>prepare(attemptId,{signal:item.prepareCtl.signal}),['sandbox_starting','media_unavailable','assignment_open_unavailable'],3,live);
@@ -215,8 +252,8 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
                 throw failure('recording_phase_changed');
             item.expected=item.grant.nextSequence;
             item.stage='seed';
-            const bytes=await seedFrame(source.stream,()=>recordingSource(item),
-                ()=>ui.set('Checking recording','Saving the first frame before opening your editor…'));
+            const bytes=await seedFrame(source.stream,()=>sameTab(item),
+                ()=>{if(samePhase(item))ui.set('Checking recording','Saving the first frame before opening your editor…');},frameMs);
             check(item);
             const upload=part=>retry(()=>item.transport.upload(part),['upload_failed','media_unavailable'],2);
             const ack=await upload({sequence:item.expected,startMs:0,endMs:1,mimeType:'video/webm',bytes});
@@ -228,13 +265,24 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             const offset=Number.isFinite(serverNow)?serverNow-Date.now():0;
             if(!Number.isFinite(startAt)||!Number.isFinite(deadline)||deadline<=Date.now()+offset||deadline<=startAt||deadline-startAt>3600000)
                 throw failure('recording_closed');
+            item.deadline=setTimeout(()=>void finish(item,'timeout',{at:ack.deadlineAt,cause:'deadline'}),Math.max(0,deadline-Date.now()-offset));
             item.stage='record';
-            item.recorder=await encodeTabSegments({win,stream:source.stream,matches:()=>recordingSource(item),windowStart:startAt,deadline,
+            item.recorder=await encodeTabSegments({win,stream:source.stream,matches:()=>sameTab(item),windowStart:startAt,deadline,
+                signal:item.captureCtl.signal,
                 firstSequence:item.expected,clockOffset:offset,upload:part=>{item.expected=Math.max(item.expected,part.sequence+1);return upload(part);},
                 cutoff:async()=>{const state=await item.transport.status();return state.stopRequestedAt||null;},
-                onFault:cause=>{if(samePhase(item))report('record',cause||'recorder_fault',item);void finish(item,'connection_lost',{cause:cause||'recorder_fault'});},
-                onFrame:()=>{},
-                onAwaitFrame:()=>ui.set('Opening assigned editor','Recording is active. Checking your workspace…')});
+                onFault:(code)=>{
+                    const cause=code||'recorder_fault';
+                    if(cause==='deadline'){
+                        void finish(item,'timeout',{at:ack.deadlineAt,cause});
+                        return;
+                    }
+                    if(samePhase(item))report('record',cause,item);
+                    void finish(item,'connection_lost',{cause,message:causeMessage(cause,null,item)});
+                },
+                onPause:()=>pauseCapture(item),
+                onResume:()=>resumeCapture(item),
+                onAwaitFrame:()=>{if(samePhase(item))ui.set('Opening assigned editor','Recording is active. Checking your workspace…');}});
             check(item);
             item.stage='confirm';
             await retry(async()=>{
@@ -242,9 +290,10 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
                 if(state.phaseReady!==true||state.workspaceUnlocked!==true||state.captureSessionId!==item.id||state.startedAt!==ack.startedAt
                   ||state.deadlineAt!==ack.deadlineAt||!state.firstFrameAt)throw failure('seed_not_confirmed');
             },['seed_not_confirmed','media_unavailable'],3,live);
+            if(track.muted)item.recorder.pause();
+            while(item.paused)await item.paused.promise;
             check(item);
             item.stage='open';
-            item.deadline=setTimeout(()=>void finish(item,'timeout',{at:ack.deadlineAt,cause:'deadline'}),Math.max(0,deadline-Date.now()-offset));
             item.allowMint=true;showIndicator('Recording');
             const editor=new Promise((resolve,reject)=>{item.editor={resolve,reject};});
             item.editorTimeout=setTimeout(()=>item.editor?.reject(failure('assigned_checkout_unverified')),80000);
@@ -258,10 +307,11 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         }finally{clearTimeout(item.editorTimeout);item.editor=null;}
     }
     function confirmed(frame,frameUrl,actualRoot){
-        const item=activity;if(!item?.allowMint||!item.editor||!recordingSource(item)||!frame.isConnected)return;
+        const item=activity;if(!item?.allowMint||!item.editor||!sameTab(item)||!frame.isConnected)return;
         const url=new URL(frameUrl), folders=[item.meta.workspaceFolder,item.meta.checkoutFolder];
         if(!folders.includes(actualRoot)||!folders.includes(url.searchParams.get('folder'))){item.editor.reject(failure('assigned_checkout_unverified'));return;}
-        locked=false;park(false);ui.reveal();item.editor.resolve();
+        item.editorFrame=frame;
+        revealEditor(item);
     }
     /** The gate's screen for an ended share. `saved` null: its footage is still being saved, so nothing is claimed yet. */
     function showEnded(item,reason,saved){
@@ -318,6 +368,8 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         clearInterval(item.watch);clearTimeout(item.deadline);clearTimeout(item.editorTimeout);
         // Ended first, so the aborted mint's `cancelled` lands in start()'s silent return.
         item.prepareCtl?.abort();
+        item.captureCtl.abort();
+        clearPause(item);
         item.editor?.reject(failure('workspace_locked'));
         item.source?.stream.getTracks().forEach(t=>t.stop());
         removeIndicator();

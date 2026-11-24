@@ -4,12 +4,12 @@ import {encodeTabSegments} from './tab-segments.js';
 
 // No browser, display, real content or real video is used in these deterministic timing tests.
 function harness(beforeDeadline) {
-    let now=0, handle=0, frames=0, faults=0;
+    let now=0, handle=0, frames=0, faults=0, pauses=0, resumes=0, withholdFrames=false;
     const timers=new Map(), uploads=[];
     const start=Date.now()-3600000+beforeDeadline;
     const deadline=start+3600000;
     const video={videoWidth:480,videoHeight:360,readyState:3,play:async()=>{},pause(){},
-        requestVideoFrameCallback(fn){queueMicrotask(fn);}};
+        requestVideoFrameCallback(fn){if(!withholdFrames)queueMicrotask(fn);}};
     class Encoder {
         constructor({output}){this.output=output;this.state='configured';this.encodeQueueSize=0;}
         static async isConfigSupported(){return {supported:true};}
@@ -21,9 +21,10 @@ function harness(beforeDeadline) {
             {getContext:()=>({fillRect(){},drawImage(){}})};}},VideoEncoder:Encoder,
         VideoFrame:class{constructor(_,init){this.timestamp=init.timestamp;}close(){}}};
     return {start,deadline,uploads,get frames(){return frames;},get faults(){return faults;},
-        async create(cutoff=null){return encodeTabSegments({win,stream:{getVideoTracks:()=>[{muted:false}]},matches:()=>true,
+        get pauses(){return pauses;},get resumes(){return resumes;},holdFrames(){withholdFrames=true;},
+        async create(cutoff=null){return encodeTabSegments({win,stream:{getVideoTracks:()=>[{muted:false,addEventListener(){},removeEventListener(){}}]},matches:()=>true,
             windowStart:start,deadline,upload:async packet=>uploads.push(packet),
-            cutoff:async()=>cutoff,onFrame(){},onFault(){faults++;}});},
+            cutoff:async()=>cutoff,onFrame(){},onFault(){faults++;},onPause(){pauses++;},onResume(){resumes++;}});},
         async advance(ms){now+=ms;for(const [id,task] of [...timers])if(task.when<=now){timers.delete(id);task.fn();}await Promise.resolve();}};
 }
 test('original one-hour boundary ends capture without resetting the assignment clock',async()=>{
@@ -43,7 +44,23 @@ test('a late trusted submission trims already-buffered visual data before upload
 });
 test('a suspended clock seals only the observed portion of an idle interval',async()=>{
     const h=harness(9000),recorder=await h.create();
+    h.holdFrames();
     await h.advance(5000); await recorder.stop();
-    assert.equal(h.faults,1); assert.equal(h.frames,1);
+    assert.equal(h.faults,0); assert.equal(h.pauses,1); assert.equal(h.resumes,0);
+    assert.equal(h.frames,1);
     assert.equal(h.uploads[0].endMs-h.uploads[0].startMs,1000);
+});
+
+test('a delayed sampler resumes with a genuine recording gap on the original clock',async()=>{
+    const h=harness(12000),recorder=await h.create();
+    await h.advance(5000);
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(h.pauses,1); assert.equal(h.resumes,1); assert.equal(h.faults,0);
+    await h.advance(1001);
+    await recorder.stop();
+    assert.equal(h.uploads.length,2);
+    const [before,after]=h.uploads;
+    assert.equal(before.endMs-before.startMs,1000);
+    assert.ok(after.startMs-before.endMs>=3900,'interruption is left uncovered');
+    assert.equal(after.sequence,before.sequence+1);
 });
