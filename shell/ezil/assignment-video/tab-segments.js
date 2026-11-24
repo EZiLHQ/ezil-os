@@ -71,7 +71,7 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
     video.playsInline = true;
     video.srcObject = stream;
     let active = true, timer, segment, pendingUpload, sequence = firstSequence, last = null, stopped, recovery;
-    let uploadsQueued = 0;
+    const queuedSegments = new Set();
     // `held`: a server-gated hold (`hold`/`release`) stops recording. The timeline stays the real wall clock since the
     // window started: a hold leaves an honest gap between two clips, never a compressed one.
     let held = false;
@@ -104,6 +104,7 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
                 await current.encoder.flush();
                 const stopAt = Date.parse(await cutoff());
                 if (Number.isFinite(stopAt)) end = Math.min(end,stopAt-windowStart);
+                end = Math.min(end,current.pauseCutoff ?? Infinity);
                 if (end <= current.start) return;
                 const bytes = current.mux.finalize(end-current.start);
                 await upload({sequence:sequence++, startMs:current.start, endMs:end, mimeType:'video/webm', bytes});
@@ -111,10 +112,10 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
         }
         function rotate(end, interrupted=false) {
             // The interrupted clip can wait behind one in-flight upload. Keep both ordered and bounded.
-            if (uploadsQueued && (!interrupted || uploadsQueued >= 2)) throw new Error('upload_backpressure');
+            if (queuedSegments.size && (!interrupted || queuedSegments.size >= 2)) throw new Error('upload_backpressure');
             const old = segment, previous = pendingUpload;
             segment = undefined;
-            uploadsQueued++;
+            queuedSegments.add(old);
             const task = (async () => {
                 try {
                     if (previous) await previous;
@@ -125,7 +126,7 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
                     throw err;
                 }
             })().finally(() => {
-                uploadsQueued--;
+                queuedSegments.delete(old);
                 if (pendingUpload === task) pendingUpload = undefined;
             });
             pendingUpload = task;
@@ -165,16 +166,19 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
                 signal?.removeEventListener('abort', cancel);
             }
         }
-        /** Stop recording while the server's clock is paused: seal the clip so far, leave no timer and no sampling until `release`. */
-        function hold() {
+        /** Stop sampling and keep only frames before the server's pause, including in a clip already flushing. */
+        function hold(effectiveAt = null) {
             if (!active || held || signal?.aborted) return;
             try {
-                const t = usableTime();
+                const t = time();
+                const acceptedThrough = Number.isFinite(effectiveAt) ? Math.min(t, effectiveAt-windowStart) : t;
                 held = true;
+                for (const queued of queuedSegments)
+                    queued.pauseCutoff = Math.min(queued.pauseCutoff ?? Infinity, acceptedThrough);
                 win.clearTimeout(timer);
                 recovery?.abort();
                 recovery = undefined;
-                if (segment) rotate(Math.min(t, (last ?? t)+1000), true);
+                if (segment) rotate(Math.min(acceptedThrough, (last ?? t)+1000), true);
             } catch (err) { fault(faultCode(err)); }
         }
         /** End a hold: wait for a fresh frame of the shared tab, then record again; the held time stays a gap on the real timeline. */

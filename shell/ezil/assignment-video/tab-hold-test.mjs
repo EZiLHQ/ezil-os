@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {encodeTabSegments} from './tab-segments.js';
 
-function harness({muted = false, elapsedMs = 600000} = {}) {
+function harness({muted = false, elapsedMs = 600000, cutoff = async () => null} = {}) {
     let now = 0, handle = 0, frames = 0, faults = [], resumes = 0, pauses = 0, trackMuted = muted;
     const timers = new Map(), uploads = [];
     const start = Date.now() - elapsedMs;
@@ -28,7 +28,7 @@ function harness({muted = false, elapsedMs = 600000} = {}) {
         get timers() { return timers.size; }, mute(on) { trackMuted = on; },
         async create() {
             return encodeTabSegments({win, stream: {getVideoTracks: () => [track]}, matches: () => true, windowStart: start, deadline,
-                upload: async packet => uploads.push(packet), cutoff: async () => null, onFrame() {},
+                upload: async packet => uploads.push(packet), cutoff, onFrame() {},
                 onFault: code => faults.push(code), onPause() { pauses++; }, onResume() { resumes++; }});
         },
         async advance(ms) { now += ms; for (const [id, task] of [...timers]) if (task.when <= now) { timers.delete(id); task.fn(); }
@@ -133,4 +133,27 @@ test('a stop while held uploads nothing past the hold', async () => {
     const result = await recorder.stop(new Date(h.start + 3 * 60 * 1000).toISOString());
     assert.ok(result.expectedSegments >= 1);
     assert.equal(h.uploads.length, 1, 'only the clip sealed at the hold');
+});
+
+test('a delayed trusted pause cuts queued and current clips at its exact server time', async () => {
+    let continueSeal;
+    const allowSeal = new Promise(resolve => { continueSeal = resolve; });
+    const h = harness({cutoff: () => allowSeal});
+    const recorder = await h.create();
+    for (let i = 0; i < 4; i++) await h.advance(1001);
+    const pausedAt = h.start + 601500;
+    recorder.hold(pausedAt);
+    await h.advance(3000);
+    continueSeal(null);
+    await h.advance(0);
+    recorder.release();
+    await h.advance(0);
+    await h.advance(1001);
+    await recorder.stop();
+
+    assert.equal(h.uploads.length, 2);
+    assert.equal(h.uploads[0].endMs, pausedAt-h.start, 'flush drops samples after the trusted pause');
+    assert.ok(h.uploads[1].startMs > pausedAt-h.start, 'resumed recording leaves the upgrade gap');
+    assert.equal(h.uploads[1].sequence, h.uploads[0].sequence+1, 'discarded interrupted clip takes no sequence');
+    assert.deepEqual(h.faults, []);
 });
