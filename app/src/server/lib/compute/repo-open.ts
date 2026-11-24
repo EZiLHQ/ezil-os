@@ -156,7 +156,7 @@ export async function requestRepoOpen(
             ? JSON.stringify({ repositoryId: request.repositoryId, privatePacket: request.privatePacket,
                 ...(request.gitAuthor ? { gitAuthor: request.gitAuthor } : {}),
                 ...(request.refreshOnly ? { refreshOnly: true } : {}),
-                ...(!aws && !request.refreshOnly && request.assignmentPreload ? { assignmentPreload: request.assignmentPreload } : {}), timeoutMs: request.timeoutMs })
+                ...(!request.refreshOnly && request.assignmentPreload ? { assignmentPreload: request.assignmentPreload } : {}), timeoutMs: request.timeoutMs })
             : JSON.stringify({
                 repositoryId: request.repositoryId, canonicalURL: request.canonicalURL, ref: request.ref,
                 ...(request.git ? { git: { token: request.git.token, expiresAt: request.git.expiresAt, ...(request.git.scope ? { scope: request.git.scope } : {}) } } : {}),
@@ -185,15 +185,17 @@ export async function requestRepoOpen(
         const code = value.errorCode ?? value.error;
         if (code === 'repo_open_unsupported_provider') return { ok: false, errorCode: 'repo_open_unsupported_provider' };
         if (!response.ok || value.ok === false) return failed(response.status, code, value.diagnosticReason);
-        if (aws && (Object.keys(value).sort().join(',') !== 'folder,ok,status' || value.ok !== true
+        const awsKeys = request.assignmentPreload ? 'assignmentPreload,checkoutFolder,folder,ok,status' : 'folder,ok,status';
+        if (aws && (Object.keys(value).sort().join(',') !== awsKeys || value.ok !== true
             || (value.status !== 'cloned' && value.status !== 'fetched'))) return failed(response.status, 'aws_result_invalid');
         if (aws && (activeSignal.aborted || !(await current()) || activeSignal.aborted || Date.parse(request.privatePacket!.git.expiresAt) <= now() + 5000
             || value.folder !== `/workspace/projects/${request.repositoryId}`)) return failed(response.status, 'aws_result_invalid');
         if (!isRepositoryFolder(value.folder, request.repositoryId)) return failed(response.status, 'invalid_folder');
         const head = typeof value.head === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value.head) ? value.head : undefined;
-        const ack = !aws && matchesAck(request.assignmentPreload, value.assignmentPreload) ? value.assignmentPreload : undefined;
+        const ack = matchesAck(request.assignmentPreload, value.assignmentPreload) ? value.assignmentPreload : undefined;
         const canonicalName = request.canonicalURL.slice(request.canonicalURL.lastIndexOf('/') + 1, -4);
         const checkoutFolder = ack && value.checkoutFolder === value.folder + '/' + canonicalName ? value.checkoutFolder as string : undefined;
+        if (aws && request.assignmentPreload && !checkoutFolder) return failed(response.status, 'aws_result_invalid');
         return { ok: true, folder: value.folder, ...(head ? { head } : {}),
             ...(ack && checkoutFolder ? {assignmentPreload:ack, checkoutFolder} : {}) };
     } catch (err) {

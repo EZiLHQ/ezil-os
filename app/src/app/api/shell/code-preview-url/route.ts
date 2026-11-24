@@ -13,6 +13,7 @@ import { appRouter } from '@/server/api/root';
 import { createTRPCContext } from '@/server/api/trpc';
 import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
+import { createProviderMigrationStore } from '@/server/lib/compute/provider-migrate-store';
 import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
 import {
     matchesAck, REPO_OPEN_MAX_TIMEOUT_MS, REPO_OPEN_MIN_TIMEOUT_MS, REPO_OPEN_TRANSPORT_MARGIN_MS, requestRepoOpen, withRepositoryFolder,
@@ -334,7 +335,7 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
 
     await caller.computer.get({ id: computerId });
     const selected = await target(ctx, computerId);
-    if (isAws(selected) && (request.assignment !== undefined || parsed.host !== 'github.ezil.work' || !awsStandaloneGitEnabled()))
+    if (isAws(selected) && (parsed.host !== 'github.ezil.work' || !awsStandaloneGitEnabled()))
         return unsupportedProvider();
 
     // Only the parsed parts reach the resolver; it rebuilds the address on its literal github.com origin.
@@ -387,6 +388,34 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     const phase = assignmentPhase.safeParse(request.assignment);
     if ((request.assignment !== undefined && !reserved) || (reserved && (!authority || !request.allowAssignmentPreload || !phase.success || phase.data.attemptId !== canonicalHint
         || !privatePacket || privatePacket.git.scope !== 'write' || !repoOpenSecret()))) return assignmentLocked();
+    const signer = request.allowAssignmentPreload && authority && process.env.UNIVERSE_PROJECT_REPO_ORIGIN === authority.universe
+        ? repoOpenSecret() : undefined;
+    const enrolledId = () => signer && identity && privatePacket ? enrolledAttempt(identity, privatePacket, Date.now()) : undefined;
+    const readEnrollment = async () => {
+        const attemptId = enrolledId();
+        return attemptId && identity
+            ? universeCall(() => recordingAction(identity, { action: 'preflight', attemptId }, { signal: deadline }))
+            : null;
+    };
+    const startedOnAws = isAws(selected);
+    const migrationStore = () => createProviderMigrationStore(ctx.db as unknown as PlacementExecutor);
+    async function verifyAwsContinuation(controls: ControlTarget, enrollment: Awaited<ReturnType<typeof readEnrollment>>) {
+        if (!startedOnAws || !isAws(controls) || !identity || !enrollment?.ok) return false;
+        const { upgradedWorkspaceId, upgradeOperationId } = enrollment.value;
+        if (!upgradeOperationId || upgradedWorkspaceId !== workspaceIdentity(identity.userId, computerId, controls.sandboxName))
+            return false;
+        const migration = await migrationStore().readByComputer(computerId);
+        return migration?.id === upgradeOperationId && migration.state === 'committed'
+            && migration.userId === identity.userId && migration.computerId === computerId
+            && migration.fromProvider === 'cloudflare' && migration.toProvider === 'aws-ec2';
+    }
+    let preflight = reserved && startedOnAws ? await readEnrollment() : null;
+    if (reserved && startedOnAws) {
+        if (preflight && !preflight.ok && preflight.kind === 'unavailable') return assignmentUnavailable();
+        if (preflight && !preflight.ok && preflight.kind === 'identity') return assignmentIdentity();
+        if (!await verifyAwsContinuation(selected, preflight)) return unsupportedProvider();
+    }
+
     const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown; computeProvider?: unknown; sandboxId?: unknown; generation?: unknown; leaseEpoch?: unknown };
     // A not-ready answer goes back as a not-ready answer (rule 6 of `openProject`), so the shell's wake loop waits out a
     // cold computer. For a reserved assignment repository only its allow-listed wake fields; Universe is not asked.
@@ -415,13 +444,11 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     } else if (preview.computeProvider === 'aws-ec2') {
         return shellRefusal(409, 'repo_open_computer_changed', 'This computer changed while opening. Try again.');
     }
-    // Only a signed worker acknowledgement for this enrolled repository may authorize the assignment workspace.
-    if (reserved && isAws(controls)) return unsupportedProvider();
-    const signer = request.allowAssignmentPreload && authority && process.env.UNIVERSE_PROJECT_REPO_ORIGIN === authority.universe && !isAws(controls)
-        ? repoOpenSecret() : undefined;
-    const attemptId = signer && identity && privatePacket ? enrolledAttempt(identity, privatePacket, Date.now()) : undefined;
-    const preflight = attemptId && identity && privatePacket
-        ? await universeCall(() => recordingAction(identity,{action:'preflight',attemptId},{signal:deadline})) : null;
+    // A migrated assignment has to be authorized for this exact workspace before and after minting.
+    if (reserved && (startedOnAws || isAws(controls)) && !await verifyAwsContinuation(controls, preflight))
+        return unsupportedProvider();
+    const attemptId = enrolledId();
+    preflight ??= await readEnrollment();
     // A reserved checkout is never cloned on a failed Universe call: no answer is not a refusal (retryable), and a
     // lapsed EZiL ID is a sign-in. Universe's own refusal keeps today's path (`assignment_checkout_unverified`).
     if (reserved && preflight && !preflight.ok && preflight.kind === 'unavailable') return assignmentUnavailable();
@@ -429,6 +456,7 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     const enrolled = preflight?.ok ? preflight.value : null;
     const challenge = enrolled && privatePacket && attemptId && matchesEnrollment(enrolled, privatePacket, attemptId, Date.now())
         ? makeChallenge(attemptId, privatePacket.repository.canonicalURL) : undefined;
+    if (reserved && isAws(controls) && !challenge) return assignmentLocked();
     const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS,
         privatePacket ? Date.parse(privatePacket.git.expiresAt) - Date.now() - 15_000 : REPO_OPEN_MAX_TIMEOUT_MS);
     if (timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS) {
@@ -444,7 +472,12 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
             git: privatePacket ? { token: privatePacket.git.token, expiresAt: privatePacket.git.expiresAt, scope: privatePacket.git.scope } : null,
             ...(privatePacket ? { privatePacket, ...(identity?.gitAuthor ? { gitAuthor: identity.gitAuthor } : {}) } : {}), timeoutMs },
         { correlationId: newCorrelationId(), signal: deadline, awsStandaloneEnabled: awsStandaloneGitEnabled(),
-            revalidateTarget: () => target(ctx, computerId) });
+            revalidateTarget: async () => {
+                const fresh = await target(ctx, computerId);
+                if (reserved && isAws(controls) && !await verifyAwsContinuation(fresh, preflight))
+                    throw new Error('assignment_placement_changed');
+                return fresh;
+            } });
     if (!opened.ok) {
         if (opened.errorCode === 'repo_open_unsupported_provider') return unsupportedProvider();
         return repoOpenFailureResponse(ctx.db, ctx.user.id, computerId, opened, "This repository's files could not be opened. Try again.");
