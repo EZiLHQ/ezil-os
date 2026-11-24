@@ -1,6 +1,8 @@
-import {checkAssignmentVideoEligibility,createAssignmentVideoTransport} from './transport.js';
+import {checkAssignmentClock,checkAssignmentVideoEligibility,createAssignmentVideoTransport} from './transport.js';
 import { currentTabPicker, assignmentOsOrigin } from './current-tab.js';
 import { encodeTabSegments, seedFrame } from './tab-segments.js';
+import { createCountdown } from './countdown.js';
+import { createStatusControl } from './status-control.js';
 import telemetry from '../telemetry.js';
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const canonical=/^https:\/\/github\.ezil\.work\/default\/u-[0-9a-f]{16}-a-([0-9a-f-]{36})\.git$/;
@@ -24,6 +26,11 @@ export const STOP_SAVE_CEILING_MS=150000;
  * outlasts this fails as `no_current_frame`.
  */
 export const FRESH_FRAME_MS=8000;
+/** How often the server's clock is asked for: while a share is live (a pause reaches capture within seconds) and between shares. */
+export const CLOCK_LIVE_MS=3000;
+export const CLOCK_IDLE_MS=15000;
+/** How long an unpaused share waits for its editor to be re-verified before it offers to reconnect it. */
+export const RECONNECT_OFFER_MS=15000;
 /**
  * The stopped share whose footage is still being saved (`{item,done}`), in any gate of this document. A new share sends
  * no begin until it is done: the broker holds one capture lease per attempt and OS session, so a new phase would refuse
@@ -103,7 +110,7 @@ async function retry(operation, codes, times=2, live=()=>true) {
 }
 
 export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare, computerProvider, settleMs=STOP_SETTLE_MS,
-    saveCeilingMs=STOP_SAVE_CEILING_MS, frameMs=FRESH_FRAME_MS}) {
+    saveCeilingMs=STOP_SAVE_CEILING_MS, frameMs=FRESH_FRAME_MS, clockLiveMs=CLOCK_LIVE_MS, clockIdleMs=CLOCK_IDLE_MS, reconnectMs=RECONNECT_OFFER_MS}) {
     const win=globalThis.window, repo=project?.repoUrl;
     if(!win || !assignmentOsOrigin(win.location.origin)){queueMicrotask(open);return null;}
     const address=new URL(win.location.href);
@@ -114,32 +121,112 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
 
     const owner=actor(), ui=buildGate(body);
     // `shown`: the ended share whose result the gate is showing; a late save result refreshes only its own screen.
-    let disposePromise, disposed=false, locked=true, picker, activity, indicator, shown;
+    let disposePromise, disposed=false, locked=true, picker, activity, indicator, shown, clockTimer, over=false;
+    // The server's clock for this assignment. It outlives a share: a stop, a close or a restart never touches it.
+    const countdown=createCountdown();
     const isOwner=()=>Boolean(owner) && actor()===owner;
     const isHere=()=>!disposed && current===gate && isOwner() && win===win.top;
     const samePhase=item=>isHere() && activity===item && !item.ended;
     // The exact tab is still shared. A muted track is still this tab; it only presents no new frames.
     const sameTab=item=>samePhase(item) && Boolean(item.source?.matches());
     const recordingSource=item=>sameTab(item) && !item.paused && !item.source.stream.getVideoTracks()[0].muted;
+    // While the server's clock is paused (`item.gated`) the share, the transport and the editor's mint stay alive. A muted
+    // track is expected then (the tab shows the computer reconnecting), so it does not block the mint.
+    const mintSource=item=>item.gated?sameTab(item):recordingSource(item);
     function lockedView(title,message) {
         locked=true;park(true);ui.clear();ui.set(title,message);
     }
-    function showIndicator(message) {
-        if(!indicator){
-            indicator=document.createElement('button');indicator.type='button';
-            indicator.className='ezil-assignment-recording-status';
-            indicator.setAttribute('aria-label','Stop sharing this assignment tab');
-            indicator.title='Stop sharing this assignment tab';
-            indicator.onclick=event=>{if(event.isTrusted && activity)void finish(activity,'sharing_stopped',{cause:'indicator_stop'});};
-            document.body.append(indicator);
-        }
-        indicator.textContent=message+' · Stop';
+    /** The corner control, in `state`. It is created with the share and kept after a stop while the clock still counts. */
+    function showIndicator(state) {
+        if(!indicator)indicator=createStatusControl({win,countdown,
+            onStop:()=>{if(activity)void finish(activity,'sharing_stopped',{cause:'indicator_stop'});}});
+        indicator.set(state);
     }
     function removeIndicator(){indicator?.remove();indicator=null;}
+    /** A share ended: keep the corner control (stopped, or time ended) while the server's clock is running, else drop it. */
+    function endIndicator(reason){
+        if(reason==='submitted' || !countdown.started())removeIndicator();
+        else showIndicator(reason==='timeout'?'ended':'stopped');
+    }
+    /**
+     * A server report of the clock: the shell route's `clock` action, or the begin / confirm / status answers that carry
+     * a deadline. Redraws the control, moves the recorder's deadline, re-arms the deadline timer and applies the server's
+     * pause. Only the server starts, pauses or extends the clock: nothing local (checkout, a resize, progress) does.
+     */
+    function applyClock(report){
+        if(disposed || !countdown.sync(report))return;
+        const item=activity&&!activity.ended&&isHere()?activity:null;
+        if(item){
+            item.recorder?.setDeadline(countdown.serverDeadlineAt());
+            armDeadline(item);
+            applyGate(item);
+        }else if(!indicator && !over && countdown.started())showIndicator(countdown.state()==='ended'?'ended':'idle');
+        indicator?.sync();
+    }
+    const syncClock=(item,report)=>{if(samePhase(item))applyClock(report);};
+    async function refreshClock(){
+        if(disposed)return;
+        try{applyClock(await checkAssignmentClock(attemptId));}catch{/* the next poll asks again; the shown time keeps counting */}
+    }
+    // Rehydrated after a refresh (once the assignment is verified), while a share is live (so a pause or a start reaches
+    // the capture within seconds) and slowly after a share stops, until the time is over.
+    function scheduleClock(){
+        clearTimeout(clockTimer);
+        if(disposed || over || countdown.state()==='ended')return;
+        clockTimer=setTimeout(async()=>{await refreshClock();scheduleClock();},activity&&!activity.ended?clockLiveMs:clockIdleMs);
+    }
+    function armDeadline(item){
+        clearTimeout(item.deadline);
+        // A server-stopped clock has no deadline to meet; the resume report re-arms it.
+        if(countdown.state()==='paused' || countdown.deadlineAt()===null)return;
+        item.deadline=setTimeout(()=>void deadlineReached(item),Math.max(0,countdown.deadlineAt()-Date.now()));
+    }
+    /** The local copy of the deadline passed: ask the server first, since it may have given back time it stopped. */
+    async function deadlineReached(item){
+        if(!samePhase(item))return;
+        await refreshClock();
+        if(!samePhase(item))return;
+        if(countdown.state()==='paused' || countdown.remaining()>1500){armDeadline(item);return;}
+        void finish(item,'timeout',{at:new Date(countdown.serverDeadlineAt()).toISOString(),cause:'deadline'});
+    }
+    /**
+     * The server's pause gates capture. Paused: recording stops (the clip so far is sealed and kept), the editor is
+     * covered and the share, the transport and the capture lease stay. Not paused any more: capture resumes once the
+     * editor has been re-verified on the assigned checkout; the pause stays a gap on the real timeline.
+     */
+    function applyGate(item){
+        const paused=countdown.state()==='paused';
+        if(paused&&!item.gated){
+            item.gated=true;item.reverified=false;
+            clearTimeout(item.editorTimeout);clearTimeout(item.reconnect);
+            item.recorder?.hold();
+            showIndicator('paused');
+            lockedView('Assignment time paused',
+                'Universe paused your assignment time and recording for a system upgrade. Keep this EZiL OS tab shared: your editor opens and recording resumes when it is available again. '
+                +'If sharing ends meanwhile, share this tab again to resume. Saved footage and your assignment attempt are kept.');
+        }else if(paused&&item.gated)showIndicator('paused');
+        else if(!paused&&item.gated)resumeGated(item);
+    }
+    function resumeGated(item){
+        if(!sameTab(item))return;
+        if(!item.reverified){
+            if(item.reconnect)return;
+            lockedView('Waiting for your editor','Assignment time is running again. Recording resumes once your editor is checked on your assigned checkout…');
+            // Nothing re-opens an editor that was never disturbed: offer the same open the editor itself uses.
+            item.reconnect=setTimeout(()=>{if(samePhase(item)&&item.gated&&!item.reverified)ui.action('Reconnect editor',()=>{if(item.gated&&!item.reverified)open();});},reconnectMs);
+            return;
+        }
+        clearTimeout(item.reconnect);item.reconnect=null;
+        item.gated=false;item.reverified=false;
+        if(item.recorder?.held()){item.releasing=true;item.recorder.release();}
+        else{showIndicator('recording');revealEditor(item);}
+    }
     function check(item){if(!sameTab(item))throw failure('source_lost');}
     function revealEditor(item){
         if(!recordingSource(item)||!item.editorFrame?.isConnected)return;
         locked=false;park(false);ui.reveal();item.editor?.resolve();
+        // The first usable editor is what starts the server's clock: ask for it now rather than at the next poll.
+        void refreshClock();
     }
     function pauseCapture(item){
         if(!sameTab(item)||item.paused)return;
@@ -147,7 +234,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         const promise=new Promise(done=>{resolve=done;});
         item.paused={promise,resolve};
         lockedView('Recording paused','Waiting for a fresh frame from this EZiL OS tab…');
-        showIndicator('Recording paused');
+        showIndicator('interrupted');
     }
     function clearPause(item){
         item.paused?.resolve();
@@ -156,7 +243,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     function resumeCapture(item){
         if(!sameTab(item)||!item.paused)return;
         clearPause(item);
-        showIndicator('Recording');
+        showIndicator('recording');
         if(item.editorFrame?.isConnected)revealEditor(item);
         else if(item.editorFrame)void finish(item,'connection_lost',{cause:'assigned_checkout_unverified',
             message:causeMessage('assigned_checkout_unverified',null,item)});
@@ -191,6 +278,8 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             }
             picker??=currentTabPicker(win);
             displayConsent();
+            // A refresh loses the page's state, not the server's clock: show the time left before sharing again.
+            void refreshClock();scheduleClock();
         }catch(e){
             if(!isHere())return;
             if(e.code==='identity_refresh_required'){showSignIn();return;}
@@ -224,7 +313,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             });
             track.addEventListener('capturehandlechange',()=>{if(!sameTab(item))void finish(item,'connection_lost',{cause:'capture_handle_changed'});});
             item.watch=setInterval(()=>{if(!sameTab(item))void finish(item,'connection_lost',{cause:'source_lost'});},1100);
-            showIndicator('Sharing');lockedView('Preparing assignment','Verifying the assigned repository…');
+            showIndicator('sharing');lockedView('Preparing assignment','Verifying the assigned repository…');
             item.stage='prepare';item.prepareCtl=new AbortController();
             const result=await retry(()=>prepare(attemptId,{signal:item.prepareCtl.signal}),['sandbox_starting','media_unavailable','assignment_open_unavailable'],3,live);
             check(item);
@@ -243,6 +332,9 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             }
             item.stage='begin';
             item.transport=createAssignmentVideoTransport({attemptId,repoOpenProof:item.proof,captureSessionId:item.id,consentVersion:4,
+                onClock:report=>syncClock(item,report),paused:()=>countdown.state()==='paused',
+                // The timeline is the real wall clock: time the server gave back after a pause lets a clip end past the first hour.
+                maxEndMs:()=>countdown.startedAtMs()!==null&&countdown.serverDeadlineAt()!==null?countdown.serverDeadlineAt()-countdown.startedAtMs():0,
                 onStop:(why,at)=>void finish(item,why==='submitted'||why==='timeout'?why:'connection_lost',{at,cause:'universe_'+why})});
             // A stop while this is in flight still checkpoints the phase it opens once it lands (`save`), never orphans it.
             item.beginning=retry(()=>item.transport.begin(),['media_unavailable'],2,live);
@@ -265,7 +357,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             const offset=Number.isFinite(serverNow)?serverNow-Date.now():0;
             if(!Number.isFinite(startAt)||!Number.isFinite(deadline)||deadline<=Date.now()+offset||deadline<=startAt||deadline-startAt>3600000)
                 throw failure('recording_closed');
-            item.deadline=setTimeout(()=>void finish(item,'timeout',{at:ack.deadlineAt,cause:'deadline'}),Math.max(0,deadline-Date.now()-offset));
+            syncClock(item,ack);
             item.stage='record';
             item.recorder=await encodeTabSegments({win,stream:source.stream,matches:()=>sameTab(item),windowStart:startAt,deadline,
                 signal:item.captureCtl.signal,
@@ -274,14 +366,18 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
                 onFault:(code)=>{
                     const cause=code||'recorder_fault';
                     if(cause==='deadline'){
-                        void finish(item,'timeout',{at:ack.deadlineAt,cause});
+                        void finish(item,'timeout',{at:new Date(countdown.serverDeadlineAt()).toISOString(),cause});
                         return;
                     }
                     if(samePhase(item))report('record',cause,item);
                     void finish(item,'connection_lost',{cause,message:causeMessage(cause,null,item)});
                 },
                 onPause:()=>pauseCapture(item),
-                onResume:()=>resumeCapture(item),
+                onResume:()=>{
+                    // The recorder is recording again after a system hold: only now does the editor come back.
+                    if(item.releasing){item.releasing=false;showIndicator('recording');revealEditor(item);return;}
+                    resumeCapture(item);
+                },
                 onAwaitFrame:()=>{if(samePhase(item))ui.set('Opening assigned editor','Recording is active. Checking your workspace…');}});
             check(item);
             item.stage='confirm';
@@ -294,7 +390,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             while(item.paused)await item.paused.promise;
             check(item);
             item.stage='open';
-            item.allowMint=true;showIndicator('Recording');
+            item.allowMint=true;showIndicator('recording');
             const editor=new Promise((resolve,reject)=>{item.editor={resolve,reject};});
             item.editorTimeout=setTimeout(()=>item.editor?.reject(failure('assigned_checkout_unverified')),80000);
             open();await editor;
@@ -307,11 +403,19 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         }finally{clearTimeout(item.editorTimeout);item.editor=null;}
     }
     function confirmed(frame,frameUrl,actualRoot){
-        const item=activity;if(!item?.allowMint||!item.editor||!sameTab(item)||!frame.isConnected)return;
+        const item=activity;
+        // `item.gated`: a re-open after the server's pause, once the first editor is long open (`item.editor` is gone).
+        if(!item?.allowMint||!(item.editor||item.gated)||!sameTab(item)||!frame.isConnected)return;
         const url=new URL(frameUrl), folders=[item.meta.workspaceFolder,item.meta.checkoutFolder];
-        if(!folders.includes(actualRoot)||!folders.includes(url.searchParams.get('folder'))){item.editor.reject(failure('assigned_checkout_unverified'));return;}
+        if(!folders.includes(actualRoot)||!folders.includes(url.searchParams.get('folder'))){
+            if(item.editor)item.editor.reject(failure('assigned_checkout_unverified'));
+            else void finish(item,'connection_lost',{cause:'assigned_checkout_unverified',message:causeMessage('assigned_checkout_unverified',null,item)});
+            return;
+        }
         item.editorFrame=frame;
-        revealEditor(item);
+        // Re-verified on the assigned checkout. While the server's clock is paused the gate stays; once it allows, capture resumes.
+        if(item.gated){item.reverified=true;if(countdown.state()!=='paused')resumeGated(item);}
+        else revealEditor(item);
     }
     /** The gate's screen for an ended share. `saved` null: its footage is still being saved, so nothing is claimed yet. */
     function showEnded(item,reason,saved){
@@ -372,7 +476,12 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         clearPause(item);
         item.editor?.reject(failure('workspace_locked'));
         item.source?.stream.getTracks().forEach(t=>t.stop());
-        removeIndicator();
+        clearTimeout(item.reconnect);item.gated=false;item.reverified=false;item.releasing=false;
+        // The corner control stays while the server's clock counts: a stop ends the share, never the time.
+        endIndicator(reason);
+        // The assignment closed (submitted, or its time ended): nothing is left to ask the server about.
+        if(reason==='submitted'||reason==='timeout'){over=true;clearTimeout(clockTimer);}
+        else{void refreshClock();scheduleClock();}
         if(!item.transport){
             // Nothing reached Universe: there is no capture phase to checkpoint and nothing was recorded.
             activity=null;
@@ -398,6 +507,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         disposed=true;const item=activity;
         win.removeEventListener('pagehide',pageHide);
         const ended=item?finish(item,'connection_lost',{cause:'window_closed'}):Promise.resolve();
+        clearTimeout(clockTimer);
         picker?.dispose();removeIndicator();ui.remove();if(current===gate)current=null;
         disposePromise=Promise.all([ended,saving?.done]).then(()=>{});
         return disposePromise;
@@ -413,7 +523,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         item.editor.reject(Object.assign(failure(res?.errorCode||'unknown'),{reason:res?.reason,correlationId:res?.correlationId}));
     }
     const gate={repo,locked:()=>locked,confirm:confirmed,close,fail:failOpen,
-        access:()=>activity?.allowMint&&recordingSource(activity)?{attemptId,phase:'open',repoOpenProof:activity.proof,captureSessionId:activity.id}:null};
+        access:()=>activity?.allowMint&&mintSource(activity)?{attemptId,phase:'open',repoOpenProof:activity.proof,captureSessionId:activity.id}:null};
     current=gate;
     if(!attemptId||!isOwner()||win!==win.top){
         lockedView('Open your assigned OS tab','Use the assignment link in Universe to open the verified workspace in its own OS tab.');

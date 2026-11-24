@@ -45,7 +45,8 @@ test('embedded OS never activates even a valid canonical assignment',async(t)=>{
 test('the native Stop during a delayed private checkout cannot later start media or release Code',async(t)=>{
     const requests=[],elements=[];
     t.mock.method(globalThis,'fetch',async(_path,options)=>{
-        const body=JSON.parse(options.body);requests.push(body.action);
+        // The server clock is asked for on its own schedule (`clock`); `requests` is the recording protocol only.
+        const body=JSON.parse(options.body);if(body.action!=='clock')requests.push(body.action);
         return Response.json({status:'eligible',attemptId:id,repositoryUrl:repo,expiresAt:new Date(Date.now()+60000).toISOString()});
     });
     let handle,resolveCheckout,releasePreparing,opened=0;
