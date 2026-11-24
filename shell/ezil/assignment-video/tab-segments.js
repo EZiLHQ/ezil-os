@@ -63,6 +63,24 @@ export function freshFrame(video, track, ms, onWaiting, timers = globalThis, sig
     });
 }
 
+/** Arm the frame callback before playback can consume the first picture. A progress paint on the captured tab can
+ * be what makes Chromium deliver that picture and settle play(). Both share one deadline and cancel together. */
+async function startFrame(video, track, ms, onWaiting, timers, signal) {
+    const waiting = new AbortController();
+    const cancel = () => waiting.abort();
+    if (signal?.aborted) cancel();
+    signal?.addEventListener('abort', cancel, {once:true});
+    try {
+        await Promise.all([
+            playWithin(video, ms, timers, waiting.signal),
+            freshFrame(video, track, ms, onWaiting, timers, waiting.signal),
+        ]);
+    } finally {
+        waiting.abort();
+        signal?.removeEventListener('abort', cancel);
+    }
+}
+
 export async function encodeTabSegments({win, stream, matches, windowStart, deadline, upload, cutoff,
     onFault, onFrame, onAwaitFrame, onPause, onResume, signal, recoveryMs=4500, firstSequence=0, clockOffset=0}) {
     const track = stream.getVideoTracks()[0];
@@ -83,8 +101,7 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
     const canvas = win.document.createElement('canvas');
     const ctx = canvas.getContext('2d', {alpha:false});
     try {
-        await playWithin(video, 4500, win, signal);
-        await freshFrame(video, track, 4500, onAwaitFrame, win, signal);
+        await startFrame(video, track, 4500, onAwaitFrame, win, signal);
         if (!matches() || !ctx || !video.videoWidth || !video.videoHeight) throw new Error('source_lost');
         const scale = Math.min(1, 1920/video.videoWidth, 1080/video.videoHeight);
         canvas.width = Math.max(2, 2*Math.floor(video.videoWidth*scale/2));
@@ -281,8 +298,7 @@ export async function seedFrame(stream,valid,onWaiting,ms=8000,signal) {
     video.srcObject=stream; video.muted=true; video.playsInline=true;
     let encoder;
     try {
-        await playWithin(video,ms,globalThis,signal);
-        await freshFrame(video,stream.getVideoTracks()[0],ms,onWaiting,globalThis,signal);
+        await startFrame(video,stream.getVideoTracks()[0],ms,onWaiting,globalThis,signal);
         if (!valid() || !video.videoWidth || !video.videoHeight) throw new Error('source_lost');
         const scale=Math.min(1,640/video.videoWidth,480/video.videoHeight);
         const canvas=document.createElement('canvas');

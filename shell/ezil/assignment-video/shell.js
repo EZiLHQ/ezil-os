@@ -379,8 +379,10 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             item.expected=item.grant.nextSequence;
             item.stage='seed';
             const bytes=await seedFrame(source.stream,()=>sameTab(item),
-                ()=>{if(samePhase(item))ui.set('Checking recording','Saving the first frame before opening your editor…');},frameMs);
+                ()=>{if(samePhase(item)&&!item.gated)ui.set('Checking recording','Waiting for a fresh frame from this OS tab…');},
+                frameMs,item.captureCtl.signal);
             check(item);
+            if(!item.gated)ui.set('Checking recording','Saving the first frame before opening your editor…');
             const upload=part=>retry(()=>item.transport.upload(part),['upload_failed','media_unavailable'],2);
             const ack=await upload({sequence:item.expected,startMs:0,endMs:1,mimeType:'video/webm',bytes});
             check(item);
@@ -419,7 +421,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
                     if(item.releasing){item.releasing=false;showIndicator('recording');revealEditor(item);return;}
                     resumeCapture(item);
                 },
-                onAwaitFrame:()=>{if(samePhase(item))ui.set('Opening assigned editor','Recording is active. Checking your workspace…');}});
+                onAwaitFrame:()=>{if(samePhase(item)&&!item.gated)ui.set('Opening assigned editor','First frame saved. Checking your workspace…');}});
             if(item.gated)item.recorder.hold(countdown.serverPausedAt());
             check(item);
             item.stage='confirm';

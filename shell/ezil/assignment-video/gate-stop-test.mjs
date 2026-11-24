@@ -124,9 +124,10 @@ function harness(t,{prepare,control={},video,media=false,settleMs=40,saveCeiling
     return {gate,calls,tracks,opened:()=>opened,panel:()=>elements.find(e=>e.tag==='section'),
         title:()=>elements.filter(e=>e.tag==='h2').at(-1)?.textContent,
         status:()=>elements.filter(e=>e.tag==='p').at(-1)?.textContent,
-        buttons,
+        buttons,clock:()=>elements.filter(e=>e.role==='timer').at(-1)?.textContent,
         async share(){const count=buttons().length;await waitFor(()=>buttons().length>0);buttons().at(-1).onclick({isTrusted:true});return count;},
         stop(){tracks.at(-1).listeners.ended();},
+        stopFromControl(){elements.filter(e=>e.textContent==='Stop'&&!e.hidden).at(-1).onclick({isTrusted:true});},
     };
 }
 const gateEvents=since=>recentEvents().slice(since).filter(e=>e.site.startsWith('ezil-os:assignment#'));
@@ -171,7 +172,7 @@ test('a stale retry of an ended share never prepares again and never aborts the 
     }finally{await h.gate.close();}
 });
 
-test('a stop while the seed frame hangs hands the gate back within the bound and checkpoints once the seed step settles', async t=>{
+test('a stop aborts a pending seed and checkpoints the begun phase without waiting for playback', async t=>{
     let rejectPlay;
     const video=()=>Object.assign(new Element(),{muted:false,playsInline:false,srcObject:null,pause(){},requestVideoFrameCallback(){},
         play:()=>new Promise((_,reject)=>{rejectPlay=reject;})});
@@ -187,13 +188,11 @@ test('a stop while the seed frame hangs hands the gate back within the bound and
         assert.ok(Date.now()-stoppedAt<1000,'consent returns within the settle bound, not when the seed frame gives up');
         assert.equal(h.status(),'Sharing stopped. Share this OS tab again to open your assignment.'+CONSENT_TAIL,
             'no footage is claimed: no segment was confirmed');
-        assert.equal(h.calls.includes('checkpoint'),false,'the phase waits for its seed step (bounded by its own 8 s frame budget)');
-        rejectPlay(new Error('aborted'));
         await waitFor(()=>h.calls.includes('checkpoint'));await tick(10);
         assert.equal(h.calls.filter(c=>c==='checkpoint').length,1);assert.equal(h.opened(),0);
         const finish=gateEvents(since).filter(e=>e.site==='ezil-os:assignment#finish');
         assert.equal(finish.length,1,'one finish report, once the footage is settled');
-        assert.match(finish[0].detail,/stage:seed;reason:sharing_stopped;began:1;accepted:0;saved:1;late:1/);
+        assert.match(finish[0].detail,/stage:seed;reason:sharing_stopped;began:1;accepted:0;saved:1;late:0/);
     }finally{rejectPlay?.(new Error('aborted'));await h.gate.close();}
 });
 
@@ -231,6 +230,59 @@ async function recording(h){
     await waitFor(()=>h.opened()===1,3000);
 }
 const index=(calls,call)=>{const at=calls.indexOf(call);assert.notEqual(at,-1,call+' was sent');return at;};
+
+test('a second share paints progress before playback and proves its own fresh frame after explicit Stop', async t=>{
+    const options=recorded(), sessions=[];
+    const begin=options.begin, confirm=options.confirm;
+    options.begin=async body=>{
+        sessions.push(body.captureSessionId);
+        const result=await begin(body).json();
+        return Response.json({...result,nextSequence:sessions.length===1?0:10});
+    };
+    options.confirm=async body=>{
+        if(body.sequence!==10)return confirm(body);
+        return Response.json({...await confirm({...body,sequence:0}).json(),sequence:10,nextSequence:11});
+    };
+    const now=Date.now();
+    const clock={serverNow:new Date(now).toISOString(),startedAt:new Date(now-1200000).toISOString(),
+        deadlineAt:new Date(now+1635000).toISOString(),pausedAt:null,pauseReason:null,remainingMs:null,revision:1};
+    options.clock=options['editor-ready']=()=>Response.json(clock);
+    let videos=0, pulse, playback;
+    const video=()=>{
+        const element=mediaElement.video();
+        if(++videos!==3)return element;
+        element.play=()=>new Promise(resolve=>{playback=resolve;});
+        element.requestVideoFrameCallback=callback=>{pulse=callback;return 1;};
+        return element;
+    };
+    const h=harness(t,{prepare:async()=>checkout,media:true,video,control:options});
+    const editorUrl='https://fixture.test/?'+new URLSearchParams({folder:checkout.repository.checkoutFolder});
+    try{
+        await recording(h);
+        h.gate.confirm(new Element(),editorUrl,checkout.repository.checkoutFolder);
+        await waitFor(()=>!h.gate.locked());
+        assert.match(h.clock(),/^27:/);
+        h.stopFromControl();
+        await waitFor(()=>h.calls.includes('checkpoint') && h.title()==='Record this assignment tab');
+        assert.match(h.clock(),/^27:/,'explicit Stop keeps the original clock running');
+        await h.share();
+        await waitFor(()=>h.status()==='Waiting for a fresh frame from this OS tab…' && typeof playback==='function',700);
+        assert.equal(typeof pulse,'function','the callback was armed while play is pending');
+        assert.equal(h.gate.locked(),true);
+        assert.equal(h.gate.access(),null);
+        assert.equal(h.calls.includes('prepare:10'),false);
+        // The refreshed tab delivers its one frame on the progress paint, before play settles.
+        pulse();
+        playback();
+        await waitFor(()=>h.opened()===2);
+        assert.equal(h.calls.includes('confirm:10'),true,'fresh proof is saved at the assigned resume sequence');
+        assert.equal(h.gate.access().captureSessionId,sessions[1]);
+        assert.notEqual(sessions[0],sessions[1]);
+        h.gate.confirm(new Element(),editorUrl,checkout.repository.checkoutFolder);
+        await waitFor(()=>!h.gate.locked());
+        assert.match(h.clock(),/^27:/,'new capture never creates a new assignment clock');
+    }finally{playback?.();await h.gate.close();}
+});
 
 test('a stop confirms the in-flight and the final segment before the checkpoint, even when they outlast the screen bound', async t=>{
     // Review repro: an 11 s segment still uploading and the final one still to seal, on an uplink slower than settleMs.
