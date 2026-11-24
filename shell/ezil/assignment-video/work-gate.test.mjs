@@ -81,18 +81,29 @@ test('the native Stop during a delayed private checkout cannot later start media
 
 
 test('verified production placement gates the picker and ordinary Code is unaffected',async t=>{
-    t.mock.method(globalThis,'fetch',async()=>Response.json({status:'eligible',attemptId:id,repositoryUrl:repo,expiresAt:new Date(Date.now()+60000).toISOString()}));
-    for (const provider of ['aws-ec2',null]) {
+    const upgradedWorkspaceId='a'.repeat(64),upgradeOperationId='9bb4a746-14a6-4dec-9f3e-fbb971356ff2';
+    let upgrade={};
+    t.mock.method(globalThis,'fetch',async()=>Response.json({status:'eligible',attemptId:id,repositoryUrl:repo,
+        expiresAt:new Date(Date.now()+60000).toISOString(),...upgrade}));
+    for (const [provider, proof, consent] of [
+        ['aws-ec2',{},false],
+        ['aws-ec2',{upgradedWorkspaceId},false],
+        [null,{upgradedWorkspaceId,upgradeOperationId},false],
+        ['aws-ec2',{upgradedWorkspaceId,upgradeOperationId},true],
+    ]) {
+        upgrade=proof;
         const texts=[],doc={createElement(){const e=new Element();Object.defineProperty(e,'textContent',{set:v=>texts.push(v)});return e;}};
         const win={location:new URL('https://os.ezil.work/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id),
-            addEventListener(){},removeEventListener(){},document:doc};
+            addEventListener(){},removeEventListener(){},document:doc,crypto:globalThis.crypto,isSecureContext:true,
+            navigator:{mediaDevices:{getDisplayMedia(){},setCaptureHandleConfig(){}}},VideoFrame:class{},VideoEncoder:class{},
+            MediaStreamTrack:class{getCaptureHandle(){}}};
         win.top=win;Object.assign(globalThis,{window:win,document:doc});
         let opens=0,prepares=0;
         const gate=openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>'owner',computerId:'self',body:new Element(),
             park(){},open(){opens++;},prepare(){prepares++;},computerProvider:async()=>provider});
         await new Promise(r=>setImmediate(r));
-        assert.ok(texts.includes('Choose an assignment-ready computer'));
-        assert.ok(!texts.includes('Share this OS tab and open assignment'));assert.equal(gate.locked(),true);
+        assert.equal(texts.includes('Choose an assignment-ready computer'),!consent);
+        assert.equal(texts.includes('Share this OS tab and open assignment'),consent);assert.equal(gate.locked(),true);
         assert.equal(opens,0);assert.equal(prepares,0);await gate.close();
     }
 });
