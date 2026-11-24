@@ -113,6 +113,34 @@ test('the local expiry waits while the server clock is paused and ends the share
     } finally { soon.dispose(); }
 });
 
+test('editor-ready sends the attempt, the phase and the open proof, never a time, and returns the canonical clock', async () => {
+    const report = {revision: 3, serverNow: iso(Date.now()), startedAt: iso(Date.now()), deadlineAt: iso(Date.now() + 60 * MIN), pausedAt: null, pauseReason: null, remainingMs: null};
+    const {t, s} = await begun({}, {});
+    const inner = s.fetcher;
+    const t2 = createAssignmentVideoTransport({attemptId: id, repoOpenProof: proof, consentVersion: 4, captureSessionId: phase, pollMs: 100000,
+        fetcher: async (u, o) => JSON.parse(o.body).action === 'editor-ready' ? (s.calls.push(JSON.parse(o.body)), Response.json(report)) : inner(u, o)});
+    try {
+        await assert.rejects(t2.editorReady(), {code: 'recording_unavailable'}, 'not before the share began');
+        await t2.begin();
+        assert.deepEqual(await t2.editorReady(), report);
+        const body = s.calls.findLast(c => c.action === 'editor-ready');
+        assert.deepEqual(body, {action: 'editor-ready', attemptId: id, captureSessionId: phase, repoOpenProof: proof});
+    } finally { t.dispose(); t2.dispose(); }
+});
+
+test('an editor-ready answer without a revision is refused', async () => {
+    const t = createAssignmentVideoTransport({attemptId: id, repoOpenProof: proof, consentVersion: 4, captureSessionId: phase, pollMs: 100000,
+        fetcher: async (u, o) => {
+            const body = JSON.parse(o.body);
+            if (body.action === 'editor-ready') return Response.json({serverNow: iso(Date.now())});
+            return server().fetcher(u, o);
+        }});
+    try {
+        await t.begin();
+        await assert.rejects(t.editorReady(), {code: 'recording_unavailable'});
+    } finally { t.dispose(); }
+});
+
 test('a clip may end past the first hour only as far as the server deadline allows', async () => {
     let span = 0;
     const {t} = await begun({maxEndMs: () => span}, {});
