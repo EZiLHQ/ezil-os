@@ -167,6 +167,22 @@ class GuardTests(unittest.TestCase):
         outcome, _ = self.run_guard({}, 27, source='env', running='26', environment=production)
         self.assertTrue(outcome.startswith('Running app cannot read the live release registry.'), outcome)
 
+    def test_native_registry_enforces_capacity_before_install_in_both_environments(self):
+        deployments = registry(45)
+        for environment in (self.SANITIZED, self.PRODUCTION):
+            for raw in (deployments, json.dumps(deployments)):
+                with self.subTest(environment=environment, shape=type(raw)):
+                    self.assertIsNone(self.run_guard({'work.ezil.registry-capacity': '45'}, 45,
+                                                     raw=raw, environment=environment)[0])
+                    self.assertEqual(self.run_guard({'work.ezil.registry-capacity': '44'}, 45,
+                                                    raw=raw, environment=environment)[0],
+                                     'Image cannot read the live release registry; refused before install')
+
+    def test_invalid_native_registry_does_not_bypass_capacity_check(self):
+        for raw in ([], True, 7, {'ap-south-1': []}, {'ap-south-1': {'releases': {}}}):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.run_guard({}, 1, raw=raw)[0], 'Invalid release registry')
+
     def test_unreviewed_environment_pair_refuses_before_reading(self):
         for pair in ({'EZIL_REGISTRY_SECRET_ID': 'ezil-os/production/app', 'EZIL_REGISTRY_LEGACY': '32'},
                      {'EZIL_REGISTRY_SECRET_ID': 'ezil-os/billing-staging/app', 'EZIL_REGISTRY_LEGACY': '26'},

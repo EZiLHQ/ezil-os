@@ -112,7 +112,8 @@ if source == "secret":
     if result.returncode:
         raise SystemExit("Registry capacity guard could not read the app secret")
     try:
-        raw = json.loads(json.loads(result.stdout)["SecretString"]).get("EZIL_AWS_LIFECYCLE_DEPLOYMENTS")
+        secret = json.loads(json.loads(result.stdout)["SecretString"])
+        raw = secret.get("EZIL_AWS_LIFECYCLE_DEPLOYMENTS", {})
     except (ValueError, KeyError, TypeError, AttributeError):
         raise SystemExit("Registry capacity guard could not read the app secret") from None
 else:
@@ -124,12 +125,13 @@ else:
         raise SystemExit("Invalid rendered environment") from None
     if len(lines) > 1:
         raise SystemExit("Invalid rendered environment")
-    raw = lines[0] if lines else None
+    raw = lines[0] if lines else {}
 try:
-    deployments = json.loads(raw) if isinstance(raw, str) else {}
-except ValueError:
+    deployments = json.loads(raw) if isinstance(raw, str) else raw
+except (ValueError, RecursionError):
     raise SystemExit("Invalid release registry") from None
-releases = (deployments.get("ap-south-1") or {}).get("releases", []) if isinstance(deployments, dict) else None
+region = deployments.get("ap-south-1", {}) if isinstance(deployments, dict) else None
+releases = region.get("releases", []) if isinstance(region, dict) else None
 if not isinstance(releases, list):
     raise SystemExit("Invalid release registry")
 if len(releases) <= LEGACY:

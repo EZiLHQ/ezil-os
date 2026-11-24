@@ -113,6 +113,27 @@ class RenderEnvTests(unittest.TestCase):
             with self.subTest(key=unknown), self.assertRaisesRegex(renderer.RenderError, "Unknown key refused"):
                 renderer.validate({**self.values, unknown: raw})
 
+    def test_native_lifecycle_deployments_render_as_the_same_single_line_as_legacy_json(self):
+        key = renderer.LIFECYCLE_DEPLOYMENTS_KEY
+        deployments = {"ap-south-1": {"releases": [{"label": 'synthetic-é-$-#-"\n'}]}}
+        raw = json.dumps(deployments, separators=(",", ":"))
+        native = {**self.values, key: deployments}
+        self.assertEqual(renderer.validate(native), {**self.values, key: raw})
+        self.assertIs(native[key], deployments)
+        self.assertEqual(self.render_fixture(native), self.render_fixture({**self.values, key: raw}))
+
+    def test_native_lifecycle_form_is_narrow_and_keeps_environment_checks(self):
+        key = renderer.LIFECYCLE_DEPLOYMENTS_KEY
+        for value in ([{}], None, True, 12):
+            with self.subTest(value=value), self.assertRaises(renderer.RenderError):
+                renderer.validate({**self.values, key: value})
+        with self.assertRaisesRegex(renderer.RenderError, "Expected nonempty strings"):
+            renderer.validate({**self.values, "EZIL_AWS_IDENTITY_CERTS": {}})
+        with self.assertRaisesRegex(renderer.RenderError, "Invalid lifecycle deployments JSON"):
+            renderer.validate({**self.values, key: {"ap-south-1": {"releases": [float("nan")]}}})
+        with self.assertRaisesRegex(renderer.RenderError, "Staging refuses production"):
+            renderer.validate({**self.values, key: {"ap-south-1": {"origin": renderer.PRODUCTION_API_URL}}})
+
     def test_standalone_repo_open_flag_is_optional_and_forwarded_exactly(self):
         # Both Git routes (app/src/server/git/staging.ts awsStandaloneGitEnabled) read this exact key; absent means off.
         key = "AWS_STANDALONE_REPO_OPEN_ENABLED"
@@ -281,6 +302,15 @@ class ProductionEnvironmentTests(unittest.TestCase):
         self.assertEqual(renderer.validate(dict(self.values), "production"), self.values)
         renderer.validate({**self.values, "STRIPE_SECRET": "rk_live_synthetic",
                            "SUPABASE_DATABASE_URL": PRODUCTION_DB.replace("postgres://", "postgresql://")}, "production")
+
+    def test_production_accepts_native_lifecycle_deployments_without_weakening_its_pins(self):
+        key = renderer.LIFECYCLE_DEPLOYMENTS_KEY
+        deployments = {"ap-south-1": {"releases": []}}
+        raw = json.dumps(deployments, separators=(",", ":"))
+        self.assertEqual(renderer.validate({**self.values, key: deployments}, "production"),
+                         {**self.values, key: raw})
+        self.assertRefused({**self.values, key: {"ap-south-1": {"origin": renderer.STAGING_FUNDING_URL}}},
+                           "Production refuses staging")
 
     def test_production_pins_api_url(self):
         for url in ("https://13-206-183-230.sslip.io", "https://db.ezil.work/", "http://db.ezil.work"):

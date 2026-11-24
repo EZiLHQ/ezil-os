@@ -60,7 +60,14 @@ and the ordered production runbook at the end of `INFRASTRUCTURE.md`.
    `https://os-staging.ezil.work`. Preserve existing production allowlist entries.
 6. Populate the Secrets Manager JSON with PREVIEW and Stripe test credentials.
    `AUTH0_SECRET_ID` is the Auth0 client secret value consumed by existing code,
-   despite its name. Supply all required names below as nonempty JSON strings.
+   despite its name. Supply all other values as nonempty JSON strings with no
+   surrounding whitespace. `EZIL_AWS_LIFECYCLE_DEPLOYMENTS` accepts a JSON object
+   keyed by region or its legacy JSON string form. The shared staging and
+   production installer checks either form, and `render-env.py` renders an object
+   as one compact JSON string in `app.env` for the existing Node reader.
+   Lifecycle writers preserve the stored form. Use the string form until every
+   active and rollback installer, renderer, and other secret consumer used
+   for that environment has been verified against the object form.
 
 Required JSON key names (values deliberately omitted; `render-env.py` REQUIRED):
 ```text

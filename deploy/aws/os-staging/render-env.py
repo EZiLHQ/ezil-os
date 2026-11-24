@@ -69,6 +69,7 @@ STAGING_MCP_AUTH0_CLIENT = "EZIL_MCP_IDENTITY_BOOTSTRAP_AUTH0_CLIENT_ID"
 STAGING_BROWSER_OBSERVE = "EZIL_DELEGATED_BROWSER_OBSERVE"
 STAGING_BROWSER_OPEN = "EZIL_DELEGATED_BROWSER_OPEN_URL"
 STAGING_BROWSER_CONTROL = "EZIL_DELEGATED_BROWSER_CONTROL"
+LIFECYCLE_DEPLOYMENTS_KEY = "EZIL_AWS_LIFECYCLE_DEPLOYMENTS"
 ASSIGNMENT_RECEIPT_KEY = "UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET"
 ASSIGNMENT_PILOT_JOBS = "EZIL_ASSIGNMENT_ENROLLMENT_PILOT_JOB_IDS"
 STAGING_BROWSER_ORIGINS = "EZIL_BROWSER_TEST_ALLOWED_ORIGINS"
@@ -108,6 +109,13 @@ def validate(values, environment="staging"):
         raise RenderError("Unknown key refused")
     if REQUIRED - values.keys():
         raise RenderError("Missing required key")
+    deployments = values.get(LIFECYCLE_DEPLOYMENTS_KEY)
+    if isinstance(deployments, dict):
+        try:
+            encoded = json.dumps(deployments, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError, RecursionError):
+            raise RenderError("Invalid lifecycle deployments JSON") from None
+        values = {**values, LIFECYCLE_DEPLOYMENTS_KEY: encoded}
     for value in values.values():
         if not isinstance(value, str) or not value or value != value.strip():
             raise RenderError("Expected nonempty strings without surrounding whitespace")
