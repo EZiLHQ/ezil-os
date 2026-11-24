@@ -377,8 +377,9 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
             return shellRefusal(503, 'repo_url_unavailable', "We couldn't reach this repository. Try again.");
         }
     };
-    let privatePacket = parsed.host === 'github.ezil.work' ? await loadGrant() : null;
-    if (privatePacket instanceof Response) return privatePacket;
+    const initialPacket = parsed.host === 'github.ezil.work' ? await loadGrant() : null;
+    if (initialPacket instanceof Response) return initialPacket;
+    let privatePacket = initialPacket;
     if (!(await sameSession())) return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
 
     const canonicalHint = parsed.canonicalURL.match(/-a-([0-9a-f-]{36})\.git$/)?.[1];
