@@ -26,13 +26,13 @@ export function clockOf(report) {
     const remainingMs = finite(report.remainingMs);
     if (deadline === null && !(paused && remainingMs !== null)) return null;
     const revision = Number.isSafeInteger(report.revision) ? report.revision : null;
-    return {deadline, serverNow, paused, revision, startedAt: parse(report.startedAt),
+    return {deadline, serverNow, paused, pausedAt, revision, startedAt: parse(report.startedAt),
         pauseReason: paused && typeof report.pauseReason === 'string' && report.pauseReason ? report.pauseReason : null,
         frozenMs: paused ? (remainingMs !== null ? remainingMs : pausedAt !== null && deadline !== null ? deadline - pausedAt : null) : null};
 }
 
 export function createCountdown({now = Date.now} = {}) {
-    let deadline = null, offset = 0, frozen = null, started = false, pausedBy = null, latest = null, startedAt = null;
+    let deadline = null, offset = 0, frozen = null, started = false, pausedBy = null, latest = null, startedAt = null, pausedAt = null;
     return {
         /**
          * Take a server report. Returns true when it was applied: it carried a clock and was not older than the newest
@@ -48,6 +48,7 @@ export function createCountdown({now = Date.now} = {}) {
             if (!clock) return false;
             if (clock.serverNow !== null) offset = clock.serverNow - receivedAt;
             deadline = clock.deadline;
+            pausedAt = clock.pausedAt;
             startedAt = clock.startedAt ?? startedAt;
             started = true;
             if (clock.paused) {
@@ -64,6 +65,7 @@ export function createCountdown({now = Date.now} = {}) {
         deadlineAt: () => deadline === null ? null : deadline - offset,
         /** The deadline in the server's time, which segment times and cut-offs are measured in; null before the clock starts. */
         serverDeadlineAt: () => deadline,
+        serverPausedAt: () => pausedAt,
         /** Milliseconds left, or null before the clock has started. */
         remaining(at = now()) {
             if (frozen !== null) return Math.max(0, frozen);

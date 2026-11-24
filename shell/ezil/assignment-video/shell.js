@@ -199,7 +199,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         if(paused&&!item.gated){
             item.gated=true;item.reverified=false;
             clearTimeout(item.editorTimeout);clearTimeout(item.reconnect);
-            item.recorder?.hold();
+            item.recorder?.hold(countdown.serverPausedAt());
             showIndicator('paused');
             lockedView('Assignment time paused',
                 'Universe paused your assignment time and recording for a system upgrade. Keep this EZiL OS tab shared: your editor opens and recording resumes when it is available again. '
@@ -362,7 +362,11 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             item.recorder=await encodeTabSegments({win,stream:source.stream,matches:()=>sameTab(item),windowStart:startAt,deadline,
                 signal:item.captureCtl.signal,
                 firstSequence:item.expected,clockOffset:offset,upload:part=>{item.expected=Math.max(item.expected,part.sequence+1);return upload(part);},
-                cutoff:async()=>{const state=await item.transport.status();return state.stopRequestedAt||null;},
+                cutoff:async()=>{
+                    const state=await item.transport.status();
+                    const cutoffs=[Date.parse(state.stopRequestedAt),countdown.serverPausedAt()].filter(Number.isFinite);
+                    return cutoffs.length?new Date(Math.min(...cutoffs)).toISOString():null;
+                },
                 onFault:(code)=>{
                     const cause=code||'recorder_fault';
                     if(cause==='deadline'){
@@ -379,6 +383,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
                     resumeCapture(item);
                 },
                 onAwaitFrame:()=>{if(samePhase(item))ui.set('Opening assigned editor','Recording is active. Checking your workspace…');}});
+            if(item.gated)item.recorder.hold(countdown.serverPausedAt());
             check(item);
             item.stage='confirm';
             await retry(async()=>{
