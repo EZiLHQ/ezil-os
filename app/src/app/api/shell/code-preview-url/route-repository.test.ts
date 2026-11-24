@@ -38,6 +38,8 @@ const s = vi.hoisted(() => ({
     sessionId: 'session-a',
     swapSessionOnMint: false,
     aws: [false, false] as boolean[],
+    migration: null as null | { id: string; state: string; userId: string; computerId: string;
+        fromProvider: string; toProvider: string },
     preview: { ok: true } as Record<string, unknown>,
     /** How long the stubbed Code mint takes, ms of `Date.now()`. */
     mintTakes: 0,
@@ -74,6 +76,9 @@ vi.mock('@/server/auth/retained-identity', () => ({
     },
     clearProjectIdentity: async () => { s.cleared += 1; },
 }));
+vi.mock('@/server/lib/compute/provider-migrate-store', () => ({
+    createProviderMigrationStore: () => ({ readByComputer: async () => s.migration }),
+}));
 vi.mock('@/server/lib/compute/aws-control-auth', () => ({ controlTargetFor: async () => {
     s.order.push('target');
     const aws = s.aws.shift() ?? false;
@@ -107,7 +112,7 @@ const standalonePacket = (scope: 'read' | 'write') => ({ version: 2,
 let logs: ReturnType<typeof vi.spyOn>[];
 beforeEach(() => {
     Object.assign(s, { order: [], owned: true, identity: 'ok', sessionId: 'session-a', swapSessionOnMint: false,
-        aws: [false, false], requests: [], cleared: 0, mintTakes: 0, skew: 0, mintInputs: [],
+        aws: [false, false], migration: null, requests: [], cleared: 0, mintTakes: 0, skew: 0, mintInputs: [],
         preview: { ok: true, correlationId: 'c', codePreviewUrl: MINTED, expiresAt: Date.now() + 300_000, provider: 'cloudflare-guacamole' },
         universe: () => Response.json(grant()),
         worker: () => Response.json({ folder: `/workspace/projects/${REPO}`, head: 'b'.repeat(40) }),
@@ -548,8 +553,47 @@ describe('a reserved assignment repository whose computer or Universe is not rea
         const open = (assignment?: object) => POST(new Request(origin + '/api/shell/code-preview-url', { method: 'POST',
             headers: { origin, host: new URL(origin).host, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
             body: JSON.stringify({ computerId: COMPUTER, intent: 'open', repository: { url: repositoryUrl }, assignment }) }));
-        return { open, universe, prep: { attemptId, phase: 'prepare' }, now };
+        return { open, universe, enrolled, repositoryUrl, prep: { attemptId, phase: 'prepare' }, now };
     }
+
+    it('prepares a migrated AWS assignment only with exact trusted upgrade, placement and private host evidence', async () => {
+        const { open, prep, universe, enrolled, repositoryUrl } = await enrolledFixture();
+        const { workspaceIdentity } = await import('@/server/assignment-video/repo-open');
+        vi.stubEnv('AWS_STANDALONE_REPO_OPEN_ENABLED', '1');
+        const operation = '99999999-9999-4999-8999-999999999999';
+        const verified = { ...enrolled, upgradedWorkspaceId: workspaceIdentity(USER, COMPUTER, SANDBOX), upgradeOperationId: operation };
+        s.migration = { id: operation, state: 'committed', userId: USER, computerId: COMPUTER,
+            fromProvider: 'cloudflare', toProvider: 'aws-ec2' };
+        Object.assign(s.preview, {computeProvider: 'aws-ec2', sandboxId: SANDBOX, generation: 3, leaseEpoch: 1});
+        const prepare = () => { s.aws = Array<boolean>(6).fill(true); return open(prep); };
+        for (const enrollment of [enrolled, {...verified, upgradedWorkspaceId: '0'.repeat(64)},
+            {...verified, upgradeOperationId: COMPUTER}]) {
+            universe.preflight = () => Response.json(enrollment);
+            s.order = [];
+            const response = await prepare();
+            expect(response.status).toBe(409);
+            expect(s.order).not.toContain('codePreviewUrl');
+            expect(s.order).not.toContain('worker');
+        }
+        universe.preflight = () => Response.json(verified);
+        s.worker = body => {
+            const { repositoryId, assignmentPreload } = JSON.parse(body);
+            const folder = '/workspace/projects/' + repositoryId;
+            return Response.json({ok: true, status: 'fetched', folder,
+                checkoutFolder: folder + '/' + repositoryUrl.split('/').at(-1)!.slice(0, -4),
+                assignmentPreload: { eventId: assignmentPreload.eventId, nonce: assignmentPreload.nonce,
+                    port: 5679, status: 'acknowledged' }});
+        };
+        const prepared = await prepare();
+        expect(prepared.status).toBe(200);
+        expect(await prepared.json()).toMatchObject({ok: true, assignmentOpen: {attemptId}});
+        // Old host results never mint proof or expose the preloaded Code URL.
+        s.worker = body => Response.json({ ok: true, status: 'fetched',
+            folder: '/workspace/projects/' + JSON.parse(body).repositoryId });
+        const blocked = await prepare();
+        expect(blocked.ok).toBe(false);
+        expect(await blocked.text()).not.toContain('preview-bootstrap');
+    });
 
     it('a cold computer answers its wake fields only (no Universe, no Worker, no URL, no capability), so the wake loop waits', async () => {
         const { open, prep } = await enrolledFixture();
