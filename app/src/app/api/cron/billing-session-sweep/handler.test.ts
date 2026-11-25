@@ -661,14 +661,15 @@ describe('explicit Free override (provider-reverse-override.ts): the sweep\'s ow
     /** A Stripe Standard payer whose operator row marks an explicit Free override (effective-access.ts): Free decides, Stripe stays. */
     const overrideRow = { ref: 'ovr', revision: 1, userId: ref.userId, accountPublicId: 'acct', sku: 'free_v3', accessOverride: true,
         startsAt: at(-7200), endsAt: null, endedAt: null };
-    function overridden(epochs: StoredComputeEpoch[], { lane = true, grant = false } = {}) {
+    /** `lane`: the sweep's `overrideLane` (a flag or a readiness probe); 'omit' leaves it out, as an older caller would. */
+    function overridden(epochs: StoredComputeEpoch[], { lane = true as SweepInput['overrideLane'] | 'omit', grant = false } = {}) {
         const f = fixture(epochs, { sku: 'standard_monthly_v3', allowance: 144000 });
         // Billing on and enforced: the lane's own gate (`tabEnabled`) and the sweep's stops.
         f.deps.config = readBillingConfig({ BILLING_ENFORCEMENT: '1', BILLING_TAB_ENABLED: '1' });
         (f.store as unknown as { operatorEntitlementsFor: unknown }).operatorEntitlementsFor =
             vi.fn(async () => grant ? [{ ...overrideRow, sku: 'standard_monthly_v3', accessOverride: false }] : [overrideRow]);
         const run = (seconds: number, extra: Partial<SweepInput> = {}) => handleBillingSessionSweep({ deps: f.deps, now: at(seconds), stop: f.stop,
-            isStillRunning: f.isStillRunning, overrideLane: lane, ...extra });
+            isStillRunning: f.isStillRunning, ...(lane === 'omit' ? {} : { overrideLane: lane }), ...extra });
         return { ...f, run };
     }
     const paidEra = () => epoch({ size: 'std-2', deadlineAt: iso(21_600) });
@@ -718,6 +719,60 @@ describe('explicit Free override (provider-reverse-override.ts): the sweep\'s ow
         const runningAwsPlacements = vi.fn(async () => ({ candidates: [{ ...ref, state: 'RUNNING' as const, since: at(-600), closedAt: at(-86_400), stoppedSinceClose: true }], next: null }));
         expect(await f.run(0, { runningAwsPlacements })).toMatchObject({ heldOverrun: 0, stopped: 0 });
         expect(f.stop).not.toHaveBeenCalled();
+    });
+
+    describe('PR #421 P1: the stops defer only while the lane can really run (its schema, 0019 and 0012, which production lacks)', () => {
+        const heldRunning = () => vi.fn(async () => ({ candidates: [{ ...ref, state: 'RUNNING' as const, since: at(-600), closedAt: at(-86_400), stoppedSinceClose: true }], next: null }));
+
+        it('absent reverse schema (the probe answers not ready: production): the paid-era session takes the ordinary Free bound, as with the lane off', async () => {
+            const lane = vi.fn(async () => false);
+            const f = overridden([paidEra()], { lane });
+            expect(await f.run(7200)).toMatchObject({ examined: 1, stopped: 1, closed: 1 });
+            expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+            expect(f.epochs[0]).toMatchObject({ endedAt: expect.any(String), endReason: 'session_max' });
+            expect(lane).toHaveBeenCalledTimes(1);
+        });
+
+        it('absent reverse schema: the retry and the held bound keep their ordinary stops for the same owner', async () => {
+            const retry = overridden([epoch({ endedAt: iso(100), endReason: 'session_max' })], { lane: async () => false });
+            retry.isStillRunning.mockResolvedValue(true);
+            expect(await retry.run(200)).toMatchObject({ retried: 1, stopped: 1 });
+            expect(retry.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+
+            const held = overridden([epoch({ endedAt: iso(-86_400), endReason: 'session_max' })], { lane: async () => false });
+            expect(await held.run(0, { runningAwsPlacements: heldRunning() })).toMatchObject({ heldOverrun: 1, stopped: 1 });
+            expect(held.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+        });
+
+        it('a probe that throws (a schema read error) is not ready: the ordinary stop, the error named once and redacted', async () => {
+            const f = overridden([paidEra()], { lane: async () => { throw new Error('secret-dsn'); } });
+            expect(await f.run(7200)).toMatchObject({ stopped: 1, closed: 1 });
+            expect(f.stop).toHaveBeenCalledTimes(1);
+            const warned = vi.mocked(console.warn).mock.calls.filter(c => c[0] === '[billing.sweep] override lane readiness unavailable');
+            expect(warned).toEqual([['[billing.sweep] override lane readiness unavailable', { error: 'Error' }]]);
+            expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain('secret-dsn');
+        });
+
+        it('no readiness given at all (an older caller, tests): every stop is the sweep\'s own', async () => {
+            const f = overridden([paidEra()], { lane: 'omit' });
+            expect(await f.run(7200)).toMatchObject({ stopped: 1, closed: 1 });
+        });
+
+        it('configured and ready (the probe answers true): the lane owns the policy, retry and held stops; the probe runs once per sweep', async () => {
+            const lane = vi.fn(async () => true);
+            const f = overridden([paidEra(), epoch({ id: 'old', computerId: 'other', endedAt: iso(100), endReason: 'session_max' })], { lane });
+            f.isStillRunning.mockResolvedValue(true);
+            expect(await f.run(7200, { runningAwsPlacements: heldRunning() })).toMatchObject({ examined: 1, stopped: 0, closed: 0, retried: 0, heldOverrun: 0 });
+            expect(f.stop).not.toHaveBeenCalled();
+            expect(lane).toHaveBeenCalledTimes(1);
+        });
+
+        it('the probe is never run for a sweep whose AWS sessions have no explicit-override owner', async () => {
+            const lane = vi.fn(async () => true);
+            const f = overridden([paidEra()], { lane, grant: true });
+            expect(await f.run(21_600)).toMatchObject({ stopped: 1, closed: 1 });
+            expect(lane).not.toHaveBeenCalled();
+        });
     });
 });
 

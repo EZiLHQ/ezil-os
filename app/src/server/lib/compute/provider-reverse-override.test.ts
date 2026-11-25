@@ -7,9 +7,11 @@ import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import type { BillingSummaryV3 } from '@/server/billing/v3/contract';
 import { ImageJobConflictError, PlacementOwnerError, type Placement } from './placement';
+import { resetOperatorEntitlementsInstalled } from '@/server/entitlements/operator/installed';
 import {
-    explicitFreeOverrideState, freeOverrideCandidates, freeOverrideInEffect, freeOverrideLaneEnabled, OVERRIDE_PASS_BUDGET_MS, OVERRIDE_PASS_LIMIT,
-    reconcileFreeOverrideMoves, reconcileFreeOverrideMovesInSweep, type OverrideMoveCandidate, type OverrideReconcilePorts,
+    explicitFreeOverrideState, freeOverrideCandidates, freeOverrideHandoffReady, freeOverrideInEffect, freeOverrideLaneEnabled, freeOverrideSchemaPresent,
+    OVERRIDE_PASS_BUDGET_MS, OVERRIDE_PASS_LIMIT, reconcileFreeOverrideMoves, reconcileFreeOverrideMovesInSweep,
+    type OverrideMoveCandidate, type OverrideReconcilePorts,
 } from './provider-reverse-override';
 
 const U = '11111111-1111-4111-8111-111111111111';
@@ -197,11 +199,70 @@ describe('freeOverrideLaneEnabled and the SQL readers', () => {
         return { queries, db: { async execute(q: SQL) { const { sql: text, params } = dialect.sqlToQuery(q); queries.push({ text, params }); return answer(text); } } };
     }
 
-    it('candidates: own live AWS computers joined to a live explicit Free override (through to_jsonb), actionable rows only, bounded; plus the deferred count', async () => {
+    describe('the readiness probes (PR #421 P1): 0019 and 0012 through the existing probes; production has no 0012', () => {
+        const AWS_ENV = AWS;
+        /** A database answering the two catalog probes; `fail` makes the named probe throw. */
+        function schema({ operator = true, reverse = true, fail = '' as '' | 'operator' | 'reverse' } = {}) {
+            return recording(text => {
+                if (text.includes('ezil_operator_entitlements')) { if (fail === 'operator') throw new Error('db down'); return [{ present: operator }]; }
+                if (text.includes('ezil_compute_reverse_moves')) { if (fail === 'reverse') throw new Error('db down'); return [{ present: reverse }]; }
+                throw new Error(`unexpected statement: ${text}`);
+            });
+        }
+        beforeEach(() => resetOperatorEntitlementsInstalled());
+        afterEach(() => resetOperatorEntitlementsInstalled());
+
+        it('schemaPresent: both tables → true; 0012 absent (production) → false; 0019 absent → false, and 0012 is not even probed', async () => {
+            expect(await freeOverrideSchemaPresent(schema().db)).toBe(true);
+            resetOperatorEntitlementsInstalled();
+            const noReverse = schema({ reverse: false });
+            expect(await freeOverrideSchemaPresent(noReverse.db)).toBe(false);
+            expect(noReverse.queries.map(q => q.text)).toEqual([expect.stringContaining('ezil_operator_entitlements'), expect.stringContaining('ezil_compute_reverse_moves')]);
+            resetOperatorEntitlementsInstalled();
+            const noOperator = schema({ operator: false });
+            expect(await freeOverrideSchemaPresent(noOperator.db)).toBe(false);
+            expect(noOperator.queries).toHaveLength(1);
+        });
+
+        it('schemaPresent throws on a read error (each caller fails closed its own way)', async () => {
+            await expect(freeOverrideSchemaPresent(schema({ fail: 'operator' }).db)).rejects.toThrow('db down');
+            resetOperatorEntitlementsInstalled();
+            await expect(freeOverrideSchemaPresent(schema({ fail: 'reverse' }).db)).rejects.toThrow('db down');
+        });
+
+        it('handoffReady: the flags first (nothing read while they say no), then the schema; ready only with both', async () => {
+            const off = schema();
+            expect(await freeOverrideHandoffReady(off.db, {})).toBe(false);
+            expect(await freeOverrideHandoffReady(off.db, { ...AWS_ENV, EZIL_AWS_KILL_SWITCH: '1' })).toBe(false);
+            expect(off.queries).toEqual([]);
+            expect(await freeOverrideHandoffReady(schema().db, AWS_ENV)).toBe(true);
+            resetOperatorEntitlementsInstalled();
+            expect(await freeOverrideHandoffReady(schema({ reverse: false }).db, AWS_ENV)).toBe(false);
+        });
+
+        it('handoffReady is false on a read error (the sweep keeps its ordinary stop), warned once with the error name only', async () => {
+            expect(await freeOverrideHandoffReady(schema({ fail: 'reverse' }).db, AWS_ENV)).toBe(false);
+            expect(console.warn).toHaveBeenCalledExactlyOnceWith('[reverse-move] override handoff readiness unavailable', { error: 'Error' });
+        });
+
+        it('the sweep step re-probes both schemas itself: with 0012 absent it lists no candidate and returns the empty counts', async () => {
+            // The lazily imported runtime is not wired here; the probe is what matters: nothing past it runs without 0012.
+            const { db } = schema({ reverse: false });
+            const candidates = vi.fn(async () => ({ candidates: [me], deferred: 0 }));
+            const counts = await reconcileFreeOverrideMoves({ ...ports().p, candidates, schemaPresent: () => freeOverrideSchemaPresent(db) });
+            expect(counts).toEqual({ candidates: 0, deferred: 0, stopped: 0, started: 0, skipped: 0, errors: 0 });
+            expect(candidates).not.toHaveBeenCalled();
+        });
+    });
+
+    it('candidates: own live AWS computers joined to a live explicit Free override (through to_jsonb), actionable rows only, bounded; plus the deferred count (the statements are placement.ts\'s: C-2)', async () => {
         const { db, queries } = recording(text => text.includes('override-candidates') ? [{ computer_id: C.toUpperCase(), user_id: U }] : [{ n: 3 }]);
         expect(await freeOverrideCandidates(db, NOW, 50)).toEqual({ candidates: [{ userId: U, computerId: C }], deferred: 3 });
         const [list, deferred] = queries;
+        expect(list!.text).toContain('/* placement:override-candidates */');
+        expect(deferred!.text).toContain('/* placement:override-deferred */');
         for (const q of [list!, deferred!]) {
+            expect(q.text).toContain('public.ezil_computer_placements p');
             expect(q.text).toContain("to_jsonb(o)->>'access_override' = 'true'");
             expect(q.text).toContain("o.sku = 'free_v3'");
             expect(q.text).toContain('o.ended_at IS NULL');
