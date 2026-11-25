@@ -5,7 +5,7 @@
  * 503; bad kid/skew/signature → 401 unauthorized_sender; a commands body that is not JSON or has no valid command_id
  * → 400; every command answer (applied, replayed, refused) → 200. A non-matching assignments pair → 404.
  */
-import { commandIdOf, FORMATS } from './contract';
+import { commandIdOf, FORMATS, sourceCatalog } from './contract';
 import { catalog, handleCommand, readAssignments, type OperatorEntitlementDeps } from './service';
 import { readSenderKeys, SENDER_KEYS_ENV, verifySender } from './signature';
 import { SourceUnavailable } from './store';
@@ -32,7 +32,11 @@ export async function handleAdminEntitlementRequest(request: Request, endpoint: 
     if (!kid) return json(401, { error: 'unauthorized_sender' });
     if (method !== expected) return json(405, { error: 'method_not_allowed' });
     try {
-        if (endpoint === 'catalog') return json(200, await catalog(await options.deps()));
+        if (endpoint === 'catalog') {
+            // Only the 0038 probe needs deps: when they cannot be built, the v1 catalog still answers, as before overrides.
+            const deps = await options.deps().catch(() => null);
+            return json(200, deps ? await catalog(deps) : sourceCatalog());
+        }
         if (endpoint === 'assignments') {
             const osUserId = url.searchParams.get('os_user_id') ?? '', account = url.searchParams.get('account_public_id') ?? '';
             if (!UUID.test(osUserId) || !UUID.test(account) || [...url.searchParams.keys()].some(k => k !== 'os_user_id' && k !== 'account_public_id')) {

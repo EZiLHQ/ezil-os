@@ -70,6 +70,13 @@ describe('ezil-os entitlement routes', () => {
         expect(await response.json()).toEqual(sourceCatalog());
     });
 
+    it('GET catalog advertises access_overrides once 0038 is installed; deps that cannot be built still answer the v1 catalog', async () => {
+        const installed = await call(signed('GET', 'catalog'), 'catalog', { deps: deps({ accessOverridesInstalled: async () => true }) });
+        expect([installed.status, await installed.json()]).toEqual([200, { ...sourceCatalog(), access_overrides: true }]);
+        const broken = await call(signed('GET', 'catalog'), 'catalog', { deps: async () => { throw new SourceUnavailable('commands'); } });
+        expect([broken.status, await broken.json()]).toEqual([200, sourceCatalog()]);
+    });
+
     it('GET assignments: both ids required (400), a non-linked pair is 404 and reveals nothing, a linked one is 200', async () => {
         expect((await call(signed('GET', `assignments?os_user_id=${USER}`), 'assignments')).status).toBe(400);
         expect((await call(signed('GET', `assignments?os_user_id=${USER}&account_public_id=${ACCOUNT}&x=1`), 'assignments')).status).toBe(400);
