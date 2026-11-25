@@ -190,6 +190,19 @@ describe('assignment media broker',()=>{
                 .rejects.toMatchObject({status:404});
         }
     });
+    it('passes only the exact workspace start mode through a preflight, and refuses any other value',async()=>{
+        const d=deps();
+        const preflight={action:'preflight' as const,attemptId:attempt};
+        const unbound={...eligibility,boundWorkspaceId:null};
+        const answer=(extra:object)=>recordingAction(identity,preflight,{...d,fetcher:async()=>Response.json({...unbound,...extra})});
+        expect(await answer({startMode:'workspace'})).toEqual({...unbound,startMode:'workspace'});
+        // Absent (today's Universe) stays absent: nothing is inferred from a running window without a binding.
+        expect(await answer({})).toEqual(unbound);
+        expect(await answer({})).not.toHaveProperty('startMode');
+        for(const startMode of ['tab','Workspace','workspace ','',null,true,1,['workspace'],{mode:'workspace'}])
+            await expect(answer({startMode})).rejects.toMatchObject({status:404});
+        expect(d.leases.size).toBe(0);
+    });
     it('authenticates production media preflight as the actual OS and refuses unsigned calls before transport',async()=>{
         vi.stubEnv('BILLING_FUNDING_URL','https://ai.ezil.work');
         vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN','https://universe.ezil.work');

@@ -15,11 +15,15 @@ export function isAssignmentCodeReturn(path: string): boolean {
 }
 
 export const workReturnPath = '/assignment/work-return';
+/** The return of a sign-in started from the embedded workspace: it goes back to that Universe workspace page. */
+export const embeddedWorkReturnSuffix = '&workspace=1';
 
 export function workReturnAttempt(destination: string, path: typeof workReturnPath | '/app/assignment-enrollment' = workReturnPath): string | null {
     const prefix = path + '?attempt=';
     if (!destination.startsWith(prefix)) return null;
-    const attempt = destination.slice(prefix.length);
+    const value = destination.slice(prefix.length);
+    const embedded = path === workReturnPath && value.endsWith(embeddedWorkReturnSuffix);
+    const attempt = embedded ? value.slice(0, -embeddedWorkReturnSuffix.length) : value;
     return uuid.test(attempt) && attempt.length === 36 ? attempt : null;
 }
 
@@ -29,18 +33,75 @@ export function embeddedCodeAttempt(params: Record<string, string | string[] | u
     return assignmentRepositoryAttempt(repo) === assignment ? assignment : null;
 }
 
-/** Only an authenticated parent handoff can prepare the workspace. This reply only explains a sign-in requirement. */
-export function listenForWorkSignIn(attemptId: string, win: Window): () => void {
-    const universe = 'https://universe-staging.ezil.work';
-    const protocol = 'ezil.assignment.work/v2';
-    if (!uuid.test(attemptId) || win.location.origin !== 'https://os-staging.ezil.work' || win === win.top || win.parent !== win.top)
-        return () => {};
+const workProtocol = 'ezil.assignment.work/v2';
+/**
+ * The one Universe origin that may frame each EZiL OS origin: OS and Universe are selected as one deployment
+ * (`server/assignment-video/authority.ts`), so production pairs only with production and staging only with staging.
+ */
+const workHosts: Readonly<Record<string, string>> = {
+    'https://os.ezil.work': 'https://universe.ezil.work',
+    'https://os-staging.ezil.work': 'https://universe-staging.ezil.work',
+};
+export const workHostFor = (osOrigin: string): string | null => Object.hasOwn(workHosts, osOrigin) ? workHosts[osOrigin]! : null;
+export type WorkState = 'authentication_required' | 'preparing' | 'ready' | 'unavailable';
+const workStates: readonly WorkState[] = ['authentication_required', 'preparing', 'ready', 'unavailable'];
+
+/**
+ * The OS document is the direct child of a top-level page of its own paired Universe origin. Where the browser names
+ * the ancestors, that one ancestor must be that origin; the parent's origin itself is only trusted from each `discover`.
+ */
+function embeddedWorkHost(win: Window): string | null {
+    const host = workHostFor(win.location.origin);
+    const ancestors = (win.location as Location & { ancestorOrigins?: DOMStringList }).ancestorOrigins;
+    return host && win !== win.top && win.parent === win.top
+        && (ancestors == null || (ancestors.length === 1 && ancestors[0] === host)) ? host : null;
+}
+
+/**
+ * `ezil.assignment.work/v2`, child side. Answers only the actual parent window at the exact paired Universe origin, only
+ * for this attempt, echoing that discover's challenge, and posts only to that origin. `push` re-sends the current state
+ * against the latest accepted challenge, which `onDiscover` receives before the reply. Replies carry no proof,
+ * repository, computer or recording identifier.
+ * 🔴 `shell/ezil/assignment-video/work-protocol.js` is the shell's copy; `assignment-work-auth.test.ts` runs both on one fixture.
+ */
+export function respondToWorkDiscover(attemptId: string, win: Window, current: () => WorkState, onDiscover?: (challenge: string) => void):
+    { dispose: () => void; push: () => void } {
+    const host = uuid.test(attemptId) ? embeddedWorkHost(win) : null;
+    if (!host) return { dispose: () => {}, push: () => {} };
+    let challenge: string | null = null;
+    const push = () => {
+        const type = current();
+        if (challenge && workStates.includes(type)) win.parent.postMessage({protocol:workProtocol, type, attemptId, challenge}, host);
+    };
     const receive = (event: MessageEvent) => {
         const data = event.data;
-        if (event.source !== win.parent || event.origin !== universe || data?.protocol !== protocol || data.type !== 'discover'
+        if (event.source !== win.parent || event.origin !== host || data?.protocol !== workProtocol || data.type !== 'discover'
             || data.attemptId !== attemptId || typeof data.challenge !== 'string' || !uuid.test(data.challenge)) return;
-        win.parent.postMessage({protocol, type:'authentication_required', attemptId, challenge:data.challenge}, universe);
+        challenge = data.challenge;
+        onDiscover?.(data.challenge);
+        push();
     };
     win.addEventListener('message', receive);
-    return () => win.removeEventListener('message', receive);
+    return { dispose: () => win.removeEventListener('message', receive), push };
+}
+
+/** Only an authenticated parent handoff can prepare the workspace. This reply only explains a sign-in requirement. */
+export function listenForWorkSignIn(attemptId: string, win: Window): () => void {
+    return respondToWorkDiscover(attemptId, win, () => 'authentication_required').dispose;
+}
+
+/**
+ * The single framing rule the embed adds: the exact canonical assignment Code entry may be framed by the Universe
+ * origin paired with this OS origin, and by nothing else. Every other path, host and query keeps today's headers (no
+ * policy is returned).
+ */
+export function assignmentEmbedFramePolicy(publicOrigin: string, url: { pathname: string; searchParams: URLSearchParams }): string | null {
+    const host = workHostFor(publicOrigin);
+    if (!host || url.pathname !== '/app/code') return null;
+    const params: Record<string, string | string[]> = {};
+    for (const key of new Set(url.searchParams.keys())) {
+        const values = url.searchParams.getAll(key);
+        params[key] = values.length === 1 ? values[0]! : values;
+    }
+    return embeddedCodeAttempt(params) ? 'frame-ancestors ' + host : null;
 }

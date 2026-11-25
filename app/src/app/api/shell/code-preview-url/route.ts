@@ -1,6 +1,6 @@
 import { recordingAction } from '@/server/assignment-video/broker';
 import { assignmentAuthority } from '@/server/assignment-video/authority';
-import { BrokerError, uuid } from '@/server/assignment-video/contract';
+import { BrokerError, uuid, validAssignmentWindow } from '@/server/assignment-video/contract';
 import { failureFields } from '@/server/lib/failure-diagnostics';
 import { enrolledAttempt, makeChallenge, matchesEnrollment, readOpen, repoOpenSecret, sealOpen, workspaceIdentity } from '@/server/assignment-video/repo-open';
 import { z } from 'zod';
@@ -417,10 +417,15 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
      * must be PRESENT: `null` is the first opening, allowed only while no window has started; a string is the workspace
      * Universe bound and must be this computer's exact one. An omitted field (an older Universe), a malformed or a
      * foreign binding, or a computer mid-migration is refused, so nothing wakes and no editor or clock starts.
+     *
+     * One more first opening exists: Universe's own workspace page starts the window before any computer has opened the
+     * attempt (`startMode:'workspace'`). Only the sealing `prepare` may pass with that running window and no binding;
+     * `begin` then binds this workspace, so the `open` phase still needs the exact bound workspace. A running window
+     * without that mode stays refused, as does a paused, ended or malformed one.
      */
     async function verifyAwsContinuation(controls: ControlTarget, enrollment: Awaited<ReturnType<typeof readEnrollment>>) {
         if (!startedOnAws || !isAws(controls) || !identity || !enrollment?.ok) return false;
-        const { upgradedWorkspaceId, upgradeOperationId, boundWorkspaceId, windowStartedAt, deadlineAt } = enrollment.value;
+        const { upgradedWorkspaceId, upgradeOperationId, boundWorkspaceId, windowStartedAt, deadlineAt, startMode, pausedAt, revision } = enrollment.value;
         const workspace = workspaceIdentity(identity.userId, computerId, controls.sandboxName);
         if (typeof boundWorkspaceId === 'string' && boundWorkspaceId !== workspace) return false;
         const migration = await migrationStore().readByComputer(computerId);
@@ -438,7 +443,11 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
             const moved = migrationTime(migration.updatedAt), began = Date.parse(windowStartedAt);
             if (!Number.isFinite(moved) || !Number.isFinite(began) || moved >= began) return false;
         }
-        return boundWorkspaceId === workspace || (boundWorkspaceId === null && windowStartedAt === null && deadlineAt === null);
+        if (boundWorkspaceId === workspace || (boundWorkspaceId === null && windowStartedAt === null && deadlineAt === null)) return true;
+        if (boundWorkspaceId !== null || startMode !== 'workspace' || !phase.success || phase.data.phase !== 'prepare'
+            || windowStartedAt === null || deadlineAt === null || pausedAt) return false;
+        const began = Date.parse(windowStartedAt), ends = Date.parse(deadlineAt), now = Date.now();
+        return began <= now && now < ends && validAssignmentWindow(began, ends, revision);
     }
     let preflight = reserved && startedOnAws ? await readEnrollment() : null;
     if (reserved && startedOnAws) {
