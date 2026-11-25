@@ -39,6 +39,14 @@ import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 import { operatorGrantInEffect } from '@/server/billing/v3/operator-access';
+import { accessOverrideInEffect, isAccessOverride, ordinaryGrants, type AccessRow } from '@/server/billing/v3/effective-access';
+
+/**
+ * An assigned plan in effect blocks a new Stripe purchase: an ordinary operator grant (the operator ends it first), or a
+ * live explicit override, which decides access whatever Stripe sells, so a checkout or trial would pay for nothing.
+ */
+const assignedPlanInEffect = (grants: readonly AccessRow[], now: Date): boolean =>
+    operatorGrantInEffect(ordinaryGrants(grants), now) !== null || accessOverrideInEffect(grants, now) !== null;
 
 /** All router domain failures use the pinned UI vocabulary. */
 function billingError(code: BillingErrorCode, trpcCode: TRPCError['code']): TRPCError {
@@ -210,7 +218,7 @@ async function readTrialCampaignsBounded(stripe: StripeApi, timeoutMs: number): 
 async function trialEligibilityFor(store: TrialStore, deps: BillingDeps, userId: string, planFamily: string): Promise<{ facts: TrialFacts;
     decision: ReturnType<typeof trialEligibility> }> {
     const [facts, grants] = await Promise.all([store.trialFacts(userId), deps.store.operatorEntitlementsFor?.(userId) ?? []]);
-    return { facts, decision: trialEligibility({ facts, planFamily, operatorPlan: operatorGrantInEffect(grants, deps.now()) !== null }) };
+    return { facts, decision: trialEligibility({ facts, planFamily, operatorPlan: assignedPlanInEffect(grants, deps.now()) }) };
 }
 
 /**
@@ -531,13 +539,16 @@ type StoredEpochs = Awaited<ReturnType<BillingDeps['store']['epochsFor']>>;
 /**
  * Round 6 review (dunning into the hold): a paid subscription without paid access rates the computer on Free's
  * calendar month (summary.ts `computePlanV3`), which can start before the unpaid period; the epochs are then
- * re-read from the month's start, as the start gate does (compute-access.ts loadComputeBillingState).
+ * re-read from the month's start, as the start gate does (compute-access.ts loadComputeBillingState). An explicit Free
+ * override over a Stripe period rates on Free's month the same way; `epochs` were read from the Stripe-only plan's window.
  */
 async function computeWindowEpochs(deps: BillingDeps, userId: string, epochs: StoredEpochs, input: {
-    subs: SubscriptionRow[]; paymentIssues: PaymentIssueRow[]; now: Date; userCreatedAt: Date | null }): Promise<StoredEpochs> {
-    const plan = planFromSubscriptions(input);
-    const { standing } = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues, placementProvider: null, now: input.now });
-    const rated = computePlanV3(plan, standing, input);
+    subs: SubscriptionRow[]; paymentIssues: PaymentIssueRow[]; now: Date; userCreatedAt: Date | null; operatorGrants: readonly AccessRow[] }): Promise<StoredEpochs> {
+    const plan = planFromSubscriptions({ subs: input.subs, now: input.now, userCreatedAt: input.userCreatedAt });
+    const operator = operatorAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues, grants: input.operatorGrants, now: input.now });
+    const effective = planFromSubscriptions({ subs: input.subs, now: input.now, userCreatedAt: input.userCreatedAt, operator });
+    const { standing } = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues, placementProvider: null, now: input.now, operator });
+    const rated = computePlanV3(effective, standing, { subs: input.subs, now: input.now, userCreatedAt: input.userCreatedAt });
     return Date.parse(rated.window.start) < Date.parse(plan.window.start) ? deps.store.epochsFor(userId, new Date(rated.window.start)) : epochs;
 }
 
@@ -609,7 +620,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 deps.store.openPaymentIssues(ctx.user.id),
                 deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [],
             ]);
-            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
+            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt, operatorGrants });
             return buildUsageV3({ config: deps.config, now, subs, userCreatedAt, epochs, grants, storage,
                 consent, overageInvoices, planChanges: [], paymentIssues, sizePreference,
                 hasCustomer: false, computerId: input?.computerId, volumeGiB: placement.volumeGiB, placementProvider: placement.provider,
@@ -643,7 +654,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 ezilIdSignInUrl(),
                 deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [],
             ]);
-            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
+            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt, operatorGrants });
             // Phase B (§6.1.1): the move computer's reverse row; undefined (today's summary) without 0012 or on any failed read.
             const reverseMove = await reverseMoveSummaryInput(ctx.db, placement.placement, ctx.user,
                 email => isOperator(email));
@@ -767,8 +778,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const { plan } = await currentPlan(deps, ctx.user.id);
             if (plan.family !== 'free') throw billingError('already_subscribed', 'CONFLICT');
             // Product entitlements v1: an operator assignment in effect is the account's plan; no Stripe checkout is layered
-            // over it (the operator ends it first), refused before Stripe is called.
-            if (operatorGrantInEffect(await deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [], deps.now())) {
+            // over it (the operator ends it first), refused before Stripe is called. A live explicit override is one too.
+            if (assignedPlanInEffect(await deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [], deps.now())) {
                 throw billingError('already_subscribed', 'CONFLICT');
             }
             // Standard trial: only the caller's own fresh stored quote, re-checked now, with the end they were shown.
@@ -1100,8 +1111,11 @@ export function createBillingRouter(getDeps: () => BillingDeps,
         portal: protectedProcedure.mutation(async ({ ctx }) => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
-            const plan = await currentEffectivePlan(deps, ctx.user.id);
-            if (plan.operator) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
+            const effective = await currentEffectivePlan(deps, ctx.user.id);
+            // An ordinary operator grant has no Stripe billing to manage. An explicit override decides access only: the
+            // account's own Stripe subscription keeps its portal, checked as the Stripe-only plan.
+            if (effective.operator && !isAccessOverride(effective.operator)) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
+            const plan = effective.operator ? (await currentPlan(deps, ctx.user.id)).plan : effective;
             const customerId = await deps.store.stripeCustomerFor(ctx.user.id);
             if (!customerId) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
             if (plan.subscriptionId) await ownedSubscription(deps, stripe, ctx.user.id, plan.subscriptionId);

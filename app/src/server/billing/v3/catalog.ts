@@ -3,7 +3,8 @@ import { freeSkuFor, offerByLookupKey as legacyByLookupKey, offerBySku as legacy
 import { CATALOG_V2, SESSION_MAX_SECONDS, type PlanOffer } from '../v2/contract';
 import { epochSeconds } from '../v2/time';
 import { CATALOG_V3, type PlanOfferV3, type PlanSkuV3, type PublicOfferV3 } from './contract';
-import { operatorPlan, type OperatorEntitlementRow } from './operator-access';
+import { paidAccessRow, type AccessRow } from './effective-access';
+import { operatorPlan } from './operator-access';
 
 export function offerBySku(sku: string): PlanOfferV3 | undefined {
     return Object.prototype.hasOwnProperty.call(CATALOG_V3, sku) ? CATALOG_V3[sku as PlanSkuV3] : undefined;
@@ -42,22 +43,29 @@ type LegacyPlan = ReturnType<typeof legacyPlan>;
 type CommonPlan = Omit<LegacyPlan, 'sku' | 'offer'> & { legacyFree: boolean; sessionMaxSeconds: number | null;
     /** Trial funding facts stay on the resolved plan so never-paid trials cannot use paid-renewal pending access. */
     trialEnd?: Date | null; firstPaidAt?: Date | null;
-    /** Product entitlements v1: set only when an operator grant decides the plan (operator-access.ts); never a Stripe row. */
-    operator?: OperatorEntitlementRow };
+    /**
+     * Product entitlements v1: set only when an operator row decides the plan (operator-access.ts, effective-access.ts);
+     * never a Stripe row. An explicit Free override sets it on the Free plan.
+     */
+    operator?: AccessRow };
 export type ResolvedPlanV3 = CommonPlan & (
     | { sku: PlanSkuV3; offer: PlanOfferV3; legacy: null }
     | { sku: 'legacy'; offer: PlanOffer; legacy: LegacyPlan }
 );
 
 /**
- * Stored SKUs were resolved from Stripe line lookup keys, which beat checkout metadata. `operator`: the operator grant
- * that decides the plan (standing.ts `operatorAccessFor`, which lets Stripe paid access win); omitted = Stripe only.
+ * Stored SKUs were resolved from Stripe line lookup keys, which beat checkout metadata. `operator`: the operator row
+ * that decides the plan (standing.ts `operatorAccessFor`: a live explicit override, else a grant where Stripe gives no
+ * paid access); omitted = Stripe only. An explicit Free override is the Free plan itself, never `operatorPlan`'s paid one.
  */
 export function planFromSubscriptions(input: {
     subs: SubscriptionRow[]; now: Date; userCreatedAt: Date | string | null; freeEffectiveAt?: string | null;
-    operator?: OperatorEntitlementRow | null;
+    operator?: AccessRow | null;
 }): ResolvedPlanV3 {
-    if (input.operator) return operatorPlan(input.operator, planFromSubscriptions({ ...input, subs: [], operator: null }));
+    if (input.operator) {
+        const free = planFromSubscriptions({ ...input, subs: [], operator: null });
+        return paidAccessRow(input.operator) ? operatorPlan(input.operator, free) : { ...free, operator: input.operator };
+    }
     // Reuse v2's active-period precedence and delinquent/expired handling.
     const selected = legacyPlan({ ...input, subs: input.subs.map(sub => ({ ...sub,
         sku: sub.sku === 'standard_monthly_v3' ? 'standard_monthly_v2'
