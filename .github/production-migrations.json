@@ -130,6 +130,11 @@
       "path": "app/drizzle/0033_native_grant_outbox.sql",
       "sha256": "8e2f6e97726d647903b284bd35856f8829ee3661d48d75e55c1645aa3226ad1e",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0038_operator_access_overrides.sql",
+      "sha256": "04ae74d9fe1b34cd26a72bec5d85ee5213cfcfc7389c3560268acab06901d0d0",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

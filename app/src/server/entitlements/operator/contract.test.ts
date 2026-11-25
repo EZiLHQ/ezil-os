@@ -158,3 +158,35 @@ describe('issued_by: the optional issuing-organization name of an assign', () =>
         expect(() => canonicalJson(parseCommand(named('ok')) as unknown as Record<string, unknown>)).not.toThrow();
     });
 });
+
+describe('access_override: the optional explicit-override flag of a command (0038)', () => {
+    const CHANGE = { ...END, action: 'change', product: { ref: 'premium_monthly_v3', catalog_revision: 'v3.2026-11-04' }, validity: null };
+    it('absent is the v1 command byte for byte; exactly true on an assign parses, coexists with issued_by and is in the payload hash', () => {
+        expect(Object.hasOwn(parseCommand(ASSIGN), 'access_override')).toBe(false);
+        expect(payloadSha256(ASSIGN)).toBe(VECTOR.payloadSha256);
+        const flagged = { ...ASSIGN, access_override: true };
+        expect(parseCommand(flagged)).toEqual(flagged);
+        expect(parseCommand({ ...flagged, issued_by: 'Acme Labs' })).toEqual({ ...flagged, issued_by: 'Acme Labs' });
+        expect(parseCommand({ ...flagged, product: { ref: 'free_v3', catalog_revision: 'v3.2026-11-04' }, validity: { until_revoked: true } }).product!.ref).toBe('free_v3');
+        expect(payloadSha256(flagged)).not.toBe(payloadSha256(ASSIGN));
+    });
+    it('exactly true parses on change and end too (the kind match is the service check); anything else is invalid on every action', () => {
+        for (const base of [ASSIGN, CHANGE, END]) {
+            expect(parseCommand({ ...base, access_override: true })).toEqual({ ...base, access_override: true });
+            for (const value of [false, null, 'true', 1, {}]) expect(() => parseCommand({ ...base, access_override: value })).toThrow(InvalidCommand);
+        }
+        expect(Object.hasOwn(parseCommand(CHANGE), 'access_override')).toBe(false);
+        expect(Object.hasOwn(parseCommand(END), 'access_override')).toBe(false);
+        // issued_by stays assign-only, with or without the flag.
+        expect(() => parseCommand({ ...END, access_override: true, issued_by: 'Acme Labs' })).toThrow(InvalidCommand);
+    });
+    it('the catalog advertises access_overrides only when asked to, keeps Free unassignable and never moves catalog_revision', () => {
+        const v1 = sourceCatalog(), installed = sourceCatalog({ accessOverrides: true });
+        expect(Object.hasOwn(v1, 'access_overrides')).toBe(false);
+        expect(Object.hasOwn(sourceCatalog({ accessOverrides: false }), 'access_overrides')).toBe(false);
+        expect(installed).toEqual({ ...v1, access_overrides: true });
+        // Pinned before 0038: a Gateway command signed against today's catalog stays valid across the rollout.
+        expect(installed.catalog_revision).toBe('os-v3.b9d62a3fbdc88e44');
+        expect(installed.products.find(p => p.ref === 'free_v3')).toMatchObject({ assignable: false });
+    });
+});

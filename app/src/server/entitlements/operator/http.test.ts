@@ -31,6 +31,7 @@ function deps(over: Partial<OperatorEntitlementDeps> = {}): () => Promise<Operat
         readAssignments: async () => [], withCommand: async (_c, _u, run) => run({
             findEvent: async () => null, withAccessTransaction: run => run(), assignments: async () => [], insertAssignment: async () => {}, updateAssignment: async () => true,
             closeLapsed: async () => {}, insertEvent: async () => {} }),
+        accessOverridesInstalled: async () => false,
         ...over,
     };
     return async () => value;

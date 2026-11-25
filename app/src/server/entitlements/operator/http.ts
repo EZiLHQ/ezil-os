@@ -32,7 +32,7 @@ export async function handleAdminEntitlementRequest(request: Request, endpoint: 
     if (!kid) return json(401, { error: 'unauthorized_sender' });
     if (method !== expected) return json(405, { error: 'method_not_allowed' });
     try {
-        if (endpoint === 'catalog') return json(200, catalog());
+        if (endpoint === 'catalog') return json(200, await catalog(await options.deps()));
         if (endpoint === 'assignments') {
             const osUserId = url.searchParams.get('os_user_id') ?? '', account = url.searchParams.get('account_public_id') ?? '';
             if (!UUID.test(osUserId) || !UUID.test(account) || [...url.searchParams.keys()].some(k => k !== 'os_user_id' && k !== 'account_public_id')) {
