@@ -1159,6 +1159,34 @@ describe('billing v3 mutations', () => {
         expect(f.stripe.confirmUpgrade).not.toHaveBeenCalled();
     });
 
+    it('blocks direct plan changes while a compute override is live and allows them after expiry', async () => {
+        const override = {
+            ref: 'osg-00000000-0000-4000-8000-0000000000bb',
+            revision: 1, userId, accountPublicId: '10000000-0000-4000-8000-0000000000a1',
+            sku: 'free_v3' as const, startsAt: new Date(now.getTime() - 1000),
+            endsAt: new Date(now.getTime() + 1000), endedAt: null, accessOverride: true,
+        };
+        const standard = await paidFixture();
+        const standardStore: BillingStore = standard.store;
+        standardStore.operatorEntitlementsFor = vi.fn(async () => [override]);
+        await domainFailure(() => standard.caller.previewUpgrade(toCompute), 'upgrade_not_allowed');
+        await domainFailure(() => standard.caller.confirmUpgrade(confirmInput), 'upgrade_not_allowed');
+        expect(standard.stripe.retrieveSubscription).not.toHaveBeenCalled();
+        expect(standard.stripe.previewUpgrade).not.toHaveBeenCalled();
+        expect(standard.stripe.confirmUpgrade).not.toHaveBeenCalled();
+        expect(standard.store.recordPlanChange).not.toHaveBeenCalled();
+        standardStore.operatorEntitlementsFor = vi.fn(async () => [{ ...override, endsAt: now }]);
+        await expect(standard.caller.previewUpgrade(toCompute)).resolves.toMatchObject(toCompute);
+
+        const premium = await paidFixture('premium_monthly_v3');
+        const premiumStore: BillingStore = premium.store;
+        premiumStore.operatorEntitlementsFor = vi.fn(async () => [override]);
+        await domainFailure(() => premium.caller.scheduleDowngrade(toStandard), 'downgrade_not_allowed');
+        expect(premium.stripe.retrieveSubscription).not.toHaveBeenCalled();
+        expect(premium.stripe.scheduleDowngrade).not.toHaveBeenCalled();
+        expect(premium.store.recordPlanChange).not.toHaveBeenCalled();
+    });
+
     it('schedules a downgrade, persists its identity, and ignores foreign plan changes', async () => {
         const f = await paidFixture('premium_monthly_v3');
         f.changes.push(change({ subscriptionId: 'sub_foreign', kind: 'downgrade', state: 'scheduled' }));
