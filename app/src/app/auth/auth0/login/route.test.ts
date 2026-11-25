@@ -4,6 +4,7 @@ vi.mock('server-only', () => ({}));
 const set = vi.hoisted(() => vi.fn());
 vi.mock('next/headers', () => ({ cookies: async () => ({ set }) }));
 import { GET } from './route';
+import { readTransaction } from '@/server/auth/auth0';
 afterEach(() => { vi.unstubAllEnvs(); vi.clearAllMocks(); });
 
 describe('Auth0 login route', () => {
@@ -35,6 +36,28 @@ describe('Auth0 login route: silent re-auth', () => {
         }
         const plain = new URL((await GET(new NextRequest('https://os-staging.ezil.work/auth/auth0/login'))).headers.get('location')!);
         expect(plain.searchParams.has('prompt')).toBe(false);
+    });
+});
+
+describe('Auth0 login route: explicit assignment account sign-in', () => {
+    it('prompts for a fresh sign-in only on canonical same-origin assignment returns', async () => {
+        vi.stubEnv('AUTH0_CLIENT_ID', 'test-client'); vi.stubEnv('AUTH0_SECRET_ID', 'test-secret');
+        const id = '00000000-0000-4000-8000-000000000001';
+        const code = '/app/code?repo=https%3A//github.ezil.work/default/u-0000000000000000-a-'+id+'.git';
+        const start = async (returnUrl:string) => {
+            const query = new URLSearchParams({prompt:'login',returnUrl});
+            const response = await GET(new NextRequest('https://os.ezil.work/auth/auth0/login?'+query));
+            return new URL(response.headers.get('location')!);
+        };
+        for (const path of [code, code+'&assignment='+id+'&computer='+id]) {
+            const url = await start(path);
+            expect(url.searchParams.get('prompt')).toBe('login');
+            expect(readTransaction(set.mock.lastCall![1], url.searchParams.get('state')).returnUrl).toBe(path);
+        }
+        for (const path of [code+'&assignment=other', code+'&project='+id, code+'&repo=other',
+            '/app/code', 'https://elsewhere.example'+code, code.replace('github.ezil.work','elsewhere.example')]) {
+            expect((await start(path)).searchParams.has('prompt')).toBe(false);
+        }
     });
 });
 

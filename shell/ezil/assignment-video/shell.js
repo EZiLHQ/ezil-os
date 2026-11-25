@@ -106,10 +106,17 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         const dest='/app/code?'+params;
         ui.action('Sign in to EZiL OS',()=>win.location.assign('/auth/auth0/login?'+new URLSearchParams({returnUrl:dest})));
     }
+    function showAccountSignIn(){
+        lockedView('Sign in to EZiL OS','Use the same EZiL ID you used on Universe.');
+        const target=new URL(entry);
+        const returnUrl=target.pathname+target.search+target.hash;
+        const params=new URLSearchParams({prompt:'login',returnUrl});
+        ui.action('Sign in to EZiL OS',()=>win.location.assign('/auth/auth0/login?'+params));
+    }
     async function eligible(){
         lockedView('Checking assignment','Verifying the assigned repository and OS session…');
         try{
-            const result=await retry(()=>checkAssignmentVideoEligibility(attemptId),['media_unavailable','recording_unavailable']);
+            const result=await retry(()=>checkAssignmentVideoEligibility(attemptId,{repositoryUrl:repo}),['media_unavailable','recording_unavailable']);
             if(!isHere())return;
             if(result.status!=='eligible' || result.attemptId!==attemptId || result.repositoryUrl!==repo)throw failure('assignment_mismatch');
             // Only an AWS computer is checked here: any other provider keeps its own path, and the server decides it.
@@ -128,6 +135,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         }catch(e){
             if(!isHere())return;
             if(e.code==='identity_refresh_required'){showSignIn();return;}
+            if(e.code==='assignment_identity_mismatch'){showAccountSignIn();return;}
             if(e.code==='assignment_video_creator_unlinked'){
                 lockedView('The Creator needs to connect EZiL ID','The job Creator must sign in to Universe with their verified EZiL ID. Return to the job to check whether your assignment is still available.');
                 ui.action('Return to Universe jobs',()=>win.open('https://universe-staging.ezil.work/builder-jobs','_self','noreferrer'));

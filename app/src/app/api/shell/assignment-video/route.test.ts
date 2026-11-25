@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('server-only',()=>({}));
 const mocks = vi.hoisted(() => ({context:vi.fn(),identity:vi.fn(),action:vi.fn()}));
 vi.mock('@/server/api/trpc',()=>({createTRPCContext:mocks.context}));
 vi.mock('@/server/auth/retained-identity',()=>({retainedIdentity:mocks.identity}));
@@ -8,6 +9,7 @@ vi.mock('@/server/shell/http',()=>({
     shellJson:(data:unknown,status=200)=>Response.json(data,{status,headers:{'cache-control':'no-store'}}),
 }));
 import { POST } from './route';
+import { expectedRepositoryURL } from '@/server/git/assignment-enrollment';
 import { BrokerError, creatorUnlinked } from '@/server/assignment-video/contract';
 const attemptId='00000000-0000-4000-8000-000000000001';
 const action={attemptId,action:'status'};
@@ -72,6 +74,24 @@ describe('same-origin actual assignment shell route',()=>{
             expect((await post(defaults,invalid)).status).toBe(400);
         }
         expect(mocks.action).not.toHaveBeenCalled();
+    });
+    it('checks the presented repository against the current identity without querying Universe for a mismatched link',async()=>{
+        const preflight = {attemptId,action:'preflight'};
+        const repositoryUrl = expectedRepositoryURL('participant', 'a-' + attemptId);
+        const otherUrl = expectedRepositoryURL('different-account', 'a-' + attemptId);
+        const withRepo = (url: string) => ({...defaults,'x-ezil-assignment-repository':url});
+        const wrong = await post(withRepo(otherUrl),preflight);
+        expect(wrong.status).toBe(409);
+        expect(await wrong.json()).toEqual({error:{code:'assignment_identity_mismatch'}});
+        for (const invalid of [otherUrl.replace(attemptId,'00000000-0000-4000-8000-000000000099'),
+            repositoryUrl.replace('github.ezil.work','other.example'), repositoryUrl+'?hint=1']) {
+            expect((await post(withRepo(invalid),preflight)).status).toBe(400);
+        }
+        expect((await post(defaults,{...action,repositoryUrl})).status).toBe(400);
+        expect(mocks.action).not.toHaveBeenCalled();
+        expect((await post(withRepo(repositoryUrl),preflight)).status).toBe(200);
+        expect((await post(defaults,preflight)).status).toBe(200); // Older builds send no repository hint.
+        for (const call of mocks.action.mock.calls) expect(call[1]).toEqual(preflight);
     });
     it('sends only the normal validated action and identity and returns a private no-store receipt',async()=>{
         const res=await post();

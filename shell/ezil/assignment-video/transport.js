@@ -4,11 +4,12 @@ const bucket = 'https://ezil-universe-staging-assignment-media-452630323510-aps1
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const failure = (code) => Object.assign(new Error(code), {code});
 
-async function callControl(attemptId, action, fields, fetcher) {
+async function callControl(attemptId, action, fields, fetcher, repositoryUrl) {
     let response;
     try { response = await fetcher(path, {method: 'POST', credentials: 'same-origin', cache: 'no-store',
         redirect: 'error', signal: AbortSignal.timeout(18000),
-        headers: {'Content-Type':'application/json', 'X-Ezil-Assignment-Video':'1'},
+        headers: {'Content-Type':'application/json', 'X-Ezil-Assignment-Video':'1',
+            ...(repositoryUrl ? {'X-Ezil-Assignment-Repository':repositoryUrl} : {})},
         body: JSON.stringify({action,attemptId,...fields})}); }
     catch {throw failure('media_unavailable');}
     let data;
@@ -21,9 +22,9 @@ async function callControl(attemptId, action, fields, fetcher) {
     return data;
 }
 
-export async function checkAssignmentVideoEligibility(attemptId, {fetcher = globalThis.fetch, clock = Date.now} = {}) {
+export async function checkAssignmentVideoEligibility(attemptId, {repositoryUrl, fetcher = globalThis.fetch, clock = Date.now} = {}) {
     if (!uuid.test(attemptId)) throw failure('invalid_assignment');
-    const result = await callControl(attemptId, 'preflight', {}, fetcher);
+    const result = await callControl(attemptId, 'preflight', {}, fetcher, repositoryUrl);
     if (result.status !== 'eligible' || result.attemptId !== attemptId || !Number.isFinite(Date.parse(result.expiresAt))
         || Date.parse(result.expiresAt) <= clock()) throw failure('recording_unavailable');
     return result;
