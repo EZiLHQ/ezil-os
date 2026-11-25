@@ -1069,3 +1069,21 @@ test('retirement hint can only target the exact AWS staging ledger path and neve
     assert.ok(args[args.indexOf('-f') + 1].endsWith('/' + RETIRED_HOST_RELEASE_FILE));
     assert.ok(args.at(-1).includes(files.find(({ file }) => file === RETIRED_HOST_RELEASE_FILE).sha256));
 });
+
+test('operator access overrides activate only by explicit AWS preview apply', () => {
+    const overrideFile = 'app/drizzle/0038_operator_access_overrides.sql';
+    const explicit = previewHarness();
+    assert.equal(run(['apply', '--only', overrideFile, '--yes', ...previewArgs], explicit.options), 0);
+    assert.equal(schemaRuns(explicit).length, 1);
+    const { args } = schemaRuns(explicit)[0];
+    assert.ok(args[args.indexOf('-f') + 1].endsWith(overrideFile));
+
+    const production = productionHarness();
+    assert.equal(run(['apply', '--only', overrideFile, '--yes', ...productionArgs], production.options), 1);
+    assert.equal(production.calls.length, 0);
+
+    const defaultApply = previewHarness();
+    assert.equal(run(['apply', '--yes', ...previewArgs], defaultApply.options), 0);
+    assert.equal(schemaRuns(defaultApply).some(({ args }) =>
+        args[args.indexOf('-f') + 1].endsWith(overrideFile)), false);
+});
