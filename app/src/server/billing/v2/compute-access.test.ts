@@ -9,11 +9,13 @@ import { billingMeteringActive, billingV2EntitlementReader, computeGrantPending,
 import { paidComputeUnmetered } from '../../lib/compute/paid-compute-policy';
 import { buildSummaryV2 } from './summary';
 import { buildSummaryV3 } from '../v3/summary';
+import { CATALOG_V3 } from '../v3/contract';
 import * as rating from './rating';
 import * as admissionV3 from '../v3/admission';
 import { epochSeconds, isoSeconds } from './time';
 import { resolveEntitlement } from '../../lib/compute/tier';
 import type { OperatorEntitlementRow } from '../v3/operator-access';
+import type { AccessRow } from '../v3/effective-access';
 
 vi.mock('../deps', () => ({ getBillingDeps: vi.fn(() => { throw new Error('Inject billing deps'); }) }));
 
@@ -54,7 +56,7 @@ function fixture(over: Partial<Input> = {}) {
     };
     const calls: { name: string; args: unknown[] }[] = [];
     // Product entitlements v1: the account's operator assignments (none unless a test adds them).
-    const operator: OperatorEntitlementRow[] = [];
+    const operator: AccessRow[] = [];
     const methods = {
         subscriptionsFor: async () => input.subs,
         operatorEntitlementsFor: async () => [...operator],
@@ -859,3 +861,65 @@ describe('product entitlements v1: operator-assigned access', () => {
     });
 });
 
+
+// Explicit access override (Notion 4117021e…): the override decides the effective tier over Stripe paid access, through the
+// same readers (gate, ready-time epoch, entitlement reader, summary); Stripe rows, receipts and AI credits are only read.
+describe('explicit access override: effective tier through the compute readers', () => {
+    const DAY = 86_400_000;
+    const overrideRow = (over: Partial<AccessRow> = {}): AccessRow => ({ ref: 'osg-00000000-0000-4000-8000-0000000000bb', revision: 1, userId: USER,
+        accountPublicId: '10000000-0000-4000-8000-0000000000a1', sku: 'free_v3', startsAt: new Date('2026-10-17T00:00:00Z'),
+        endsAt: new Date(NOW.getTime() + 30 * DAY), endedAt: null, accessOverride: true, ...over });
+    const enforced = () => readBillingConfig({ BILLING_ENFORCEMENT: '1' });
+    const premiumPayer = () => fixture({ config: enforced(), subs: [subscription({ sku: 'premium_monthly_v3' })],
+        grants: [grant({ amount: BigInt(1_800_000) })], sizePreference: 'cmp-8' });
+
+    it('a Free override over a paying Premium subscriber: Free state, Free limits, Free since its start; AWS opens only as the D16 hold', async () => {
+        const { deps, operator, calls } = premiumPayer();
+        operator.push(overrideRow());
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject({ planSku: 'free_v3', v3: { sku: 'free_v3' }, provider: 'cloudflare', entitledSize: 'free-cf', subscriptionId: null,
+            sessionMaxSeconds: CATALOG_V3.free_v3.sessionMaxSeconds, paymentIssue: false, grantPending: false, freeSince: '2026-10-17T00:00:00Z' });
+        expect(paidComputeUnmeteredState(state)).toBe(false);
+        expect(state.summary.version === 3 && state.summary.plan).toMatchObject({ sku: 'free_v3', access: { source: 'operator', override: true } });
+        // The held Premium-size computer stays closed; the D16 hold size opens under Free; Cloudflare opens.
+        expect(await gateComputerStart({ deps, userId: USER, computerId: 'held', kind: 'aws-ec2', instanceType: 'm6i.2xlarge', now: NOW }))
+            .toEqual({ allowed: false, reason: 'files_on_aws' });
+        expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'cloudflare', instanceType: null, now: NOW })).toEqual({ allowed: true });
+        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({ planId: 'free_v3', provider: 'cloudflare', size: 'free-cf' });
+        // Reads only: no Stripe, grant or credit write (the strict store throws on any other method).
+        expect(calls.every(c => /^(epochsFor|grantsForPeriod|openEpochFor|openPaymentIssues|openPlanChanges|operatorEntitlementsFor|sizePreference|subscriptionsFor|userCreatedAt)$/.test(c.name))).toBe(true);
+    });
+
+    it('positive control: the same subscriber without the override is Premium on AWS', async () => {
+        const { deps } = premiumPayer();
+        expect(await loadComputeBillingState(deps, USER, NOW)).toMatchObject({ planSku: 'premium_monthly_v3', provider: 'aws', entitledSize: 'cmp-8', freeSince: null });
+        expect(await gateComputerStart({ deps, userId: USER, computerId: 'held', kind: 'aws-ec2', instanceType: 'm6i.2xlarge', now: NOW })).toEqual({ allowed: true });
+    });
+
+    it('a Standard override over a Premium payer: Standard size on AWS at the next start (no cmp-8 machine choice), unmetered', async () => {
+        const { deps, operator } = premiumPayer();
+        operator.push(overrideRow({ sku: 'standard_monthly_v3' }));
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject({ planSku: 'standard_monthly_v3', provider: 'aws', entitledSize: 'std-2', subscriptionId: null, freeSince: null });
+        expect(paidComputeUnmeteredState(state)).toBe(true);
+        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({ planId: 'standard_monthly_v3', status: 'active', size: 'std-2' });
+    });
+
+    it('a Premium override over Free decides like a paid plan; it beats an ordinary Standard grant', async () => {
+        const { deps, operator } = fixture({ config: enforced(), sizePreference: 'cmp-8' });
+        operator.push({ ...overrideRow({ sku: 'standard_monthly_v3' }), accessOverride: undefined, ref: 'osg-00000000-0000-4000-8000-000000000001' },
+            overrideRow({ sku: 'premium_monthly_v3' }));
+        expect(await loadComputeBillingState(deps, USER, NOW)).toMatchObject({ planSku: 'premium_monthly_v3', provider: 'aws', entitledSize: 'cmp-8' });
+    });
+
+    it.each([
+        ['ended by an operator', { endedAt: new Date(NOW.getTime() - 1000) }],
+        ['past its end', { endsAt: new Date(NOW.getTime() - 1000) }],
+    ])('a Free override %s: the Stripe Premium plan returns at once', async (_name, over) => {
+        const { deps, operator } = premiumPayer();
+        operator.push(overrideRow(over));
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject({ planSku: 'premium_monthly_v3', provider: 'aws', subscriptionId: 'sub_a', freeSince: null });
+        expect(state.summary.version === 3 && state.summary.plan).not.toHaveProperty('access');
+    });
+});

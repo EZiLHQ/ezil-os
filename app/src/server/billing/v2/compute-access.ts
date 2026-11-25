@@ -78,7 +78,8 @@ export async function loadComputeBillingState(deps: BillingDeps, userId: string,
         deps.store.openPlanChanges(userId),
         deps.store.operatorEntitlementsFor?.(userId) ?? [],
     ]);
-    // Product entitlements v1: an operator grant decides the plan only where Stripe gives no paid access (paid wins).
+    // Product entitlements v1: a live explicit override decides the plan; otherwise an operator grant decides it only where
+    // Stripe gives no paid access (paid wins).
     const operator = operatorGrants.length
         ? operatorAccessFor({ subscriptions: subs, paymentIssues: await deps.store.openPaymentIssues(userId), grants: operatorGrants, now }) : null;
     const resolved = planV3({ subs, now, userCreatedAt, operator });
@@ -104,9 +105,10 @@ export async function loadComputeBillingState(deps: BillingDeps, userId: string,
             entitledSize: summary.computer.size, provider: resolved.offer.provider, window: resolved.window,
             usedStdSeconds: usedSecondsInWindow(epochs, resolved.window, now, { sessionMaxSeconds: resolved.sessionMaxSeconds, allowanceStdSeconds: allowance }),
             allowanceStdSeconds: allowance, overage: null, summary,
-            // deriveStanding reports the drop time (heldSince) only with files on AWS; it is the same for any placement.
+            // deriveStanding reports the drop time (heldSince) only with files on AWS; it is the same for any placement. An
+            // explicit Free override drops at its own start, whatever Stripe says.
             freeSince: paidAccess(standing) ? null
-                : deriveStanding({ subscriptions: subs, paymentIssues, placementProvider: 'aws-ec2', now }).heldSince,
+                : deriveStanding({ subscriptions: subs, paymentIssues, placementProvider: 'aws-ec2', now, operator }).heldSince,
             // Grace has its own allowance (D17); a refund or revoke row is a real zero, not a grant still to come.
             grantPending: renewalGrantPending(resolved, standing, grants, now),
         };

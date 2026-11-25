@@ -799,6 +799,48 @@ describe('product entitlements v1: who assigned the plan', () => {
     });
 });
 
+// Explicit access override: it decides the plan card's tier and computer; the payer's own Stripe subscription keeps its
+// cancel and portal, AI credits stay the Stripe plan's, and no purchase (checkout, trial, upgrade, downgrade) is offered.
+describe('explicit access override: the summary', () => {
+    const override = (sku: 'free_v3' | 'standard_monthly_v3' | 'premium_monthly_v3') => ({ ref: 'osg-00000000-0000-4000-8000-0000000000bb', revision: 1,
+        userId: 'u', accountPublicId: '10000000-0000-4000-8000-0000000000a1', sku, startsAt: new Date(now.getTime() - 86_400_000),
+        endsAt: new Date(now.getTime() + 7 * 86_400_000), endedAt: null, accessOverride: true });
+    const payer = () => withSubscriptionId(input('premium_monthly_v3'), 'sub_fixture');
+
+    it('a Free override over a Premium payer: Free plan and computer, override marked, cancel and portal kept, Premium credits, no purchase', () => {
+        const args = { ...payer(), operatorGrants: [override('free_v3')], placementProvider: 'aws-ec2' as const,
+            trialOffer: { eligible: true as const, sku: 'standard_monthly_v3' as const, endsAt: '2026-11-19T12:00:00Z', amountCents: 2000, currency: 'usd' as const } };
+        const summary = buildSummaryV3(args);
+        expect(summary.plan).toMatchObject({ sku: 'free_v3', status: 'free', renewal: null, access: { source: 'operator', override: true,
+            endsAt: '2026-10-26T12:00:00Z', untilRevoked: false } });
+        expect(summary.computer).toMatchObject({ standing: 'files_on_aws', filesOn: 'aws', heldSince: '2026-10-18T12:00:00Z' });
+        expect(summary.actions).toMatchObject({ checkout: false, upgrade: false, downgrade: false, cancel: true, portal: true });
+        expect('trialOffer' in summary).toBe(false);
+        expect(summary.ai.grant).toEqual(CATALOG_V3.premium_monthly_v3.aiCredits);
+        // Positive control: the same payer without the override is Premium with its Stripe actions.
+        const paid = buildSummaryV3(payer());
+        expect(paid.plan).toMatchObject({ sku: 'premium_monthly_v3' });
+        expect(paid.plan.access).toBeUndefined();
+        expect(paid.actions).toMatchObject({ downgrade: true, cancel: true, portal: true });
+    });
+
+    it.each(['standard_monthly_v3', 'premium_monthly_v3'] as const)('a %s override: that tier, unmetered, marked; a Free viewer gets no checkout under it', sku => {
+        const summary = buildSummaryV3({ ...input(), operatorGrants: [override(sku)] });
+        expect(summary.plan).toMatchObject({ sku, status: 'active', access: { override: true } });
+        expect(summary.fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
+        expect(summary.actions).toMatchObject({ checkout: false, cancel: false, portal: false });
+        // A Free viewer's own AI credits are Free's (the override grants none and takes none).
+        expect(summary.ai.grant).toEqual(CATALOG_V3.free_v3.aiCredits);
+    });
+
+    it('an ordinary grant keeps its exact keys (no override key) and its no-Stripe rule', () => {
+        const grant = { ...override('standard_monthly_v3'), accessOverride: undefined };
+        const summary = buildSummaryV3({ ...payer(), subs: [], grants: [], operatorGrants: [grant] });
+        expect(Object.keys(summary.plan.access!).sort()).toEqual(['endsAt', 'issuedBy', 'ref', 'source', 'untilRevoked']);
+        expect(summary.actions).toMatchObject({ portal: false, cancel: false });
+        expect(summary.ai.grant).toEqual({ amount: 0, per: 'period' });
+    });
+});
 
 describe('Standard trial summary', () => {
     const trialStart = new Date('2026-10-10T00:00:00Z'), trialEnd = new Date('2026-11-10T00:00:00Z');

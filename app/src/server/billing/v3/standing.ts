@@ -13,6 +13,8 @@
  *   `incomplete`, or grace over). `files_on_aws` while any of the user's computers still has an aws-ec2
  *   placement (D16 hold); nothing has moved (the move is Phase B, `computer.move` stays null).
  * - D19: a refund is a negative grant, never a status change, so it never changes the standing.
+ * - Explicit access override (effective-access.ts): a live Free override is `free` / `files_on_aws` from its start, over
+ *   any Stripe standing; a live Standard/Premium override is `paid`. Ending it returns the standing to the sources below it.
  * - Standard trial (0021): a subscription with a trial that has never had a positive paid period has no renewal to be
  *   in grace for. Its first failed charge drops paid access at once (files kept, nothing moved); a later successful
  *   payment restores it. Grace after a previously paid renewal is unchanged.
@@ -22,7 +24,7 @@ import type { PaymentIssueRow } from '../ports';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { planFromSubscriptions } from './catalog';
 import type { ComputeStandingV3 } from './contract';
-import { operatorAccess, type OperatorEntitlementRow } from './operator-access';
+import { effectiveAccess, paidAccessRow, type AccessRow, type EffectiveAccess } from './effective-access';
 
 export const PAYMENT_GRACE_DAYS = 7 as const;
 export const PAYMENT_GRACE_SECONDS = PAYMENT_GRACE_DAYS * 86_400;
@@ -77,10 +79,15 @@ export function deriveStanding(input: {
     /** Any aws-ec2 placement among the user's live computers → 'aws-ec2'; null = unknown or none. */
     placementProvider: 'aws-ec2' | 'cloudflare' | null;
     now: Date;
-    /** The operator grant that decides the plan (`operatorAccessFor`): paid standing, no Stripe dates. */
-    operator?: OperatorEntitlementRow | null;
+    /**
+     * The operator row that decides the plan (`operatorAccessFor`): a paid grant or override is paid standing with no
+     * Stripe dates; an explicit Free override is Free whatever Stripe says (the D16 hold while the files are on AWS).
+     */
+    operator?: AccessRow | null;
 }): StandingV3 {
     const filesOn = input.placementProvider === 'aws-ec2' ? 'aws' : 'cloudflare';
+    if (input.operator && !paidAccessRow(input.operator)) return { standing: filesOn === 'aws' ? 'files_on_aws' : 'free',
+        graceEndsAt: null, planEndsAt: null, filesOn, heldSince: filesOn === 'aws' ? at(input.operator.startsAt) : null };
     if (input.operator) return { standing: 'paid', graceEndsAt: null, planEndsAt: null, filesOn, heldSince: null };
     const now = epochSeconds(input.now);
     // The same subscription precedence as the plan the Billing tab shows.
@@ -126,16 +133,25 @@ function lastEndedPeriod(subs: readonly SubscriptionRow[], now: number): string 
     return newest !== undefined && epochSeconds(newest) <= now ? at(newest) : null;
 }
 
+type AccessInput = { subscriptions: readonly SubscriptionRow[]; paymentIssues: readonly StandingIssue[];
+    grants: readonly AccessRow[] | null | undefined; now: Date };
+
 /**
- * Product entitlements v1: the operator grant that decides this account's plan. Stripe paid access (paid, renewal grace,
- * ending at period end) always wins and is never replaced; otherwise the grant in effect at `now`; otherwise null (the
- * Stripe-only plan, Free when there is none). Every reader passes its result to `planFromSubscriptions` and
- * `deriveStanding` as `operator`.
+ * Which source decides this account's effective tier (effective-access.ts): a live explicit override, else Stripe paid
+ * access (paid, renewal grace, ending at period end), else an ordinary operator grant in effect, else Free.
  */
-export function operatorAccessFor(input: { subscriptions: readonly SubscriptionRow[]; paymentIssues: readonly StandingIssue[];
-    grants: readonly OperatorEntitlementRow[] | null | undefined; now: Date }): OperatorEntitlementRow | null {
-    if (!input.grants?.length) return null;
+export function effectiveAccessFor(input: AccessInput): EffectiveAccess {
     const stripe = deriveStanding({ subscriptions: input.subscriptions, paymentIssues: input.paymentIssues, placementProvider: null, now: input.now });
-    return operatorAccess({ grants: input.grants, now: input.now, stripePaidAccess: paidAccess(stripe.standing) });
+    return effectiveAccess({ grants: input.grants, now: input.now, stripePaidAccess: paidAccess(stripe.standing) });
+}
+
+/**
+ * Product entitlements v1: the operator row that decides this account's plan, or null (the Stripe-only plan, Free when
+ * there is none). A live explicit override always decides; otherwise Stripe paid access wins over an ordinary grant and
+ * is never replaced by it. Every reader passes its result to `planFromSubscriptions` and `deriveStanding` as `operator`.
+ */
+export function operatorAccessFor(input: AccessInput): AccessRow | null {
+    if (!input.grants?.length) return null;
+    return effectiveAccessFor(input).row;
 }
 

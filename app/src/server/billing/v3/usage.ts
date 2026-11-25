@@ -6,7 +6,7 @@ import { HOLD_SIZE } from './admission';
 import { planFromSubscriptions } from './catalog';
 import { hoursLeftAtWeight } from './contract';
 import { deriveStanding, operatorAccessFor } from './standing';
-import type { OperatorEntitlementRow } from './operator-access';
+import type { AccessRow } from './effective-access';
 import { computePlanV3, fairUseAllowance, storageDisk, usedGiBOf, usedSecondsInWindow, type DiskComputer } from './summary';
 
 type Input = Parameters<typeof buildSummaryV2>[0] & {
@@ -20,7 +20,7 @@ type Input = Parameters<typeof buildSummaryV2>[0] & {
     /** The user's live computers (summary.ts `storageDisk`): the disk counts only their samples; omitted = every sample. */
     liveComputers?: readonly DiskComputer[];
     /** Product entitlements v1: the account's operator assignments; omitted = none. */
-    operatorGrants?: readonly OperatorEntitlementRow[];
+    operatorGrants?: readonly AccessRow[];
 };
 
 /** Read-only meter observations, not provider readiness or a live storage inventory. */
