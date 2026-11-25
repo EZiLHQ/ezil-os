@@ -143,6 +143,13 @@ async function refuseLiveStripeSubscription(stripe: StripeApi, customerId: strin
     }
 }
 
+async function refusePlanChangeDuringOverride(
+    deps: BillingDeps, userId: string, code: 'upgrade_not_allowed' | 'downgrade_not_allowed',
+) {
+    const rows = await deps.store.operatorEntitlementsFor?.(userId);
+    if (accessOverrideInEffect(rows, deps.now())) throw billingError(code, 'PRECONDITION_FAILED');
+}
+
 async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: string, toSku: string) {
     if (toSku !== 'premium_monthly_v3') throw billingError('unknown_sku', 'BAD_REQUEST');
     const { plan, changes, subs } = await currentPlan(deps, userId);
@@ -155,6 +162,7 @@ async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: stri
     if (row && neverPaidTrial(row)) throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     if (changes.some(change => change.kind === 'upgrade')) throw billingError('upgrade_pending', 'CONFLICT');
     if (changes.some(change => change.kind === 'downgrade')) throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
+    await refusePlanChangeDuringOverride(deps, userId, 'upgrade_not_allowed');
     const subscription = await ownedSubscription(deps, stripe, userId, subscriptionId, 'upgrade_not_allowed');
     if (subscription.scheduleId !== null || subscription.status === 'trialing') throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     return { plan, subscriptionId };
@@ -963,6 +971,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 if (input.toSku !== 'standard_monthly_v3') throw billingError('unknown_sku', 'BAD_REQUEST');
                 const { plan, changes } = await currentPlan(deps, ctx.user.id);
                 const subscriptionId = paidSubscription(plan);
+                await refusePlanChangeDuringOverride(deps, ctx.user.id, 'downgrade_not_allowed');
                 await ownedSubscription(deps, stripe, ctx.user.id, subscriptionId, 'downgrade_not_allowed');
                 if (plan.sku !== 'premium_monthly_v3' || plan.status !== 'active'
                     || changes.some(change => change.kind === 'downgrade')) {
