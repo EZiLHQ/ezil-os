@@ -26,8 +26,8 @@ import { selectRuntimeAdapter, watchNativeSurface } from '../native-runtime.js';
 // ── 🔴 Mint the token per window-open — NEVER reuse an earlier one ─────────
 // The app-preview URL carries a bootstrap token good for FIVE MINUTES
 // (`APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS`, enforced by the Worker's
-// `verifyPreviewBootstrapToken`; the same reason
-// `cloudflare-guacamole-canvas.tsx` refetches the full desktop's URL on a
+// `verifyPreviewBootstrapToken`; the same reason the removed
+// `/computer/[id]` canvas refetched the full desktop's URL on a
 // timer). A page can sit open for a long time between load and the user
 // actually clicking the Preview icon, so a URL captured at boot-payload time —
 // or cached from a PRIOR window-open — is routinely already dead by the time a

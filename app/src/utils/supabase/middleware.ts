@@ -11,7 +11,7 @@ import { authCookieOptions, isHttpsRequest, isLegacyAuthCookie } from './cookie-
  * can't write cookies, so if we didn't refresh here, a session nearing
  * expiry could go stale mid-render. Route-level auth *gating* (redirecting
  * an unauthenticated visitor to /login) happens separately in each
- * protected layout (see app/computers/layout.tsx, app/computer/layout.tsx)
+ * protected layout (see app/computers/layout.tsx)
  * — this function's only job is keeping the session cookie current.
  *
  * Also stamps an `x-pathname` request header with the current path, so a
@@ -53,7 +53,7 @@ export async function updateSession(request: NextRequest) {
     // 🔴 `getSession()`, deliberately, NOT `getUser()`.
     //
     // This function performs no authorization: every protected surface calls
-    // `getUser()` itself (`app/computers/layout.tsx`, `app/computer/layout.tsx`,
+    // `getUser()` itself (`app/computers/layout.tsx`,
     // `createTRPCContext` for `/os` and every tRPC call), and that call is the
     // one that validates the token against the Auth server. What ran here was
     // a SECOND, identical validation of the same token, on the same request,

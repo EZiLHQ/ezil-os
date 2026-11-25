@@ -48,7 +48,6 @@ const serverSurface = (): Set<string> => {
  * desktop, and a third-party client has no coherent use for them.
  */
 const KNOWN_UNCOVERED: Record<string, string> = {
-    'computer.touch': 'stamps lastOpenedAt for the /computer/<id> route; not a third-party concern',
     'cloudflareGuacamole.confirmFrame': 'the shell confirming its own iframe painted',
     'cloudflareGuacamole.confirmDisplay': 'the shell confirming a stream is live',
     'cloudflareGuacamole.focusApp': 'foregrounds an app in the X session; drives the in-stream switcher',

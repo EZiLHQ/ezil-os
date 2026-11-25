@@ -59,7 +59,7 @@ import { HydrationSignal } from './hydration-signal';
  *    has no UI of its own. That is what makes the hydration handshake below
  *    necessary. Removing them means giving `/os` its own root layout, which in
  *    Next's App Router requires moving EVERY route into route groups — a
- *    change that touches `/computers` and `/computer/[id]`, which have to keep
+ *    change that touches `/computers`, which has to keep
  *    working as the fallback. It is the right follow-up, but not a change to
  *    make in the same breath as landing the shell.
  * 2. 🔴 React hydrates this document, and until it has, the shell may not
@@ -128,10 +128,9 @@ export default async function Page({ params: routeParams, searchParams }: {
             if (attempt && (await import('@/server/git/assignment-enrollment')).assignmentEnrollmentEnabled())
                 return <AssignmentSignInNotice attemptId={attempt} />;
         }
-        // Same gate as `src/app/computers/layout.tsx` and
-        // `src/app/computer/layout.tsx`. The pathname is known here (`/os`,
-        // or `/app/<id>` for an allowlisted id), so it is used directly rather
-        // than read back from `x-pathname`.
+        // Same gate as `src/app/computers/layout.tsx`. The pathname is known
+        // here (`/os`, or `/app/<id>` for an allowlisted id), so it is used
+        // directly rather than read back from `x-pathname`.
         redirect(`${Routes.LOGIN}?${getReturnUrlQueryParam(returnUrl)}`);
     }
 

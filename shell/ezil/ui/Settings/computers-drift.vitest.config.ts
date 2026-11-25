@@ -59,8 +59,7 @@ export default ({
             'react-dom/server': path.resolve(appRoot, 'node_modules/react-dom/server.js'),
             'react/jsx-runtime': path.resolve(appRoot, 'node_modules/react/jsx-runtime.js'),
             react: path.resolve(appRoot, 'node_modules/react'),
-            // `/computer/[id]/page` reaches `@/trpc/server`, which imports
-            // `server-only` — a Next bundler marker with no runtime entry
+            // `server-only` is a Next bundler marker with no runtime entry
             // point. See ./server-only.stub.ts.
             'server-only': path.resolve(here, 'server-only.stub.ts'),
             'next/navigation': path.resolve(here, 'next-navigation.stub.ts'),

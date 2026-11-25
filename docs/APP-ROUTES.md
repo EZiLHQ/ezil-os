@@ -36,6 +36,11 @@ app. There is no `launcher` app in the registry today.
   drift apart.
 - An allowlisted id that this boot cannot show (`secure-browser` outside the
   native Mac app) renders the shell and opens nothing, as `/os?app=<id>` did.
+- **`/computer/<uuid>` is gone** (25 Nov 2026). It was a React page that
+  showed one computer's desktop outside the shell. It answers 404 now. The
+  one address for "open this computer" is `/app/browser?computer=<uuid>`
+  (`computerViewerRoute` in `app/src/utils/constants.ts`), which is what a row
+  on `/computers` loads. `/computers` itself is unchanged.
 - **`/os` stays.** `/os?app=<id>` and `/os?settings=<tab>` are aliases. On
   boot the shell rewrites them in place (`replaceState`, no new entry) to
   `/app/<id>` and `/app/settings?tab=<tab>`. Every other query pair is kept
@@ -569,8 +574,9 @@ the login page, the login action, `/auth/callback`, `/auth/confirm` and the
 Auth0 flow:
 
 - accepts only this app's own return pages, with their query and hash:
-  `/os`, `/app/<allowlisted id>`, `/computers`, `/computer/<uuid>`,
-  `/billing/return`;
+  `/os`, `/app/<allowlisted id>`, `/computers`, `/billing/return`
+  (`/computer/<uuid>` was one until that page was removed on 25 Nov 2026;
+  it is now case 5);
 - rejects `//`, `/\`, any backslash, schemes, control characters and
   whitespace. The path must equal an allowlisted page, which is also what
   refuses dot segments (`/app/../admin`) and encoded separators or dots
@@ -588,7 +594,7 @@ The rule is five numbered cases, in this order, each commented in
 |---|---|---|
 | 1 | nothing: absent, `''`, `[]`, `['']` (a repeat counts by its first value) | `/os` |
 | 2 | hostile shape: a scheme or non-path, `//`, `/\`, a backslash anywhere (query included), a control character or whitespace | `/computers` |
-| 3 | a return page: `/os`, `/app/<registry id or alias>`, `/computers`, `/computer/<uuid>` (either case), `/billing/return` | itself, byte for byte, query and hash included (`path=src/main.ts` keeps its `/`) |
+| 3 | a return page: `/os`, `/app/<registry id or alias>`, `/computers`, `/billing/return` | itself, byte for byte, query and hash included (`path=src/main.ts` keeps its `/`) |
 | 4 | any other path under `/app` (`/app`, `/app/`, `/app/unknown`, `/app/Code`, `/app/../x`, `/app/%2e%2e/x`, `/app/code%2fx`, `/app/code%5cx`, `/app/code/x`) | `/os` |
 | 5 | any other path (`/apps`, `/app%2fcode` included) | `/computers` |
 
@@ -624,7 +630,7 @@ The producer audit behind the last column (grep for `returnUrl=`,
 `getReturnUrlQueryParam`, `RETURN_URL_PARAM` and `next=` in `app/src`,
 `shell/ezil`, `landing`, `e2e`, `worker/src`): the `/os` and `/app/[appId]`
 pages (`returnUrlFor` of the allowlisted literal), `computers/layout.tsx`
-and `computer/layout.tsx` (`x-pathname`: `/computers`, `/computer/<id>`),
+(`x-pathname`: `/computers`),
 `billing/return/page.tsx` (`/billing/return?session_id=…`), the pricing CTA
 (`/os?settings=billing&upgrade=<tier>`), `EZIL_ID_SIGN_IN_URL`
 (`/auth/auth0/login?returnUrl=/os`), and the e2e scripts (`/computers`,

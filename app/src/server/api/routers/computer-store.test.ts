@@ -147,7 +147,7 @@ describe('liveComputersOf (the filter computer.list uses)', () => {
     });
 });
 
-describe('liveOwnedComputer (the filter get/rename/touch/delete use)', () => {
+describe('liveOwnedComputer (the filter get/rename/delete use)', () => {
     it('requires the id, the owner AND a live row', async () => {
         const { db, statements } = makeTestDb();
 
