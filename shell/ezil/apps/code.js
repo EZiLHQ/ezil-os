@@ -1751,15 +1751,15 @@ export async function openCodeWindow (ctx = {}) {
                     el_iframe.setAttribute('aria-hidden','true');
                 } else el_iframe.removeAttribute('aria-hidden');
             },
-            async computerProvider() {
+            async computerInfo() {
                 const path = desktop_state.endpoints?.system;
                 if (path !== '/api/shell/system') return null;
-                const response = await fetch(path + '?' + new URLSearchParams({computerId:computer.id}), {
+                const response = await fetch(path + '?' + new URLSearchParams({computerId:computer.id, assignmentSession:'1'}), {
                     cache:'no-store', credentials:'same-origin', redirect:'error', signal:AbortSignal.timeout(7000),
                 });
                 if (!response.ok) return null;
                 const result = await response.json();
-                return result?.ok === true ? result.info?.provider : null;
+                return result?.ok === true ? result.info : null;
             },
             async prepare(attemptId, {signal}={}) {
                 if (!stillHere()) throw Object.assign(new Error('closed'),{code:'workspace_disconnected'});

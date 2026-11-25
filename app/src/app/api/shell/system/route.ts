@@ -24,8 +24,10 @@ export async function GET(req: Request) {
         const ctx = await createTRPCContext({ headers });
         if (!ctx.user) return shellUnauthenticated();
 
-        const computerId = new URL(req.url).searchParams.get('computerId') ?? '';
-        const info = await appRouter.createCaller(ctx).computer.systemInfo({ computerId });
+        const query = new URL(req.url).searchParams;
+        const computerId = query.get('computerId') ?? '';
+        const info = await appRouter.createCaller(ctx).computer.systemInfo({ computerId,
+            ...(query.get('assignmentSession') === '1' ? { assignmentSession: true as const } : {}) });
         return shellJson({ ok: true, info });
     } catch (err) {
         return shellErrorResponse(err, 'GET /api/shell/system');
