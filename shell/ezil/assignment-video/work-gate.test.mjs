@@ -106,7 +106,7 @@ test('verified production placement gates the picker and ordinary Code is unaffe
         win.top=win;Object.assign(globalThis,{window:win,document:doc});
         let opens=0,prepares=0;
         const gate=openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>'owner',computerId:'self',body:new Element(),
-            park(){},open(){opens++;},prepare(){prepares++;},computerProvider:async()=>provider});
+            park(){},open(){opens++;},prepare(){prepares++;},computerInfo:async()=>({provider})});
         await new Promise(r=>setImmediate(r));
         assert.equal(texts.includes('Choose an assignment-ready computer'),!consent);
         assert.equal(texts.includes('Share this OS tab and open assignment'),consent);assert.equal(gate.locked(),true);
@@ -140,4 +140,36 @@ test('an assignment sign-in refresh keeps the selected computer, repository and 
         assert.equal(back.pathname,'/app/code');
         assert.deepEqual([...back.searchParams],[['repo',repo],['assignment',id],['computer',computerId]]);
     }finally{await gate.close();}
+});
+test('only a confirmed old AWS session blocks consent; Stop and recheck retain the same attempt',async t=>{
+    const texts=[], actions=[], requests=[];
+    const doc={createElement(){const e=new Element();Object.defineProperty(e,'textContent',{set(v){this.label=v;texts.push(v);}});
+        actions.push(e);return e;}};
+    const origin='https://os.ezil.work';
+    const win={location:new URL(origin+'/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id),document:doc,
+        crypto:globalThis.crypto,isSecureContext:true,addEventListener(){},removeEventListener(){},
+        navigator:{mediaDevices:{getDisplayMedia(){assert.fail('a recheck must not choose a source');},setCaptureHandleConfig(){}}},
+        VideoFrame:class{},VideoEncoder:class{},MediaStreamTrack:class{getCaptureHandle(){}}};
+    win.top=win;Object.assign(globalThis,{window:win,document:doc});
+    let bound=null, info={provider:'aws-ec2',lifecycleState:'RUNNING',assignmentSession:'stop_then_reopen'};
+    t.mock.method(globalThis,'fetch',async(_url,options)=>{
+        const input=JSON.parse(options.body);requests.push(input.action);
+        return Response.json({status:'eligible',attemptId:id,repositoryUrl:repo,boundWorkspaceId:bound,expiresAt:new Date(Date.now()+60000).toISOString()});
+    });
+    const gate=openWithAssignmentConsent({project:{repoUrl:repo},computerId:'fixture',actor:()=>'owner',body:new Element(),
+        park(){},open(){assert.fail('no automatic open');},prepare(){assert.fail('no bootstrap');},computerInfo:async()=>info});
+    const check=()=>actions.findLast(e=>e.label==='Check this computer again');
+    try {
+        await new Promise(r=>setImmediate(r));
+        assert.ok(texts.includes('Update this computer for your assignment'));
+        assert.ok(texts.some(v=>v.includes('Save your work')&&v.includes('same computer')&&v.includes('Stopped')));
+        assert.ok(!texts.includes('Share this OS tab and open assignment'));
+        info={provider:'aws-ec2',lifecycleState:'STOPPING'};
+        check().onclick({isTrusted:true});await new Promise(r=>setImmediate(r));
+        assert.ok(texts.includes('Stopping your computer'));assert.ok(!texts.includes('Share this OS tab and open assignment'));
+        info={provider:'aws-ec2',lifecycleState:'STOPPED'};
+        check().onclick({isTrusted:true});await new Promise(r=>setImmediate(r));
+        assert.ok(texts.includes('Share this OS tab and open assignment'));assert.ok(gate.locked());
+        assert.ok(requests.every(action=>['preflight','clock'].includes(action)));
+    } finally {await gate.close();}
 });

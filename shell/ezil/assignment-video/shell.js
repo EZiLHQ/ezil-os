@@ -113,7 +113,7 @@ async function retry(operation, codes, times=2, live=()=>true) {
             await new Promise(resolve=>setTimeout(resolve,320*(i+1)));}}
 }
 
-export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare, computerProvider, settleMs=STOP_SETTLE_MS,
+export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare, computerInfo, settleMs=STOP_SETTLE_MS,
     saveCeilingMs=STOP_SAVE_CEILING_MS, frameMs=FRESH_FRAME_MS, clockLiveMs=CLOCK_LIVE_MS, clockIdleMs=CLOCK_IDLE_MS, reconnectMs=RECONNECT_OFFER_MS}) {
     const win=globalThis.window, repo=project?.repoUrl;
     if(!win || !assignmentOsOrigin(win.location.origin)){queueMicrotask(open);return null;}
@@ -289,7 +289,8 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             // The same attempt's clock is available while the provider is unavailable or sharing is stopped.
             void refreshClock();scheduleClock();
             if (win.location.origin === 'https://os.ezil.work') {
-                const provider = await computerProvider?.();
+                const info = await computerInfo?.();
+                const provider = info?.provider;
                 if (!isHere()) return;
                 const upgradedAssignment = provider === 'aws-ec2'
                     && /^[a-f0-9]{64}$/.test(result.upgradedWorkspaceId ?? '')
@@ -303,6 +304,17 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
                     lockedView('Choose an assignment-ready computer',provider === 'aws-ec2'
                         ? 'Universe has not verified this AWS computer for this assignment. Reopen the assignment from Universe, or select a Cloudflare computer you own in EZiL OS.'
                         : 'EZiL OS could not verify this computer’s assignment support. Check its provider in Settings → System, then try again.');
+                    ui.action('Check this computer again',eligible);
+                    return;
+                }
+                if (provider === 'aws-ec2' && ['STOPPING','DRAINING','RETIRING'].includes(info.lifecycleState)) {
+                    lockedView('Stopping your computer','Wait until Settings → Computer shows Stopped, then reopen this assignment on this same computer.');
+                    ui.action('Check this computer again',eligible);
+                    return;
+                }
+                if (provider === 'aws-ec2' && info.lifecycleState === 'RUNNING' && info.assignmentSession === 'stop_then_reopen') {
+                    lockedView('Update this computer for your assignment',
+                        'Save your work, then choose Stop in Settings → Computer. Wait until it says Stopped and reopen this assignment from Universe on this same computer. Your files stay on its disk.');
                     ui.action('Check this computer again',eligible);
                     return;
                 }

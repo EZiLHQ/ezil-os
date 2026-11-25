@@ -537,6 +537,7 @@ await check('Computer: switch and stop confirmations carry the brief\'s copy', (
     const stop = tab.confirmCopy('stop', { data });
     assert.equal(stop.title, 'Stop your computer?');
     assert.ok(stop.lines.includes('Your files stay on your disk.'));
+    assert.ok(stop.lines.includes('Wait until the status says Stopped before choosing Open desktop.'));
     for ( const copy of [sw, stop] ) assert.deepEqual(scanCopy([copy.title, ...copy.lines].join(' ')), []);
 });
 await check('Computer: no banned copy in any rendered state', () => {
