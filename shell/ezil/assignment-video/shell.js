@@ -192,6 +192,7 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
             throw error;
         }
     }
+    const digestOf=async bytes=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),n=>n.toString(16).padStart(2,'0')).join('');
     async function upload(d){
         const item=active,p=d.part;
         // A stopping share may still deliver its final clip (`lock` precedes `end`); a seed may not.
@@ -199,23 +200,48 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
         if(!p || !(p.bytes instanceof ArrayBuffer) || !p.bytes.byteLength || p.bytes.byteLength>8*1024*1024 || p.mimeType!=='video/webm'
             || !Number.isSafeInteger(p.sequence) || p.sequence<0 || p.sequence>=600 || !Number.isSafeInteger(p.startMs) || !Number.isSafeInteger(p.endMs))
             throw failure('invalid_segment');
-        const seeding=!item.seed;
-        if(seeding && (item.shareEnded || p.sequence!==item.expected || p.startMs!==0 || p.endMs!==1 || p.bytes.byteLength>1024*1024))
-            throw failure('invalid_segment');
-        const ack=await item.transport.upload({sequence:p.sequence,startMs:p.startMs,endMs:p.endMs,mimeType:'video/webm',bytes:p.bytes});
-        if(active!==item || item.ending)throw failure('recording_phase_changed');
-        if(!seeding){item.expected=Math.max(item.expected,p.sequence+1);return {confirmed:true,sequence:p.sequence};}
-        if(!ack.phaseReady || ack.captureSessionId!==item.id || ack.nextSequence!==item.expected+1 || !ack.firstFrameAt)throw failure('seed_not_confirmed');
-        const startAt=Date.parse(ack.startedAt), deadline=Date.parse(ack.deadlineAt), serverNow=Date.parse(ack.serverNow);
-        const offset=Number.isFinite(serverNow)?serverNow-Date.now():0;
-        if(!Number.isFinite(startAt) || !Number.isFinite(deadline) || deadline<=Date.now()+offset || deadline<=startAt || deadline-startAt>3600000)
-            throw failure('recording_closed');
-        // Reopening after a stop resumes the attempt's own window; a different start is never a new clock.
-        if(windowStart!==undefined && windowStart!==startAt)throw failure('recording_closed');
-        windowStart=startAt;item.seed=ack;item.expected=ack.nextSequence;
-        // The broker's own clock at confirmation: the parent's recorder offsets its segment and deadline timing by it.
-        return {confirmed:true,phaseReady:true,captureSessionId:item.id,nextSequence:ack.nextSequence,startedAt:ack.startedAt,deadlineAt:ack.deadlineAt,
-            serverNow:Number.isFinite(serverNow)?ack.serverNow:null};
+        const seedShape=p.startMs===0 && p.endMs===1 && p.bytes.byteLength<=1024*1024;
+        // A retransmitted first frame (the parent missed the reply) gets the same acknowledgement again, without a new
+        // request: only the identical bytes, by SHA-256 against the frame this document already sent, are accepted.
+        if(item.seedTask && p.sequence===item.seedTask.sequence){
+            const task=item.seedTask;
+            if(!seedShape || await digestOf(p.bytes)!==await task.digest || active!==item || item.ending)throw failure('invalid_segment');
+            return task.reply(true);
+        }
+        if(item.seedTask){
+            if(!item.seed)throw failure('seed_not_confirmed');
+            const ack=await item.transport.upload({sequence:p.sequence,startMs:p.startMs,endMs:p.endMs,mimeType:'video/webm',bytes:p.bytes});
+            if(active!==item || item.ending || !ack?.confirmed)throw failure('recording_phase_changed');
+            item.expected=Math.max(item.expected,p.sequence+1);return {confirmed:true,sequence:p.sequence};
+        }
+        if(item.shareEnded || p.sequence!==item.expected || !seedShape)throw failure('invalid_segment');
+        // Registered before any await, so a concurrent retransmit joins this attempt instead of starting another.
+        const task=item.seedTask={sequence:p.sequence,digest:digestOf(p.bytes)};
+        task.done=(async()=>{
+            await task.digest;
+            const ack=await item.transport.upload({sequence:p.sequence,startMs:0,endMs:1,mimeType:'video/webm',bytes:p.bytes});
+            const receivedAt=Date.now();
+            if(active!==item || item.ending)throw failure('recording_phase_changed');
+            if(!ack.phaseReady || ack.captureSessionId!==item.id || ack.nextSequence!==task.sequence+1 || !ack.firstFrameAt)throw failure('seed_not_confirmed');
+            const startAt=Date.parse(ack.startedAt), deadline=Date.parse(ack.deadlineAt), serverNow=Date.parse(ack.serverNow);
+            const offset=Number.isFinite(serverNow)?serverNow-receivedAt:0;
+            if(!Number.isFinite(startAt) || !Number.isFinite(deadline) || deadline<=receivedAt+offset || deadline<=startAt || deadline-startAt>3600000)
+                throw failure('recording_closed');
+            // Reopening after a stop resumes the attempt's own window; a different start is never a new clock.
+            if(windowStart!==undefined && windowStart!==startAt)throw failure('recording_closed');
+            windowStart=startAt;item.seed=ack;item.expected=Math.max(item.expected,ack.nextSequence);
+            return {ack,serverNow,receivedAt};
+        })();
+        // A refused first frame leaves no acknowledgement to replay: the parent's next attempt is a real upload.
+        task.done.catch(()=>{if(item.seedTask===task)item.seedTask=null;});
+        task.reply=async replay=>{
+            const {ack,serverNow,receivedAt}=await task.done;
+            // The broker's own clock at confirmation: the parent's recorder offsets its segment and deadline timing by
+            // it. A replay advances it by the time elapsed here, so the parent's offset stays the broker's.
+            const now=!Number.isFinite(serverNow) ? null : replay ? new Date(serverNow+Math.max(0,Date.now()-receivedAt)).toISOString() : ack.serverNow;
+            return {confirmed:true,phaseReady:true,captureSessionId:item.id,nextSequence:ack.nextSequence,startedAt:ack.startedAt,deadlineAt:ack.deadlineAt,serverNow:now};
+        };
+        return task.reply(false);
     }
     async function status(d){
         const item=active;

@@ -284,7 +284,7 @@ function parentPort(){
         close(){channel.port1.close();channel.port2.close();}};
 }
 // The OS's own assignment-video route and the media bucket, as the transport sees them.
-function fakeServer({stopReason=null,readyBeforeSeed=false}={}){
+function fakeServer({stopReason=null,readyBeforeSeed=false,holdSeed=null,failSeedOnce=false}={}){
     const log=[],started=Date.now();let seeded=false,stopAt=null,serverNow=null;
     const startedAt=new Date(started-1000).toISOString(),deadlineAt=new Date(started+1800000).toISOString(),firstFrameAt=new Date(started).toISOString();
     async function handler(path,options){
@@ -297,6 +297,8 @@ function fakeServer({stopReason=null,readyBeforeSeed=false}={}){
         if(body.action==='prepare')return Response.json({expiresAt:new Date(Date.now()+60000).toISOString(),headers:{'content-type':'video/webm'},
             putUrl:`${bucket}/universe-staging/assignment-media/v1/o/${id}/${recordingId}/segments/${body.sequence}/${body.sha256}.webm`});
         if(body.action==='confirm'){
+            if(!seeded && failSeedOnce){failSeedOnce=false;return Response.json({error:{code:'media_unavailable'}},{status:503});}
+            if(!seeded && holdSeed)await holdSeed;
             const seed=!seeded;seeded=true;
             return Response.json(seed?{...same,sequence:body.sequence,confirmed:true,phaseReady:true,nextSequence:body.sequence+1,firstFrameAt,startedAt,deadlineAt,
                 serverNow:serverNow=new Date(Date.now()+2345).toISOString()}:{recordingId,sequence:body.sequence,confirmed:true});
@@ -558,4 +560,50 @@ test('a frame whose browser-reported ancestor is not Universe keeps the locked v
             assert.equal(gate.locked(),true);assert.equal(gate.access(),null);assert.ok(w.shown('Open your assigned OS tab'));
         }finally{await gate.close();p.close();}
     }
+});
+test('a retransmitted first frame gets the same phase acknowledgement once, with no new upload, and only for identical bytes',async t=>{
+    let release;const holdSeed=new Promise(r=>release=r);
+    const server=fakeServer({holdSeed});t.mock.method(globalThis,'fetch',server.handler);
+    const w=embeddedWindow(),p=parentPort();
+    const gate=embeddedGate(w,{prepare:async()=>checkout});
+    const copy=()=>seedPart({bytes:new Uint8Array([26,69,223,163,1]).buffer});
+    try{
+        await bound(w,p);
+        await p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        // The parent's reply timer fired while the first attempt was still being confirmed: both attempts share it.
+        const first=p.rpc('upload',{captureSessionId:session,part:copy()}),again=p.rpc('upload',{captureSessionId:session,part:copy()});
+        await settle(20);release();
+        const [one,two]=await Promise.all([first,again]);
+        const expected={confirmed:true,phaseReady:true,captureSessionId:session,nextSequence:1,startedAt:server.startedAt,deadlineAt:server.deadlineAt};
+        assert.deepEqual(one.value,{...expected,serverNow:server.serverNow()});
+        assert.deepEqual({...two.value,serverNow:undefined},{...expected,serverNow:undefined});
+        assert.ok(Date.parse(two.value.serverNow)>=Date.parse(server.serverNow()));
+        await settle(40);
+        const late=await p.rpc('upload',{captureSessionId:session,part:copy()});
+        assert.ok(Date.parse(late.value.serverNow)-Date.parse(server.serverNow())>=35,'a replay advances the broker clock by the elapsed time');
+        assert.deepEqual({...late.value,serverNow:undefined},{...expected,serverNow:undefined},'a later retransmit is acknowledged the same way');
+        assert.ok(Date.parse(late.value.serverNow)>=Date.parse(two.value.serverNow),'the replayed broker clock only moves forward');
+        const uploads=()=>server.log.filter(x=>['prepare','put','confirm'].includes(x));
+        assert.deepEqual(uploads(),['prepare','put','confirm'],'one upload for three deliveries');
+        for(const part of [seedPart({bytes:new Uint8Array([26,69,223,163,2]).buffer}),seedPart({endMs:2}),seedPart({startMs:1,endMs:2})])
+            assert.equal((await p.rpc('upload',{captureSessionId:session,part})).code,'invalid_segment');
+        assert.deepEqual(uploads(),['prepare','put','confirm'],'no alternate payload reaches the media service');
+    }finally{await gate.close();p.close();}
+});
+test('a first frame the broker refused is uploaded again for real, and no segment precedes a confirmed seed',async t=>{
+    let release;const holdSeed=new Promise(r=>release=r);
+    const server=fakeServer({failSeedOnce:true,holdSeed});t.mock.method(globalThis,'fetch',server.handler);
+    const w=embeddedWindow(),p=parentPort();
+    const gate=embeddedGate(w,{prepare:async()=>checkout});
+    try{
+        await bound(w,p);
+        await p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        assert.equal((await p.rpc('upload',{captureSessionId:session,part:seedPart()})).code,'media_unavailable');
+        const pending=p.rpc('upload',{captureSessionId:session,part:seedPart()});
+        await settle(20);
+        assert.equal((await p.rpc('upload',{captureSessionId:session,part:seedPart({sequence:1,endMs:1000})})).code,'seed_not_confirmed');
+        release();
+        assert.equal((await pending).value.phaseReady,true);
+        assert.deepEqual(server.log.filter(x=>x==='confirm').length,2);
+    }finally{await gate.close();p.close();}
 });
