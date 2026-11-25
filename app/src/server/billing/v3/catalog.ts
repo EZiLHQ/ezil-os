@@ -3,7 +3,7 @@ import { freeSkuFor, offerByLookupKey as legacyByLookupKey, offerBySku as legacy
 import { CATALOG_V2, SESSION_MAX_SECONDS, type PlanOffer } from '../v2/contract';
 import { epochSeconds } from '../v2/time';
 import { CATALOG_V3, type PlanOfferV3, type PlanSkuV3, type PublicOfferV3 } from './contract';
-import { paidAccessRow, type AccessRow } from './effective-access';
+import type { AccessRow } from './effective-access';
 import { operatorPlan } from './operator-access';
 
 export function offerBySku(sku: string): PlanOfferV3 | undefined {
@@ -64,7 +64,7 @@ export function planFromSubscriptions(input: {
 }): ResolvedPlanV3 {
     if (input.operator) {
         const free = planFromSubscriptions({ ...input, subs: [], operator: null });
-        return paidAccessRow(input.operator) ? operatorPlan(input.operator, free) : { ...free, operator: input.operator };
+        return operatorPlan(input.operator, free);
     }
     // Reuse v2's active-period precedence and delinquent/expired handling.
     const selected = legacyPlan({ ...input, subs: input.subs.map(sub => ({ ...sub,

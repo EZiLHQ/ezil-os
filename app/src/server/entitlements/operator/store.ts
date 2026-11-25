@@ -62,10 +62,10 @@ const SELECT = sql`SELECT ref, revision, user_id::text AS user_id, account_publi
     to_jsonb(e)->>'issued_by' AS issued_by, to_jsonb(e)->>'access_override' AS access_override
     FROM public.ezil_operator_entitlements e`;
 
-/** Every operator assignment of one account, ordinary and override, newest first (at most 50). [] until 0019 is applied. */
+/** Every operator assignment of one account, ordinary and override, with unended rows first, then newest first (at most 50). [] until 0019 is applied. */
 export async function readOperatorEntitlements(db: Executor, userId: string): Promise<OperatorEntitlementRow[]> {
     try {
-        const rows = rowsOf(await db.execute(sql`${SELECT} WHERE user_id = ${userId}::uuid ORDER BY starts_at DESC, ref LIMIT 50`));
+        const rows = rowsOf(await db.execute(sql`${SELECT} WHERE user_id = ${userId}::uuid ORDER BY (ended_at IS NULL) DESC, starts_at DESC, ref LIMIT 50`));
         return rows.map(toRow).filter((row): row is OperatorEntitlementRow => row !== null);
     } catch (error) {
         if (missingRelation(error)) return [];
@@ -145,7 +145,7 @@ function commandStore(tx: Executor): CommandStore {
             return { payloadSha256: String(row.payload_sha256), result } satisfies StoredEvent;
         },
         async assignments(userId) {
-            const rows = rowsOf(await tx.execute(sql`${SELECT} WHERE user_id = ${userId}::uuid ORDER BY starts_at DESC, ref LIMIT 50`));
+            const rows = rowsOf(await tx.execute(sql`${SELECT} WHERE user_id = ${userId}::uuid ORDER BY (ended_at IS NULL) DESC, starts_at DESC, ref LIMIT 50`));
             return rows.map(toRow).filter((row): row is OperatorEntitlementRow => row !== null);
         },
         async insertAssignment(row) {
