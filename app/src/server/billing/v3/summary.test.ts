@@ -833,6 +833,14 @@ describe('explicit access override: the summary', () => {
         expect(summary.ai.grant).toEqual(CATALOG_V3.free_v3.aiCredits);
     });
 
+    it('an override over an ordinary grant: compute is the override\'s; credits and the no-portal rule stay the grant\'s', () => {
+        const grant = { ...override('premium_monthly_v3'), ref: 'osg-00000000-0000-4000-8000-000000000001', accessOverride: undefined };
+        const summary = buildSummaryV3({ ...payer(), subs: [], grants: [], operatorGrants: [grant, override('free_v3')] });
+        expect(summary.plan).toMatchObject({ sku: 'free_v3', access: { override: true } });
+        expect(summary.actions).toMatchObject({ portal: false, cancel: false, checkout: false });
+        expect(summary.ai.grant).toEqual({ amount: 0, per: 'period' });
+    });
+
     it('an ordinary grant keeps its exact keys (no override key) and its no-Stripe rule', () => {
         const grant = { ...override('standard_monthly_v3'), accessOverride: undefined };
         const summary = buildSummaryV3({ ...payer(), subs: [], grants: [], operatorGrants: [grant] });

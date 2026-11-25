@@ -25,13 +25,14 @@ export function aiIncludedModels(planSku: PlanSku | PlanSkuV3): readonly string[
 /**
  * For the AI credential push: the owner's models from the same effective plan the computer start gate uses
  * (`loadComputeBillingState`: a plan without paid access, such as one past its payment grace, runs as Free).
- * Model policy is independent of compute metering flags: always resolve the owner's effective plan.
+ * Model policy is independent of compute metering flags: always resolve the owner's effective plan. An explicit access
+ * override decides compute only, so it neither widens nor cuts the models: they follow Stripe, else an ordinary grant.
  * A failed read: `undefined`, so the Worker keeps the list only until its original expiry. Never throws.
  */
 export async function aiIncludedModelsFor(userId: string, getDeps: () => BillingDeps = getBillingDeps): Promise<readonly string[] | null | undefined> {
     try {
         const deps = getDeps();
-        return aiIncludedModels((await loadComputeBillingState(deps, userId, deps.now())).planSku);
+        return aiIncludedModels((await loadComputeBillingState(deps, userId, deps.now(), { accessOverrides: false })).planSku);
     } catch {
         console.warn('[billing.ai-models] plan read failed', { userId });
         return undefined;

@@ -374,6 +374,31 @@ describe('billing router', () => {
         await expect(f.caller.history()).resolves.toEqual(history);
     });
 
+    it('an explicit override decides compute only: a Stripe payer keeps the portal, a grant-only account has none, no checkout over it', async () => {
+        const f = fixture();
+        await f.store.linkCustomer(userId, 'cus_fixture');
+        f.store.subscriptionsFor.mockResolvedValue([subscription()]);
+        const base = { revision: 1, userId, accountPublicId: '10000000-0000-4000-8000-0000000000a1',
+            startsAt: new Date(now.getTime() - 86_400_000), endsAt: null, endedAt: null };
+        const override = { ...base, ref: 'osg-00000000-0000-4000-8000-0000000000bb', sku: 'free_v3' as const, accessOverride: true };
+        const store = f.store as BillingStore;
+        store.operatorEntitlementsFor = vi.fn(async () => [override]);
+        await expect(f.caller.portal()).resolves.toEqual({ url: 'https://billing.example/portal' });
+        expect(f.stripe.createPortalSession).toHaveBeenCalledTimes(1);
+        // An ordinary grant under the override, no Stripe subscription: the pre-override rule (no portal) stands.
+        f.store.subscriptionsFor.mockResolvedValue([]);
+        store.operatorEntitlementsFor = vi.fn(async () => [override, { ...base, ref: 'osg-00000000-0000-4000-8000-000000000001', sku: 'standard_monthly_v3' as const }]);
+        await expect(f.caller.portal()).rejects.toMatchObject({ message: 'not_subscribed' });
+        expect(f.stripe.createPortalSession).toHaveBeenCalledTimes(1);
+        // A Free viewer under a live override buys nothing that would change access: refused before Stripe is called.
+        store.operatorEntitlementsFor = vi.fn(async () => [override]);
+        await expect(f.caller.createCheckout({ sku })).rejects.toMatchObject({ code: 'CONFLICT', message: 'already_subscribed' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        // Positive control: the override ended, the same Free viewer checks out.
+        store.operatorEntitlementsFor = vi.fn(async () => [{ ...override, endedAt: new Date(now.getTime() - 1000) }]);
+        await checkoutControl(f);
+    });
+
     it('refuses another checkout for a v2 Standard subscription', async () => {
         const f = fixture();
         f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v2' })]);

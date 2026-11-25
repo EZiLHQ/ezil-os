@@ -25,6 +25,13 @@ export const isAccessOverride = (row: Pick<AccessRow, 'accessOverride'>): boolea
 /** A row whose tier is paid (Standard or Premium): every ordinary grant, and a paid override. */
 export const paidAccessRow = (row: AccessRow): row is AccessRow & { sku: OperatorSku } => row.sku !== 'free_v3';
 
+/**
+ * The rows as they were before overrides existed. Overrides decide compute only: AI model and credit eligibility, the
+ * Stripe actions and the portal read the plan these rows give (Stripe paid access, else an ordinary grant, else Free).
+ */
+export const withoutAccessOverrides = <R extends Pick<AccessRow, 'accessOverride'>>(rows: readonly R[] | null | undefined): R[] =>
+    (rows ?? []).filter(row => !isAccessOverride(row));
+
 /** Ordinary grants only: an override never decides through the grant rule (Stripe paid access wins over a grant). */
 export const ordinaryGrants = (rows: readonly AccessRow[] | null | undefined) =>
     (rows ?? []).filter((row): row is AccessRow & { sku: OperatorSku } => !isAccessOverride(row) && paidAccessRow(row));

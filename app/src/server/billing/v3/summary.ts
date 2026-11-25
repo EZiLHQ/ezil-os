@@ -13,7 +13,7 @@ import {
     CATALOG_V3, CATALOG_V3_VERSION, type AiAccountV3, type AiGrantKindV3, type BillingSummaryV3, type ComputerReverseMoveV3, type ComputeStandingV3, type SellableSkuV3,
 } from './contract';
 import { deriveStanding, effectiveAccessFor, paidAccess } from './standing';
-import type { AccessRow } from './effective-access';
+import { withoutAccessOverrides, type AccessRow } from './effective-access';
 import { fairUseAllowance, renewalGrantPending } from './funding';
 export { fairUseAllowance, renewalGrantPending, GRANT_PENDING_SECONDS } from './funding';
 import { issuedByOf } from './operator-access';
@@ -367,10 +367,10 @@ now: Date): BillingSummaryV3['plan']['trial'] | undefined {
 export function aiAccountSummaryV3(input: { subs: Input['subs']; userCreatedAt: Input['userCreatedAt']; paymentIssues: Input['paymentIssues'];
     operatorGrants?: readonly AccessRow[]; enrollment: BillingSummaryV3['ai']['enrollment']; now: Date;
     ai: NonNullable<Parameters<typeof buildSummaryV3>[0]['ai']> }): Pick<BillingSummaryV3['ai'], 'enrollment' | 'waiting' | 'delivering'> & { account: AiAccountV3 } {
-    const access = effectiveAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues, grants: input.operatorGrants, now: input.now });
-    // The summary's AI plan: an explicit override leaves AI credits on the Stripe-only plan (`buildSummaryV3` billingPlan).
-    const plan = planFromSubscriptions({ subs: input.subs, now: input.now, userCreatedAt: input.userCreatedAt,
-        operator: access.source === 'override' ? null : access.row });
+    // The summary's AI plan (`buildSummaryV3` basePlan): explicit overrides decide compute only, never AI credits.
+    const base = effectiveAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
+        grants: withoutAccessOverrides(input.operatorGrants), now: input.now });
+    const plan = planFromSubscriptions({ subs: input.subs, now: input.now, userCreatedAt: input.userCreatedAt, operator: base.row });
     const enrolled = input.enrollment === 'enrolled';
     const delivering = enrolled ? waitingCredits(input.ai.receipts, input.now) : null;
     return { enrollment: input.enrollment, waiting: enrolled ? null : waitingCredits(input.ai.receipts, input.now),
@@ -414,9 +414,12 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     const operator = access.row;
     const override = access.source === 'override';
     const plan = planFromSubscriptions({ ...input, operator });
-    // An explicit override decides access only. The account's own Stripe subscription (cancel, the portal) and its AI
-    // credits keep reading the Stripe-only plan, so a payer under an override can still manage it; the same plan otherwise.
-    const billingPlan = override ? planFromSubscriptions({ ...input, operator: null }) : plan;
+    // An explicit override decides compute only. AI credits, the Stripe cancel and the portal keep reading the plan as it
+    // was before overrides (Stripe paid access, else an ordinary grant, else Free), so a payer under an override still
+    // manages its subscription and a grant-only account stays without the portal; the same plan when no override is live.
+    const baseOperator = override ? effectiveAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
+        grants: withoutAccessOverrides(input.operatorGrants), now: input.now }).row : operator;
+    const basePlan = override ? planFromSubscriptions({ ...input, operator: baseOperator }) : plan;
     const standing = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
         placementProvider: input.placementProvider ?? null, now: input.now, operator });
     const legacy = plan.sku === 'legacy' ? buildSummaryV2(input) : null;
@@ -469,7 +472,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     const disk = storageDisk(rated, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB, input.liveComputers);
     const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;
     // Promotion review: an operator-granted plan has no Stripe subscription, so no Stripe-backed action applies to it.
-    const stripeActions = enabled && !operatorGrantedSubscription(billingPlan.subscriptionId);
+    const stripeActions = enabled && !operatorGrantedSubscription(basePlan.subscriptionId);
     const trial = operator ? undefined : trialBlock(input.subs.find(sub => sub.stripeSubscriptionId === plan.subscriptionId), plan.sku,
         paymentIssue !== null, input.renewal ?? null, input.now);
     const enrollment = input.enrollment?.state ?? 'enrolled';
@@ -501,14 +504,14 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             // Phase B (§6.1): the move rides its own key; `move` above stays null so an old shell never renders it.
             ...reverseMoveFields(input.reverseMove, standing.standing) },
         // Balance is filled from the AI Gateway by the caller; legacy plans grant nothing new.
-        // An operator grant includes no AI credits (product entitlements v1: credits are never granted with access); under an
-        // explicit override the credits are the Stripe-only plan's, which the override never changes.
-        ai: { grant: billingPlan.sku === 'legacy' || (operator && !override) ? { amount: 0, per: 'period' } : { ...billingPlan.offer.aiCredits },
+        // An operator grant includes no AI credits (product entitlements v1: credits are never granted with access); an
+        // explicit override changes no credits, so they are the base plan's.
+        ai: { grant: basePlan.sku === 'legacy' || baseOperator ? { amount: 0, per: 'period' } : { ...basePlan.offer.aiCredits },
             balance: null, state: 'unavailable',
             enrollment, waiting: enrollment === 'enrolled' ? null : waitingCredits(input.ai?.receipts ?? null, input.now),
             ...(delivering ? { delivering } : {}),
-            ...(input.ai ? { ...aiCreditBuckets({ plan: billingPlan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro),
-                account: aiAccountV3({ plan: billingPlan, ...input.ai, now: input.now }) } : {}) },
+            ...(input.ai ? { ...aiCreditBuckets({ plan: basePlan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro),
+                account: aiAccountV3({ plan: basePlan, ...input.ai, now: input.now }) } : {}) },
         fairUse: { status: unmetered ? 'ok' : fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end,
             ...(unmetered ? { policy: 'unmetered' as const } : {}) },
         // Free has no provisioned disk: capBytes '0' with 'unavailable' (the pinned wire type is a string).
@@ -523,8 +526,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             downgrade: stripeActions && !operator && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             // payment_pending keeps the supported cancel (cancelAtPeriodEnd): it stops renewals; the first charge already
             // being collected is not voided, and clients say so (paused access, no "stays active").
-            cancel: stripeActions && billingPlan.subscriptionId !== null && billingPlan.planActive && !pendingUpgrade,
-            portal: stripeActions && (!operator || override) && input.hasCustomer,
+            cancel: stripeActions && basePlan.subscriptionId !== null && basePlan.planActive && !pendingUpgrade,
+            portal: stripeActions && !baseOperator && input.hasCustomer,
             ezilId: enrollment === 'needs_ezil_id' ? input.enrollment?.ezilIdUrl ?? null : null },
         // Round 6 (R1-06): the Free offer says the hours this account gets on Free (legacy 8 h today).
         ...(input.trialOffer !== undefined && enabled && plan.family === 'free' && !override ? { trialOffer: input.trialOffer } : {}),
