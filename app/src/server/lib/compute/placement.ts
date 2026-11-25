@@ -43,8 +43,7 @@
 
 import { TRPCError } from '@trpc/server';
 import { sql, type SQL } from 'drizzle-orm';
-import { operatorBranchEnabled } from '@/server/entitlements/operator/installed';
-import { paidComputeAccessCtes } from '@/server/billing/v3/paid-compute-access-sql';
+import { paidComputeAccessCtes, paidComputeBranches } from '@/server/billing/v3/paid-compute-access-sql';
 
 import { totalsOf, utcNextMonthStart, type MonthUsage, type UsageTotals } from './usage';
 import { INSTANCE_VCPU, instanceVcpu } from './aws-config';
@@ -422,6 +421,37 @@ export async function readLastUsageStop(db: PlacementExecutor, rawComputerId: st
         FROM public.ezil_compute_usage
         WHERE computer_id = ${canonicalId(rawComputerId)}::uuid AND user_id = ${canonicalId(userId)}::uuid`));
     return timestamp(row?.stopped_at) ?? null;
+}
+
+/** The live explicit Free override predicate, in SQL: `access_override` through to_jsonb, so a schema without 0038 yields none. */
+const liveFreeOverride = (at: string) => sql`o.sku = 'free_v3' AND to_jsonb(o)->>'access_override' = 'true' AND o.ended_at IS NULL
+    AND o.starts_at <= ${at}::timestamptz AND (o.ends_at IS NULL OR o.ends_at > ${at}::timestamptz)`;
+/** The override set: the account's own live computers whose placement is aws-ec2, with a live explicit Free override. */
+const freeOverrideSet = (at: string) => sql`FROM public.ezil_computers c
+    JOIN public.ezil_computer_placements p ON p.computer_id = c.id AND p.owner_user_id = c.user_id AND p.provider = 'aws-ec2'
+    WHERE c.deleted_at IS NULL AND EXISTS (SELECT 1 FROM public.ezil_operator_entitlements o WHERE o.user_id = c.user_id AND ${liveFreeOverride(at)})`;
+/** Actionable: RUNNING or STOPPED with no lifecycle job, and no reverse row holding the computer (requires 0012). */
+const freeOverrideActionable = sql`p.state IN ('RUNNING', 'STOPPED') AND p.lifecycle_job_id IS NULL
+    AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_reverse_moves m WHERE m.computer_id = c.id AND m.state NOT IN ('committed', 'failed_reopened'))`;
+
+/**
+ * The explicit Free override lane's discovery (provider-reverse-override.ts `freeOverrideCandidates`): the ACTIONABLE
+ * override set (an AWS placement of an owner under a live explicit Free override, RUNNING or STOPPED with no lifecycle
+ * job and no reverse row holding it), oldest placement write first (a stable order: a bounded pass makes progress), with
+ * the count of the set's other computers (deferred until they settle). Read-only; it lives here because only this module
+ * may name the placement table (C-2). Requires 0019 and 0012: the caller probes both first (`freeOverrideSchemaPresent`).
+ */
+export async function readFreeOverrideMoveCandidates(db: PlacementExecutor, now: Date, limit: number):
+    Promise<{ candidates: { userId: string; computerId: string }[]; deferred: number }> {
+    const count = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
+    if (!count) return { candidates: [], deferred: 0 };
+    const at = now.toISOString();
+    const listed = rowsOf(await db.execute(sql`/* placement:override-candidates */ SELECT c.id::text AS computer_id, c.user_id::text AS user_id
+        ${freeOverrideSet(at)} AND ${freeOverrideActionable}
+        ORDER BY p.updated_at ASC, c.id LIMIT ${count}`));
+    const other = rowsOf(await db.execute(sql`/* placement:override-deferred */ SELECT count(*)::int AS n ${freeOverrideSet(at)} AND NOT (${freeOverrideActionable})`));
+    return { candidates: listed.map(row => ({ userId: canonicalId(String(row.user_id)), computerId: canonicalId(String(row.computer_id)) })),
+        deferred: Number(other[0]?.n ?? 0) || 0 };
 }
 
 export class ImageJobConflictError extends Error {
@@ -2105,12 +2135,13 @@ export interface PaidMigrationCandidate {
 /**
  * One computer per paid owner, including the implicit Cloudflare placement. Product entitlements v1 (0019 applied): an
  * operator grant in effect is a paid owner too (provider-migrate-reconcile then re-checks the entitlement and admission).
+ * A live explicit override decides first: Standard/Premium is a paid owner, Free never is (whatever Stripe says).
  */
 export async function paidCloudflareCandidates(db: PlacementExecutor, now: Date, limit = 10): Promise<PaidMigrationCandidate[]> {
     const count = Number.isFinite(limit) ? Math.max(0, Math.min(10, Math.trunc(limit))) : 0;
     if (!count) return [];
     const at = now.toISOString();
-    const result = await db.execute(sql`WITH ${paidComputeAccessCtes(at, await operatorBranchEnabled(db))}
+    const result = await db.execute(sql`WITH ${paidComputeAccessCtes(at, await paidComputeBranches(db))}
         SELECT DISTINCT ON (s.user_id) s.user_id::text AS user_id, c.id::text AS computer_id, s.sku
         FROM eligible s
         JOIN public.ezil_computers c ON c.user_id = s.user_id AND c.deleted_at IS NULL

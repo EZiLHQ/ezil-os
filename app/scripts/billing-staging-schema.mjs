@@ -41,6 +41,7 @@ export const EXPLICIT_FILES = Object.freeze([
     'app/drizzle/0030_delegation_replay.sql',
 ]);
 export const TARGETED_APPLY_FILE = 'app/drizzle/0030_delegation_replay.sql';
+const ACCESS_OVERRIDE_STAGING_FILE = 'app/drizzle/0038_operator_access_overrides.sql';
 const TABLE = 'public.ezil_staging_schema_log';
 const HASH = /^[a-f0-9]{64}$/;
 class Refusal extends Error {}
@@ -187,8 +188,13 @@ export function parseArgs(args) {
     if (mode === 'baseline' ? positional.length === 0 : positional.length !== 0) refuse('Only baseline accepts file arguments; baseline needs at least one file.');
     // Targeted apply: exactly one named file (a second --only is refused above); the default apply still runs every pending file.
     if (only !== undefined && mode !== 'apply') refuse('--only is accepted only by apply.');
-    // Only the delegation replay ledger is targetable, by its exact canonical path (no basename or ./ alias).
-    if (only !== undefined && only !== TARGETED_APPLY_FILE) refuse(`--only accepts only ${TARGETED_APPLY_FILE}.`);
+    // Targeted access-override activation requires the exact AWS preview destination and canonical path.
+    if (only === ACCESS_OVERRIDE_STAGING_FILE && target !== 'aws-preview') {
+        refuse('Operator access override activation is currently available only on aws-preview.');
+    }
+    if (only !== undefined && only !== TARGETED_APPLY_FILE && only !== ACCESS_OVERRIDE_STAGING_FILE) {
+        refuse(`--only accepts only ${TARGETED_APPLY_FILE}, or ${ACCESS_OVERRIDE_STAGING_FILE} on aws-preview.`);
+    }
     if (nativeProduction) {
         if (target !== 'aws-production' || mode === 'baseline' || only !== undefined) {
             refuse('--native-production requires plan or apply on aws-production without --only.');
@@ -236,6 +242,10 @@ export function run(args = process.argv.slice(2), {
         const connection = databaseUrl ? validateDatabaseUrl(databaseUrl, target) : null;
         if (!connection && (mode !== 'plan' || target.startsWith('aws-'))) refuse('BILLING_STAGING_DATABASE_URL is required.');
         const ordered = orderFiles(readdirSync(resolve(ROOT, 'app/drizzle')), readdirSync(resolve(ROOT, 'docs/aws-computers/sql')));
+        if (target === 'aws-preview') ordered.push(ACCESS_OVERRIDE_STAGING_FILE);
+        if (mode === 'baseline' && requested.some((name) => basename(name) === basename(ACCESS_OVERRIDE_STAGING_FILE))) {
+            refuse('Operator access override schema must be applied; it cannot be baselined.');
+        }
         // Production applies the reviewed list that belongs there (release plan §4.1-4.2) under the same guards as
         // preview: localhost:5432 host pin, pg_control system-id pin, SHA-256 re-check, one logged transaction per
         // file. 0003-0011 are already applied there; 0019-0023 apply with their releases, 0024-0025 (incident alerts,
@@ -318,6 +328,7 @@ export function run(args = process.argv.slice(2), {
         }
         for (const entry of plan) {
             if ((mode === 'baseline' || only !== undefined) && !selected.has(entry.file)) continue;
+            if (entry.file === ACCESS_OVERRIDE_STAGING_FILE && only !== ACCESS_OVERRIDE_STAGING_FILE) continue;
             // 0012 (reverse moves) is staging-only on production: never applied or logged there (the app probes for it).
             if (target === 'aws-production' && basename(entry.file) === '0012_compute_reverse_moves.sql') {
                 emit(`${entry.file}: staging-only on production; skipped`);

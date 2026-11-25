@@ -307,6 +307,11 @@ export interface BillingSummaryV3 {
             source: 'operator'; ref: string; endsAt: string | null; untilRevoked: boolean;
             /** The issuing organization's name the plan card shows ("Assigned by <issuedBy>"); EZiL when none was given. */
             issuedBy: string;
+            /**
+             * Explicit access override (additive, present only for one): it decides the effective tier over any Stripe plan
+             * until it ends, then the Stripe plan, an ordinary grant or Free applies again. Absent on ordinary grants.
+             */
+            override?: true;
         };
         /**
          * Standard trial (additive, present only for a trial that has not converted): `trialing` = $0 so far, the first

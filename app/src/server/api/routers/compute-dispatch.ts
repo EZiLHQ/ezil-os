@@ -100,8 +100,11 @@ export interface RouteOptions {
     env?: Env;
     /** Defaults to billing v2, whose reader touches no store while billing is off. */
     entitlements?: EntitlementReader;
-    /** Overrides `defaultAwsCollaborators(env)` (tests). */
-    aws?: Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer' | 'meter' | 'randomBytes' | 'now' | 'newId' | 'leaseSeconds'>;
+    /**
+     * Overrides `defaultAwsCollaborators(env)` (tests). A guarded automatic stop (`stopGuard`, aws-ec2.ts) is passed here
+     * MERGED over `defaultAwsCollaborators(env)` by its caller (provider-reverse-override.ts), never in place of them.
+     */
+    aws?: Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer' | 'meter' | 'randomBytes' | 'now' | 'newId' | 'leaseSeconds' | 'stopGuard'>;
     /** The caller starts a sandbox: pin a no-row Cloudflare computer first (select.ts `ResolveOptions`). */
     pinCloudflare?: boolean;
 }
@@ -700,6 +703,19 @@ export interface ReverseTriggerDeps {
     /** §5.9.1 rule 2: the operator allow-list (`/admin/telemetry`'s gate). */
     isOperator?: (email: string) => boolean | Promise<boolean>;
     now?: () => Date;
+    /**
+     * Who the row `startReverseMove` writes says started it: `'user'` (the click; default) or `'cron'` (the billing sweep's
+     * explicit Free override reconciliation, provider-reverse-override.ts, which runs the same pinned checks). The open
+     * trigger always writes `'open'`.
+     */
+    startedBy?: 'user' | 'cron';
+    /**
+     * An automatic start's own re-check, run right before the create (after every pinned refusal): the explicit Free
+     * override is still in effect (provider-reverse-override.ts). `heldStanding` alone cannot tell natural Free (an expired
+     * override) from the override, and natural Free is the click's and the open trigger's, never the cron's. A refusal or a
+     * throw answers `move_not_held` and creates nothing. The click passes none.
+     */
+    confirmStart?: () => Promise<boolean>;
 }
 
 async function defaultScheduleMove(moveId: string): Promise<void> {
@@ -777,9 +793,15 @@ export async function startReverseMove(db: PlacementDb, computer: ComputerRef, k
     // 7, 8. Only from STOPPED with no job.
     if (record && (MOVE_RUNNING_STATES.includes(record.state) || record.lifecycleJobId !== null)) return moveRefusal('move_computer_running');
     if (reserved || !record || record.state !== 'STOPPED') return moveRefusal('move_computer_unsettled');
-    // 9. Create (or get the row a concurrent click created). Store refusals are values too.
+    // 9. Create (or get the row a concurrent click created). Store refusals are values too. An automatic start re-checks its
+    // own reason (the explicit override) here, as close to the create as a read can be.
+    if (deps.confirmStart) {
+        let confirmed = false;
+        try { confirmed = await deps.confirmStart() === true; } catch { confirmed = false; }
+        if (!confirmed) return moveRefusal('move_not_held');
+    }
     let m: ComputeReverseMove;
-    try { m = await store.createOrGetActive({ computerId, userId, startedBy: 'user' }); }
+    try { m = await store.createOrGetActive({ computerId, userId, startedBy: deps.startedBy ?? 'user' }); }
     catch (error) {
         if (error instanceof ReverseMoveConflictError) {
             if (error.reason === 'owner_mismatch') return moveRefusal('move_not_held');

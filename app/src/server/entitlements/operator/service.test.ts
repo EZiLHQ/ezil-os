@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { OperatorEntitlementRow } from '@/server/billing/v3/operator-access';
 import { addCalendarMonthUtc } from '@/server/billing/v3/trial';
 import { sourceCatalog } from './contract';
-import { handleCommand, readAssignments, type CommandStore, type IdentityCheck, type OperatorEntitlementDeps, type StripeView } from './service';
+import { catalog, handleCommand, readAssignments, type CommandStore, type IdentityCheck, type OperatorEntitlementDeps, type StripeView } from './service';
 
 const USER = '00000000-0000-4000-8000-0000000000a1';
 const ACCOUNT = '10000000-0000-4000-8000-0000000000a1';
@@ -39,7 +39,8 @@ function harness(options: { identity?: IdentityCheck; stripe?: StripeView } = {}
         },
         async assignments(userId) { return rows.filter(r => r.userId === userId).map(r => ({ ...r })).sort((a, b) => b.startsAt.getTime() - a.startsAt.getTime()); },
         async insertAssignment(row) {
-            if (rows.some(r => r.userId === row.userId && r.endedAt === null)) throw new Error('one live assignment');
+            // 0038: one live row per account per kind (ordinary grant, access override).
+            if (rows.some(r => r.userId === row.userId && r.endedAt === null && (r.accessOverride === true) === (row.accessOverride === true))) throw new Error('one live assignment');
             rows.push({ ...row }); state.accessWrites++;
         },
         async updateAssignment(ref, expected, next) {
@@ -60,6 +61,7 @@ function harness(options: { identity?: IdentityCheck; stripe?: StripeView } = {}
         identity: async () => state.identity, stripe: async () => state.stripe,
         readAssignments: userId => store.assignments(userId),
         withCommand: (_command, _user, run) => run(store),
+        accessOverridesInstalled: async () => true,
     };
     return { deps, rows, events, state };
 }
@@ -406,5 +408,186 @@ describe('issued_by: the stored issuing organization of an assign', () => {
         const result = await run(h, command({ issued_by: 'Acme Labs' }));
         expect(result).toMatchObject({ outcome: 'refused', refusal: { code: 'paid_subscription_conflict' } });
         expect(h.rows).toHaveLength(0);
+    });
+});
+
+describe('explicit access overrides (0038): first while unexpired, a slot of their own, Stripe never written', () => {
+    const paid: StripeView = { paidAccess: true, computeActive: true, productRef: 'standard_monthly_v3', state: 'active', checkoutOpen: false };
+    const TARGET = { kind: 'individual' as const, os_user_id: USER, account_public_id: ACCOUNT };
+    const product = (ref: string) => ({ ref, catalog_revision: REVISION });
+    const override = (over: Record<string, unknown> = {}) => command({ access_override: true, ...over });
+    // change and end of an override restate access_override; an ordinary assignment is addressed without it.
+    const change = (ref: string, revision: number, over: Record<string, unknown> = {}) => command({ action: 'change', product: null, validity: null,
+        assignment: { ref, expected_revision: revision }, access_override: true, ...over });
+    const end = (ref: string, revision: number, over: Record<string, unknown> = {}) => command({ action: 'end', product: null, validity: null,
+        assignment: { ref, expected_revision: revision }, access_override: true, ...over });
+    const unflagged = (body: Record<string, unknown>) => { const copy = { ...body }; delete copy.access_override; return copy; };
+    const view = (h: ReturnType<typeof harness>) => readAssignments(h.deps, TARGET);
+
+    it('paid Stripe + active Premium override: applies without a paid conflict, reports the override, stores its exact end', async () => {
+        const h = harness({ stripe: paid });
+        const result = await run(h, override({ product: product('premium_monthly_v3'), validity: { ends_at: later(10 * DAY).toISOString() } }));
+        expect(result).toMatchObject({ outcome: 'applied', refusal: null, provisioning: { state: 'not_applicable' }, credit_status: { state: 'not_requested' },
+            effective_access: { state: 'active', product_ref: 'premium_monthly_v3', via: 'operator' },
+            assignment: { revision: 1, product_ref: 'premium_monthly_v3', starts_at: T0.toISOString(), ends_at: later(10 * DAY).toISOString(),
+                until_revoked: false, state: 'active', access_override: true } });
+        expect(h.rows).toEqual([expect.objectContaining({ accessOverride: true, sku: 'premium_monthly_v3', endsAt: later(10 * DAY), endedAt: null })]);
+        expect(await view(h)).toMatchObject({ effective_access: { product_ref: 'premium_monthly_v3', via: 'operator' },
+            stripe: { state: 'active', product_ref: 'standard_monthly_v3' }, assignments: [{ access_override: true, state: 'active' }] });
+    });
+
+    it('paid Stripe + active Free override: active free_v3 via operator, until revoked', async () => {
+        const h = harness({ stripe: paid });
+        const result = await run(h, override({ product: product('free_v3'), validity: { until_revoked: true } }));
+        expect(result).toMatchObject({ outcome: 'applied', effective_access: { state: 'active', product_ref: 'free_v3', via: 'operator' },
+            assignment: { product_ref: 'free_v3', ends_at: null, until_revoked: true, access_override: true } });
+        expect(await view(h)).toMatchObject({ effective_access: { state: 'active', product_ref: 'free_v3', via: 'operator' } });
+    });
+
+    it('paid Stripe + expired override: Stripe again from the exact end (read time, no command); a new override closes the lapsed one', async () => {
+        const h = harness({ stripe: paid });
+        const first = await run(h, override({ product: product('free_v3'), validity: { ends_at: later(DAY).toISOString() } }));
+        h.state.now = later(DAY - 1);
+        expect((await view(h))!.effective_access).toEqual({ state: 'active', product_ref: 'free_v3', via: 'operator' });
+        h.state.now = later(DAY);
+        expect(await view(h)).toMatchObject({ effective_access: { state: 'active', product_ref: 'standard_monthly_v3', via: 'stripe' },
+            assignments: [{ ref: first.assignment!.ref, state: 'ended', access_override: true }] });
+        // Expired is not in effect: it can no longer be changed or ended.
+        expect(await run(h, end(first.assignment!.ref, 1))).toMatchObject({ outcome: 'refused', refusal: { code: 'invalid_command' } });
+        const second = await run(h, override({ product: product('premium_monthly_v3'), validity: { until_revoked: true } }));
+        expect(second).toMatchObject({ outcome: 'applied', effective_access: { product_ref: 'premium_monthly_v3', via: 'operator' } });
+        expect(h.rows.find(r => r.ref === first.assignment!.ref)!.endedAt).toEqual(later(DAY));
+    });
+
+    it('paid Stripe + cleared (ended) override: end restores Stripe', async () => {
+        const h = harness({ stripe: paid });
+        const o = await run(h, override({ product: product('free_v3'), validity: { until_revoked: true } }));
+        h.state.now = later(60_000);
+        expect(await run(h, end(o.assignment!.ref, 1))).toMatchObject({ outcome: 'applied',
+            assignment: { revision: 2, state: 'ended', ends_at: later(60_000).toISOString(), access_override: true },
+            effective_access: { state: 'active', product_ref: 'standard_monthly_v3', via: 'stripe' } });
+        expect((await view(h))!.effective_access).toMatchObject({ via: 'stripe' });
+    });
+
+    it('an override never lifts paid Stripe that has no compute funding into Stripe access; once cleared that answer is back', async () => {
+        const h = harness({ stripe: { ...paid, computeActive: false } });
+        const o = await run(h, override({ product: product('standard_monthly_v3'), validity: { until_revoked: true } }));
+        expect(o.effective_access).toEqual({ state: 'active', product_ref: 'standard_monthly_v3', via: 'operator' });
+        expect((await run(h, end(o.assignment!.ref, 1))).effective_access).toEqual({ state: 'none', product_ref: null, via: null });
+    });
+
+    it('grant compatibility: an override and an ordinary grant are independent live slots; ending the override restores the grant', async () => {
+        const h = harness();
+        const grant = await run(h, command());
+        expect(Object.hasOwn(grant.assignment!, 'access_override')).toBe(false);
+        const o = await run(h, override({ product: product('free_v3'), validity: { until_revoked: true } }));
+        expect(o).toMatchObject({ outcome: 'applied', effective_access: { product_ref: 'free_v3', via: 'operator' } });
+        expect(h.rows.filter(r => r.endedAt === null)).toHaveLength(2);
+        // One live row per kind: a second of either kind is refused; neither closes the other.
+        expect(await run(h, override({ product: product('premium_monthly_v3'), validity: { until_revoked: true } })))
+            .toMatchObject({ outcome: 'refused', refusal: { code: 'invalid_command', message: expect.stringMatching(/access override/) } });
+        expect(await run(h, command())).toMatchObject({ outcome: 'refused', refusal: { code: 'invalid_command', message: expect.stringMatching(/operator assignment/) } });
+        const listed = (await view(h))!.assignments;
+        expect(listed.map(a => Object.hasOwn(a, 'access_override'))).toEqual(listed.map(a => a.ref === o.assignment!.ref));
+        // The ordinary grant keeps its own rules: no validity change, same month end.
+        expect(await run(h, unflagged(change(grant.assignment!.ref, 1, { validity: { until_revoked: true } })))).toMatchObject({ refusal: { code: 'invalid_command' } });
+        expect(await run(h, end(o.assignment!.ref, 1))).toMatchObject({ outcome: 'applied',
+            effective_access: { state: 'active', product_ref: 'standard_monthly_v3', via: 'operator' } });
+        expect(h.rows.find(r => r.ref === grant.assignment!.ref)).toMatchObject({ endedAt: null, endsAt: MONTH_END, sku: 'standard_monthly_v3' });
+    });
+
+    it('ordinary rules are unchanged by the feature: paid conflict, Free unassignable, one calendar month', async () => {
+        const h = harness({ stripe: paid });
+        expect(await run(h, command())).toMatchObject({ refusal: { code: 'paid_subscription_conflict' } });
+        expect(await run(h, command({ product: product('free_v3') }))).toMatchObject({ refusal: { code: 'product_not_assignable' } });
+        h.state.stripe = NO_STRIPE;
+        expect(await run(h, command({ validity: { until_revoked: true } }))).toMatchObject({ refusal: { code: 'invalid_command' } });
+        expect(await run(h, command({ validity: { ends_at: later(3 * DAY).toISOString() } }))).toMatchObject({ outcome: 'applied',
+            assignment: { ends_at: MONTH_END.toISOString() } });
+        expect(h.state.accessWrites).toBe(1);
+    });
+
+    it('change on an override sets the tier and/or the validity, each authoritative, never a paid conflict', async () => {
+        const h = harness({ stripe: paid });
+        const o = await run(h, override({ product: product('standard_monthly_v3'), validity: { ends_at: later(5 * DAY).toISOString() } }));
+        const ref = o.assignment!.ref;
+        expect(await run(h, change(ref, 1, { product: product('premium_monthly_v3') }))).toMatchObject({ outcome: 'applied',
+            assignment: { revision: 2, product_ref: 'premium_monthly_v3', ends_at: later(5 * DAY).toISOString(), access_override: true } });
+        expect(await run(h, change(ref, 2, { validity: { until_revoked: true } }))).toMatchObject({ outcome: 'applied',
+            assignment: { revision: 3, product_ref: 'premium_monthly_v3', ends_at: null, until_revoked: true } });
+        expect(await run(h, change(ref, 3, { product: product('free_v3'), validity: { ends_at: later(2 * DAY).toISOString() } }))).toMatchObject({ outcome: 'applied',
+            assignment: { revision: 4, product_ref: 'free_v3', ends_at: later(2 * DAY).toISOString() }, effective_access: { product_ref: 'free_v3', via: 'operator' } });
+        const writes = h.state.accessWrites;
+        const refusedWith = async (over: Record<string, unknown>, code: string, revision = 4) =>
+            expect(await run(h, change(ref, revision, over))).toMatchObject({ outcome: 'refused', refusal: { code }, assignment: null });
+        await refusedWith({ validity: { ends_at: T0.toISOString() } }, 'invalid_command');
+        await refusedWith({ validity: { ends_at: later(-DAY).toISOString() } }, 'invalid_command');
+        await refusedWith({ product: product('free_v3'), validity: { ends_at: later(2 * DAY).toISOString() } }, 'invalid_command');
+        await refusedWith({ product: product('free_v3') }, 'invalid_command');
+        await refusedWith({ product: product('free_v3'), starts_at: later(60_000).toISOString() }, 'invalid_command');
+        await refusedWith({ product: product('legacy') }, 'product_not_assignable');
+        await refusedWith({ product: { ref: 'premium_monthly_v3', catalog_revision: 'os-v3.0000000000000000' } }, 'catalog_revision_mismatch');
+        await refusedWith({ product: product('premium_monthly_v3') }, 'stale_revision', 3);
+        expect(h.state.accessWrites).toBe(writes);
+        // The start may be restated.
+        expect(await run(h, change(ref, 4, { product: product('standard_monthly_v3'), starts_at: T0.toISOString() }))).toMatchObject({ outcome: 'applied' });
+    });
+
+    it('assign validity is authoritative: ends_at as sent or until revoked; a non-future end or a scheduled start is refused', async () => {
+        const h = harness();
+        for (const ends of [T0, later(-1)]) {
+            expect(await run(h, override({ validity: { ends_at: ends.toISOString() } }))).toMatchObject({ outcome: 'refused', refusal: { code: 'invalid_command' } });
+        }
+        expect(await run(h, override({ starts_at: later(10 * 60_000).toISOString() }))).toMatchObject({ outcome: 'refused', refusal: { code: 'invalid_command' } });
+        expect(await run(h, override({ product: product('legacy') }))).toMatchObject({ refusal: { code: 'product_not_assignable' } });
+        expect(await run(h, override({ product: { ref: 'free_v3', catalog_revision: 'os-v3.0000000000000000' } }))).toMatchObject({ refusal: { code: 'catalog_revision_mismatch' } });
+        expect(h.state.accessWrites).toBe(0);
+        expect(await run(h, override({ validity: { ends_at: later(1).toISOString() } }))).toMatchObject({ outcome: 'applied',
+            assignment: { starts_at: T0.toISOString(), ends_at: later(1).toISOString() } });
+    });
+
+    it('idempotency: the override replays; the same id without the flag is payload_mismatch', async () => {
+        const h = harness({ stripe: paid });
+        const body = override({ product: product('free_v3'), validity: { until_revoked: true }, issued_by: 'Acme Labs' });
+        const first = await run(h, body);
+        h.state.now = later(60_000);
+        expect(await run(h, body)).toEqual({ ...first, outcome: 'replayed' });
+        expect(await run(h, unflagged(body))).toMatchObject({ outcome: 'refused', refusal: { code: 'payload_mismatch' } });
+        const changed = change(first.assignment!.ref, 1, { product: product('premium_monthly_v3') });
+        const applied = await run(h, changed);
+        expect(applied).toMatchObject({ outcome: 'applied', assignment: { revision: 2, access_override: true } });
+        expect(await run(h, changed)).toEqual({ ...applied, outcome: 'replayed' });
+        expect(await run(h, unflagged(changed))).toMatchObject({ outcome: 'refused', refusal: { code: 'payload_mismatch' } });
+        expect(h.rows).toEqual([expect.objectContaining({ accessOverride: true, issuedBy: 'Acme Labs', revision: 2, sku: 'premium_monthly_v3' })]);
+    });
+
+    it('change and end must restate the immutable kind: a mismatch is refused before any other check or write, and replays as that refusal', async () => {
+        const h = harness({ stripe: paid });
+        h.state.stripe = NO_STRIPE;
+        const grant = await run(h, command());
+        h.state.stripe = paid;
+        const o = await run(h, override({ product: product('free_v3'), validity: { until_revoked: true } }));
+        const writes = h.state.accessWrites, rows = structuredClone(h.rows);
+        const notOverride = { outcome: 'refused', assignment: null, refusal: { code: 'invalid_command', message: expect.stringMatching(/not an access override/) } };
+        const isOverrideRow = { outcome: 'refused', assignment: null, refusal: { code: 'invalid_command', message: expect.stringMatching(/restate access_override/) } };
+        // An override addressed as ordinary (no flag), even with a stale revision: the kind is checked first.
+        expect(await run(h, unflagged(end(o.assignment!.ref, 1)))).toMatchObject(isOverrideRow);
+        expect(await run(h, unflagged(change(o.assignment!.ref, 9, { product: product('premium_monthly_v3') })))).toMatchObject(isOverrideRow);
+        // An ordinary assignment addressed as an override: no override path (validity, Free, no paid conflict) can reach it.
+        expect(await run(h, end(grant.assignment!.ref, 1))).toMatchObject(notOverride);
+        const freeGrant = change(grant.assignment!.ref, 1, { product: product('free_v3'), validity: { until_revoked: true } });
+        expect(await run(h, freeGrant)).toMatchObject({ ...notOverride, effective_access: { product_ref: 'free_v3', via: 'operator' } });
+        expect([h.state.accessWrites, h.rows]).toEqual([writes, rows]);
+        // A stored refusal replays as itself.
+        expect(await run(h, freeGrant)).toMatchObject(notOverride);
+        // Matching kinds apply.
+        expect(await run(h, end(o.assignment!.ref, 1))).toMatchObject({ outcome: 'applied', effective_access: { via: 'stripe' } });
+        expect(await run(h, unflagged(end(grant.assignment!.ref, 1)))).toMatchObject({ outcome: 'applied', assignment: { state: 'ended' } });
+    });
+
+    it('GET catalog advertises access_overrides only when 0038 is installed; a failing probe keeps the v1 catalog', async () => {
+        expect(await catalog({ accessOverridesInstalled: async () => true })).toEqual({ ...sourceCatalog(), access_overrides: true });
+        expect(await catalog({ accessOverridesInstalled: async () => false })).toEqual(sourceCatalog());
+        expect(await catalog({ accessOverridesInstalled: async () => { throw new Error('down'); } })).toEqual(sourceCatalog());
     });
 });
