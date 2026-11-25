@@ -3,11 +3,13 @@
  * src/product-entitlements/contract.ts in the EZiL AI Gateway, fixtures at 93ed03f2). EZiL OS's side of the wire:
  * the strict command parser, canonical JSON and payload hash, and the answer shapes. The OS amendments (Plans brief,
  * ACK 2026-11-04) are applied here: no AI credits in the catalog, one live assignment per account, no scheduled or
- * back-dated starts, provisioning always not_applicable.
+ * back-dated starts, provisioning always not_applicable. Explicit access overrides (0038) add one optional key on each
+ * side: `access_overrides` on the catalog, `access_override` on a command and on an override's assignment view; an
+ * override is a second live slot beside the ordinary assignment.
  */
 import { createHash } from 'node:crypto';
 import { CATALOG_V3 } from '@/server/billing/v3/contract';
-import { isIssuedBy, OPERATOR_SKUS, type OperatorEntitlementRow, type OperatorSku } from '@/server/billing/v3/operator-access';
+import { isIssuedBy, OPERATOR_SKUS, type OperatorEntitlementRow, type OperatorOverrideSku } from '@/server/billing/v3/operator-access';
 
 export const PRODUCER = 'ezil-os';
 export const SCOPE = 'individual';
@@ -42,11 +44,19 @@ export interface Command {
     readonly billing_effect: 'none'; readonly credit_option: 'none';
     /** Optional, assign only: the issuing organization's name for the plan card. Absent = EZiL (and every v1 command). */
     readonly issued_by?: string;
+    /**
+     * Optional, exactly `true`: an explicit access override (0038). On an assign it writes an override instead of an
+     * ordinary grant; on change and end it restates the addressed assignment's kind, which must match. Absent = an
+     * ordinary assignment (and every v1 command).
+     */
+    readonly access_override?: true;
 }
 export interface Assignment {
     readonly ref: string; readonly revision: number; readonly producer: typeof PRODUCER; readonly scope: typeof SCOPE;
-    readonly product_ref: OperatorSku; readonly target: IndividualTarget; readonly quantity: null; readonly starts_at: string;
+    readonly product_ref: OperatorOverrideSku; readonly target: IndividualTarget; readonly quantity: null; readonly starts_at: string;
     readonly ends_at: string | null; readonly until_revoked: boolean; readonly state: 'active' | 'ended';
+    /** Present (true) only on an access override; absent on an ordinary grant. */
+    readonly access_override?: true;
 }
 export interface EffectiveAccess { readonly state: 'active' | 'none'; readonly product_ref: string | null; readonly via: 'operator' | 'stripe' | null }
 export interface Result {
@@ -81,15 +91,18 @@ export function commandIdOf(body: unknown): string | null {
 }
 
 /**
- * Strict: every field, no extras, the ezil-os producer and individual scope only. Throws InvalidCommand. The one
- * optional key, `issued_by`, is either absent (a v1 command, byte for byte) or a valid name on an assign: never null.
+ * Strict: every field, no extras, the ezil-os producer and individual scope only. Throws InvalidCommand. The optional
+ * keys are either absent (a v1 command, byte for byte) or valid, never null: `issued_by`, a name, on an assign only;
+ * `access_override`, exactly true, on any action (whether it matches the addressed assignment is the service's check).
  */
 export function parseCommand(v: unknown): Command {
     const c = rec(v, 'command');
     const named = Object.hasOwn(c, 'issued_by');
+    const override = Object.hasOwn(c, 'access_override');
     only(c, ['format', 'command_id', 'action', 'producer', 'scope', 'operator', 'product', 'target', 'quantity', 'starts_at', 'validity',
-        'reason', 'assignment', 'billing_effect', 'credit_option', ...(named ? ['issued_by'] : [])], 'command fields');
+        'reason', 'assignment', 'billing_effect', 'credit_option', ...(named ? ['issued_by'] : []), ...(override ? ['access_override'] : [])], 'command fields');
     if (named && (c.action !== 'assign' || !isIssuedBy(c.issued_by))) throw new InvalidCommand('issued_by');
+    if (override && c.access_override !== true) throw new InvalidCommand('access_override');
     if (c.format !== FORMATS.command) throw new InvalidCommand('format');
     if (c.producer !== PRODUCER || c.scope !== SCOPE) throw new InvalidCommand('producer');
     if (c.billing_effect !== 'none' || c.credit_option !== 'none') throw new InvalidCommand('billing_effect');
@@ -125,7 +138,8 @@ export function parseCommand(v: unknown): Command {
     if (c.action === 'end' && (assignment === null || product !== null || validity !== null || startsAt !== null)) throw new InvalidCommand('end');
     return { format: FORMATS.command, command_id: str(c.command_id, UUID, 'command_id'), action: c.action, producer: PRODUCER, scope: SCOPE,
         operator, product, target, quantity: null, starts_at: startsAt, validity, reason: text(c.reason, 500, 'reason'), assignment,
-        billing_effect: 'none', credit_option: 'none', ...(named ? { issued_by: c.issued_by as string } : {}) };
+        billing_effect: 'none', credit_option: 'none', ...(named ? { issued_by: c.issued_by as string } : {}),
+        ...(override ? { access_override: true as const } : {}) };
 }
 
 /** Canonical JSON: sorted keys, no whitespace; numbers are safe integers (the contract has no fractions). */
@@ -143,8 +157,13 @@ export function payloadSha256(body: Record<string, unknown>): string {
     return createHash('sha256').update(canonicalJson(rest)).digest('hex');
 }
 
-/** The OS catalog: Free (never assignable), Standard and Premium. No included AI credits: an assignment grants none. */
-export function sourceCatalog() {
+/**
+ * The OS catalog: Free (never assignable), Standard and Premium. No included AI credits: an assignment grants none.
+ * `accessOverrides`: 0038 is installed, so the catalog advertises `access_overrides: true` (an assign may carry
+ * `access_override` and set any of the three, Free included). Absent otherwise. Never part of `catalog_revision`, which
+ * covers the assignable products only, so commands signed against the same products stay valid across the rollout.
+ */
+export function sourceCatalog(options: { accessOverrides?: boolean } = {}) {
     const products = (['free_v3', ...OPERATOR_SKUS] as const).map(sku => {
         const offer = CATALOG_V3[sku];
         const assignable = sku !== 'free_v3';
@@ -153,7 +172,8 @@ export function sourceCatalog() {
     });
     const revision = createHash('sha256').update(canonicalJson(products.filter(p => p.assignable).map(p => ({ ref: p.ref, price: p.price,
         session_max_seconds: CATALOG_V3[p.ref].sessionMaxSeconds })))).digest('hex').slice(0, 16);
-    return { format: FORMATS.sourceCatalog, producer: PRODUCER, scope: SCOPE, catalog_revision: `os-v3.${revision}`, products };
+    return { format: FORMATS.sourceCatalog, producer: PRODUCER, scope: SCOPE, catalog_revision: `os-v3.${revision}`,
+        ...(options.accessOverrides ? { access_overrides: true as const } : {}), products };
 }
 
 const isoMs = (d: Date) => d.toISOString();
@@ -165,7 +185,8 @@ export function assignmentView(row: OperatorEntitlementRow, now: Date): Assignme
     const end = row.endedAt !== null && (row.endsAt === null || row.endedAt < row.endsAt) ? row.endedAt : row.endsAt;
     return { ref: row.ref, revision: row.revision, producer: PRODUCER, scope: SCOPE, product_ref: row.sku,
         target: { kind: 'individual', os_user_id: row.userId, account_public_id: row.accountPublicId }, quantity: null,
-        starts_at: isoMs(row.startsAt), ends_at: end === null ? null : isoMs(end), until_revoked: end === null, state: ended ? 'ended' : 'active' };
+        starts_at: isoMs(row.startsAt), ends_at: end === null ? null : isoMs(end), until_revoked: end === null, state: ended ? 'ended' : 'active',
+        ...(row.accessOverride ? { access_override: true as const } : {}) };
 }
 
 export function refused(commandId: string, code: RefusalCode, message: string, effective: EffectiveAccess): Result {
