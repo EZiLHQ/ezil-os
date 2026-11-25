@@ -141,6 +141,34 @@ const NOISE = /\d+%|min left|Estimated|✓|Next session|Last recorded update|App
     spinner.render({ kind: 'progress' });
     push('retry progress restores the app title and hides failure guidance', titleOf(spinner) === 'Opening Code…' && statusOf(spinner).hidden);
 }
+{
+    // A caller's link action on a failure (Code: Universe's page for a legacy project bookmark on staging AWS).
+    const href = 'https://universe-staging.ezil.work/assignment/legacy-work/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222';
+    const spinner = AppSpinner({ label: 'Opening Code…' });
+    const link = () => $(spinner, '.ezil-opening-link');
+    push('link action: hidden, wordless and without an address before any failure',
+        link().hidden === true && link().textContent === '' && ! link().hasAttribute('href'));
+    spinner.render({ kind: 'failed', reason: 'unknown', copy: { title: 'T', body: 'B' }, link: { label: 'Check this link in Universe', href } });
+    push('link action: shown beside Try again with its words and exact address',
+        link().hidden === false && link().textContent === 'Check this link in Universe' && link().getAttribute('href') === href
+        && $(spinner, '.ezil-boot-retry').hidden === false && $(spinner, '.ezil-boot-actions').hidden === false);
+    push('link action: opens a new tab with no referrer and no opener',
+        link().getAttribute('target') === '_blank' && link().getAttribute('rel') === 'noopener noreferrer'
+        && link().getAttribute('referrerpolicy') === 'no-referrer');
+    push('link action: the failure keeps its own words', titleOf(spinner) === 'T' && statusOf(spinner).textContent === 'B');
+    for (const [name, bad] of [['http', { label: 'x', href: 'http://universe-staging.ezil.work/a' }],
+        ['javascript', { label: 'x', href: 'javascript:alert(1)' }], ['credentials', { label: 'x', href: 'https://u:p@universe-staging.ezil.work/a' }],
+        ['non-canonical', { label: 'x', href: 'https://universe-staging.ezil.work' }], ['empty words', { label: ' ', href }]]) {
+        spinner.render({ kind: 'failed', reason: 'unknown', link: bad });
+        push(`link action: a ${name} link is not offered`, link().hidden === true && ! link().hasAttribute('href') && link().textContent === '');
+    }
+    spinner.render({ kind: 'failed', reason: 'unknown', link: { label: 'Check this link in Universe', href } });
+    spinner.render({ kind: 'failed', reason: 'unknown' });
+    push('link action: a later failure without one hides it again', link().hidden === true && ! link().hasAttribute('href'));
+    spinner.render({ kind: 'failed', reason: 'unknown', link: { label: 'Check this link in Universe', href } });
+    spinner.render({ kind: 'progress' });
+    push('link action: never offered while opening', link().hidden === true && $(spinner, '.ezil-boot-actions').hidden === true);
+}
 for (const flag of [undefined, null, false, 'true', 'false', 1, 0, {}, [], true]) {
     const spinner = AppSpinner({ label: 'Opening Preview…', isLaunching: () => flag });
     spinner.render({ kind: 'progress' });

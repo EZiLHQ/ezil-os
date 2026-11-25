@@ -150,6 +150,7 @@ import { register_app_frame } from '../ui/feedback/app-failures.js';
 import { register_billing_frame } from '../ui/Settings/billing-recovery.js';
 import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js';
 import AppSpinner, { computerUpdateMilestone } from '../ui/app-spinner.js';
+import { legacyWorkLink } from './legacy-work-link.js';
 import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
 import attach_app_drawer from '../ui/app-drawer.js';
 import { createFullView, is_minimized } from '../ui/full-view.js';
@@ -1112,6 +1113,8 @@ export async function openCodeWindow (ctx = {}) {
                 progress.render({
                     ...computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: res.errorCode }),
                     copy: PROJECT_FAILURE_COPY[res.errorCode],
+                    // Staging AWS refusing a legacy two-id bookmark: also offer Universe's page for that link.
+                    link: legacyWorkLink({ origin: globalThis.location?.origin, errorCode: res.errorCode, project: asked }),
                 });
                 trace.step('project_refused');
                 trace.end(res.errorCode === 'repo_open_failed' ? 'error' : 'skipped');

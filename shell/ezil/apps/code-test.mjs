@@ -1450,6 +1450,40 @@ await settle(4);
         await closeCode();
     }
 
+    // 8f'. Staging AWS refusing a legacy two-id bookmark also offers Universe's page for that link, beside the ordinary
+    //      copy and Try again. Nowhere else: not off staging, not for a repository address, not for another refusal.
+    const legacyLink = (w) => w?.querySelector('.ezil-opening-link');
+    const LEGACY_HREF = `https://universe-staging.ezil.work/assignment/legacy-work/${P1.projectId}/${P1.repoId}`;
+    const unsupported = { status: 409, payload: { error: { code: 'repo_open_unsupported_provider', message: 'x' } } };
+    for ( const [name, origin, project, answer, offered] of [
+        ['staging, legacy bookmark, unsupported provider', 'https://os-staging.ezil.work', { ...P1, path: 'src/main.ts' }, unsupported, true],
+        ['ezil.local (not staging), same refusal', 'https://ezil.local', P1, unsupported, false],
+        ['staging, repository address, same refusal', 'https://os-staging.ezil.work', { repoUrl: 'https://github.com/owner/name' }, unsupported, false],
+        ['staging, legacy bookmark, another refusal', 'https://os-staging.ezil.work', P1, refusals[0][1], false],
+    ] ) {
+        dom.reconfigure({ url: `${origin}/os` });
+        codeMintAnswer = () => answer;
+        await launch({ project });
+        await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+        w = codeWin();
+        const a = legacyLink(w);
+        const shown = !! a && a.hidden === false;
+        push(`8f' ${name}: ${offered ? 'offers' : 'does not offer'} "Check this link in Universe"`,
+            offered
+                ? shown && a.textContent === 'Check this link in Universe' && a.getAttribute('href') === LEGACY_HREF
+                  && a.getAttribute('rel') === 'noopener noreferrer' && a.getAttribute('referrerpolicy') === 'no-referrer'
+                  && a.getAttribute('target') === '_blank'
+                : ! shown && ! a?.hasAttribute('href'),
+            `shown=${shown} href=${a?.getAttribute('href')} text="${a?.textContent}"`);
+        if ( offered ) {
+            push(`8f' ${name}: the ordinary copy and Try again stay, the frame is untouched`,
+                spinnerTitle(w) === "Projects can't open on this computer yet" && ! w.querySelector('.ezil-boot-retry')?.hidden
+                && frameSrc(w) === 'about:blank', `"${spinnerTitle(w)}" ${frameSrc(w)}`);
+        }
+        await closeCode();
+    }
+    dom.reconfigure({ url: 'https://ezil.local/os' });
+
     // 8g. IDENTITY_REFRESH_REQUIRED: the tab goes to the silent sign-in, once, coming back to this project.
     const refresh = { status: 409, payload: { error: { code: 'CONFLICT', message: 'IDENTITY_REFRESH_REQUIRED' } } };
     codeMintAnswer = () => refresh;

@@ -115,6 +115,14 @@ const expectText = T => T < 60 ? 'usually under a minute' : `usually about ${Mat
 /** Seam C: the preparing status. The meta line shows the elapsed time only, so nothing contradicts it. */
 export const preparingText = app => `Preparing ${app} — the first open after your computer starts takes a minute or two.`;
 const ICON_URL = /^(?:data:image\/(?:svg\+xml|png|gif|webp|jpeg)[;,]|https:\/\/|\/(?!\/))/;
+/** A caller's link action, or null: plain words and an exact https address (no credentials, no other scheme). */
+function linkOf (link) {
+    if (!link || typeof link.label !== 'string' || !link.label.trim() || typeof link.href !== 'string') return null;
+    let url;
+    try { url = new URL(link.href); } catch { return null; }
+    if (url.protocol !== 'https:' || url.username || url.password || url.href !== link.href) return null;
+    return { label: link.label.trim().slice(0, 80), href: url.href };
+}
 const feedbackAvailable = () => typeof globalThis.window?.__EZIL_BOOT__?.desktopState?.endpoints?.feedback === 'string';
 /** "Opening Code…" → "Code". */
 const appNameOf = label => String(label ?? '').replace(/^Opening\s+/, '').replace(/…$/, '').trim();
@@ -170,6 +178,7 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             <p class="ezil-opening-meta" aria-hidden="true" hidden></p>
             <div class="ezil-boot-actions" hidden>
                 <button type="button" class="ezil-opening-action ezil-boot-retry" hidden></button>
+                <a class="ezil-opening-action is-secondary ezil-opening-link" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" hidden></a>
                 <button type="button" class="ezil-opening-action ezil-opening-view-status" hidden></button>
                 <button type="button" class="ezil-opening-action is-secondary ezil-opening-feedback" hidden></button>
             </div>
@@ -180,6 +189,7 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
     const el_fill = el('.ezil-opening-fill'), el_status = el('.ezil-opening-status'), el_meta = el('.ezil-opening-meta');
     const el_actions = el('.ezil-boot-actions'), el_retry = el('.ezil-boot-retry'), el_view = el('.ezil-opening-view-status');
     const el_feedback = el('.ezil-opening-feedback'), el_details = el('.ezil-opening-details'), el_details_text = el('.ezil-opening-details-text');
+    const el_link = el('.ezil-opening-link');
 
     const name = String(appName ?? appNameOf(label) ?? '').trim();
     if (typeof icon === 'string' && ICON_URL.test(icon)) {
@@ -250,8 +260,10 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
     /**
      * Write the DOM. textContent only; nothing is rebuilt.
      * @param {{state: string, title: string, status?: string, meta?: string, bar: null | 'indeterminate' | number,
-     *   retry?: boolean, retryLabel?: string, openAws?: boolean, view?: boolean, feedback?: boolean, details?: string|null}} m
+     *   retry?: boolean, retryLabel?: string, openAws?: boolean, view?: boolean, feedback?: boolean, details?: string|null,
+     *   link?: {label: string, href: string}|null}} m
      *   `retryLabel`: the one action's words when it is not Try again (Phase B: [Open my AWS computer], `openAws`).
+     *   `link`: an extra https link beside the actions, opened in a new tab without a referrer.
      */
     function paint (m) {
         const now = Date.now();
@@ -290,7 +302,12 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         // Its words exist only while it is offered: a hidden control adds no copy to the surface.
         el_view.textContent = m.view ? OPEN_COPY.viewStatus : '';
         el_feedback.hidden = !(m.feedback && feedbackAvailable());
-        el_actions.hidden = el_retry.hidden && el_view.hidden && el_feedback.hidden;
+        const link = linkOf(m.link);
+        el_link.hidden = !link;
+        // Its words and address exist only while it is offered.
+        el_link.textContent = link ? link.label : '';
+        if (link) el_link.href = link.href; else el_link.removeAttribute('href');
+        el_actions.hidden = el_retry.hidden && el_view.hidden && el_feedback.hidden && el_link.hidden;
         // Dev details are data for diagnostics only: the block never paints on the surface.
         el_details_text.textContent = m.details ?? '';
         el_details.hidden = true;
@@ -571,7 +588,7 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
             endOpen();
             // `state.copy`: the caller's app-specific words for this one failure (round 6: Code on a running computer).
             const copy = failureCopy ?? state.copy ?? BOOT_FAILURE_COPY[state.reason] ?? BOOT_FAILURE_COPY.unknown;
-            paint({ state: 'failed', title: copy.title, status: copy.body, bar: null, retry: true, feedback: true });
+            paint({ state: 'failed', title: copy.title, status: copy.body, bar: null, retry: true, feedback: true, link: state.link });
             return;
         }
 

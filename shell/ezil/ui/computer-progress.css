@@ -191,6 +191,7 @@
     color: var(--open-fg);
     box-shadow: inset 0 0 0 1px var(--open-line);
 }
+.ezil-app-spinner a.ezil-opening-action { text-decoration: none; }
 .ezil-app-spinner .ezil-opening-action:hover { filter: brightness(1.08); }
 .ezil-app-spinner .ezil-opening-action:focus-visible { outline: 2px solid var(--open-focus); outline-offset: 2px; }
 
