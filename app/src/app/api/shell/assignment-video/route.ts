@@ -4,6 +4,8 @@ import { recordingAction } from '@/server/assignment-video/broker';
 import { assignmentAuthority } from '@/server/assignment-video/authority';
 import { boundedJson, BrokerError, requestSchema } from '@/server/assignment-video/contract';
 import { shellJson, shellUnauthenticated } from '@/server/shell/http';
+import { expectedRepositoryURL } from '@/server/git/assignment-repository-name';
+import { assignmentRepositoryAttempt } from '@/utils/assignment-work-auth';
 import { isCrossOriginWrite } from '@/utils/request-origin';
 
 export const dynamic = 'force-dynamic';
@@ -29,7 +31,15 @@ export async function POST(req: Request) {
         if (!parsed.success) return fail('invalid_request', 400);
         const identity = await retainedIdentity(ctx.user.id).catch(() => null);
         if (!identity) return fail('identity_refresh_required', 401);
-        const result = await recordingAction(identity, parsed.data, {signal: req.signal});
+        const input = parsed.data;
+        const repositoryUrl = req.headers.get('x-ezil-assignment-repository');
+        if (input.action === 'preflight' && repositoryUrl !== null) {
+            if (assignmentRepositoryAttempt(repositoryUrl) !== input.attemptId) return fail('invalid_request', 400);
+            // Compare the link with the verified local identity without looking up the attempt or its owner.
+            if (repositoryUrl !== expectedRepositoryURL(identity.subject, 'a-' + input.attemptId))
+                return fail('assignment_identity_mismatch', 409);
+        }
+        const result = await recordingAction(identity, input, {signal: req.signal});
         const current = await retainedIdentity(ctx.user.id).catch(() => null);
         if (!current || current.sessionId !== identity.sessionId || current.subject !== identity.subject)
             return fail('identity_refresh_required', 401);
