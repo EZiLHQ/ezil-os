@@ -15,11 +15,14 @@ export function isAssignmentCodeReturn(path: string): boolean {
 }
 
 export const workReturnPath = '/assignment/work-return';
+export const embeddedWorkReturnSuffix = '&workspace=1';
 
 export function workReturnAttempt(destination: string, path: typeof workReturnPath | '/app/assignment-enrollment' = workReturnPath): string | null {
     const prefix = path + '?attempt=';
     if (!destination.startsWith(prefix)) return null;
-    const attempt = destination.slice(prefix.length);
+    const value = destination.slice(prefix.length);
+    const embedded = path === workReturnPath && value.endsWith(embeddedWorkReturnSuffix);
+    const attempt = embedded ? value.slice(0, -embeddedWorkReturnSuffix.length) : value;
     return uuid.test(attempt) && attempt.length === 36 ? attempt : null;
 }
 

@@ -30,7 +30,21 @@ describe('return from top-level OS sign-in to the original Universe assignment',
         expect(login.origin+login.pathname).toBe(origin+'/login');
         expect(login.searchParams.get('returnUrl')).toBe(returned);
     });
+    it('returns an embedded assignment to its Universe workspace in the same document',async()=>{
+        const embedded=returned+'&workspace=1';
+        expect(safeReturnUrl(embedded)).toBe(embedded);
+        const signedIn=await GET(request(embedded));
+        expect(signedIn.status).toBe(303);
+        expect(signedIn.headers.get('location')).toBe(universe+'/assignment/workspace/'+id);
+        mocks.context.mockResolvedValue({user:null,delegation:null});
+        const login=await GET(request(embedded));
+        expect(new URL(login.headers.get('location')!).searchParams.get('returnUrl')).toBe(embedded);
+        const enrollment='/app/assignment-enrollment?attempt='+id+'&workspace=1';
+        expect(safeReturnUrl(enrollment)).not.toBe(enrollment);
+    });
     it.each([returned+'&returnUrl=https://example.org',returned+'&attempt='+id,returned+'&x=1',
+        returned+'&workspace=0',returned+'&workspace=1&workspace=1',returned+'&workspace=1&x=1',
+        '/assignment/work-return?workspace=1&attempt='+id,
         '/assignment/work-return?attempt=../os','//universe-staging.ezil.work/assignment/work/'+id,
         '/assignment/work-return?attempt='+id.toUpperCase()])('rejects a supplied alternative return target %s',async value=>{
         expect(workReturnAttempt(value)).toBeNull();
