@@ -129,7 +129,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             if(!isHere())return;
             if(e.code==='identity_refresh_required'){showSignIn();return;}
             if(e.code==='assignment_video_creator_unlinked'){
-                lockedView('The Creator needs to connect EZiL ID','This assignment can open after the job Creator signs in to Universe with their verified EZiL ID. Return to the job for your application options.');
+                lockedView('The Creator needs to connect EZiL ID','The job Creator must sign in to Universe with their verified EZiL ID. Return to the job to check whether your assignment is still available.');
                 ui.action('Return to Universe jobs',()=>win.open('https://universe-staging.ezil.work/builder-jobs','_self','noreferrer'));
                 return;
             }
