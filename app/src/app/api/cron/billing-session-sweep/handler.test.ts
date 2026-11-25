@@ -12,6 +12,10 @@ import * as aiOutbox from '@/server/billing/ai-credit-outbox';
 vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ advanceStaleMigrations: vi.fn() }));
 vi.mock('@/server/lib/compute/provider-migrate-reconcile', () => ({ reconcilePaidCloudflareUsers: vi.fn() }));
 vi.mock('@/server/lib/compute/provider-reverse-runtime', () => ({ advanceReverseMoves: vi.fn() }));
+vi.mock('@/server/lib/compute/provider-reverse-override', async original => ({
+    ...await original<Record<string, unknown>>(), reconcileFreeOverrideMovesInSweep: vi.fn(async () => null), freeOverrideLaneEnabled: vi.fn(() => false),
+}));
+import { reconcileFreeOverrideMovesInSweep } from '@/server/lib/compute/provider-reverse-override';
 
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn(() => { throw new Error('Inject billing deps'); }) }));
 
@@ -539,6 +543,27 @@ describe('paid sessions: no hours cap, a six-hour session rotation', () => {
         expect(vi.mocked(advanceStaleMigrations).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(reconcilePaidCloudflareUsers).mock.invocationCallOrder[0]!);
     });
 
+    it('the explicit Free override reconciliation runs after the held pass and before the forward steps, with the handler\'s start; a throw never fails the sweep', async () => {
+        const { advanceStaleMigrations } = await import('@/server/lib/compute/provider-migrate-orchestrator');
+        vi.mocked(advanceStaleMigrations).mockClear(); vi.mocked(reconcileFreeOverrideMovesInSweep).mockClear();
+        vi.spyOn(Date, 'now').mockReturnValue(777);
+        const order: string[] = [];
+        const counts = { candidates: 1, deferred: 0, stopped: 1, started: 0, skipped: 0, errors: 0 };
+        vi.mocked(reconcileFreeOverrideMovesInSweep).mockImplementationOnce(async () => { order.push('override'); return counts; });
+        vi.mocked(advanceStaleMigrations).mockImplementationOnce(async () => { order.push('forward'); });
+        expect((await fixture().run(1)).overrideMoves).toEqual(counts);
+        expect(reconcileFreeOverrideMovesInSweep).toHaveBeenCalledExactlyOnceWith(777);
+        expect(order).toEqual(['override', 'forward']);
+        vi.mocked(reconcileFreeOverrideMovesInSweep).mockRejectedValueOnce(new Error('override down'));
+        expect((await fixture().run(1)).overrideMoves).toBeUndefined();
+        expect(vi.mocked(console.warn).mock.calls.map(c => c[0])).toContain('[billing.sweep] override reconcile unavailable');
+        // Metering off: the step does not run (it sits on the metered path, beside the forward steps).
+        vi.mocked(reconcileFreeOverrideMovesInSweep).mockClear();
+        const off = fixture([]); off.deps.config.enforcementEnabled = false; off.deps.config.tabEnabled = false;
+        await off.run(0);
+        expect(reconcileFreeOverrideMovesInSweep).not.toHaveBeenCalled();
+    });
+
     it('Phase B (§5.4): the reverse pass is the last step, after drain(), with the handler\'s own start', async () => {
         const { advanceStaleMigrations } = await import('@/server/lib/compute/provider-migrate-orchestrator');
         const { reconcilePaidCloudflareUsers } = await import('@/server/lib/compute/provider-migrate-reconcile');
@@ -629,6 +654,70 @@ describe('paid sessions: no hours cap, a six-hour session rotation', () => {
                 .rejects.toThrow(/epochs down/);
             expect(order).toEqual(['plans', 'reverse']);
         });
+    });
+});
+
+describe('explicit Free override (provider-reverse-override.ts): the sweep\'s own AWS stops defer to the override lane', () => {
+    /** A Stripe Standard payer whose operator row marks an explicit Free override (effective-access.ts): Free decides, Stripe stays. */
+    const overrideRow = { ref: 'ovr', revision: 1, userId: ref.userId, accountPublicId: 'acct', sku: 'free_v3', accessOverride: true,
+        startsAt: at(-7200), endsAt: null, endedAt: null };
+    function overridden(epochs: StoredComputeEpoch[], { lane = true, grant = false } = {}) {
+        const f = fixture(epochs, { sku: 'standard_monthly_v3', allowance: 144000 });
+        // Billing on and enforced: the lane's own gate (`tabEnabled`) and the sweep's stops.
+        f.deps.config = readBillingConfig({ BILLING_ENFORCEMENT: '1', BILLING_TAB_ENABLED: '1' });
+        (f.store as unknown as { operatorEntitlementsFor: unknown }).operatorEntitlementsFor =
+            vi.fn(async () => grant ? [{ ...overrideRow, sku: 'standard_monthly_v3', accessOverride: false }] : [overrideRow]);
+        const run = (seconds: number, extra: Partial<SweepInput> = {}) => handleBillingSessionSweep({ deps: f.deps, now: at(seconds), stop: f.stop,
+            isStillRunning: f.isStillRunning, overrideLane: lane, ...extra });
+        return { ...f, run };
+    }
+    const paidEra = () => epoch({ size: 'std-2', deadlineAt: iso(21_600) });
+
+    it('the loaded state of such an owner is the explicit Free override; an ordinary grant or a plain payer is not', async () => {
+        const { explicitFreeOverrideState } = await import('@/server/lib/compute/provider-reverse-override');
+        expect(explicitFreeOverrideState(await loadComputeBillingState(overridden([]).deps, ref.userId, T))).toBe(true);
+        expect(explicitFreeOverrideState(await loadComputeBillingState(overridden([], { grant: true }).deps, ref.userId, T))).toBe(false);
+        expect(explicitFreeOverrideState(await loadComputeBillingState(fixture([], { sku: 'standard_monthly_v3' }).deps, ref.userId, T))).toBe(false);
+    });
+
+    it('a paid-era AWS session still open under the override: no policy stop and no deadline close from the sweep (the lane\'s guarded stop and its receipt end it)', async () => {
+        const f = overridden([paidEra()]);
+        for (const seconds of [3600, 7200, 21_660]) expect(await f.run(seconds)).toMatchObject({ examined: 1, stopped: 0, closed: 0, shadow: 0 });
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(f.epochs[0]).toMatchObject({ endedAt: null });
+    });
+
+    it('with the lane off (flags) the same session takes the ordinary Free bound: the drop ends it, as before', async () => {
+        const f = overridden([paidEra()], { lane: false });
+        expect(await f.run(7200)).toMatchObject({ stopped: 1, closed: 1 });
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+    });
+
+    it('with billing off (tabEnabled false, enforcement on) the lane cannot run, so the sweep keeps its own stop', async () => {
+        const f = overridden([paidEra()]);
+        f.deps.config = readBillingConfig({ BILLING_ENFORCEMENT: '1', BILLING_TAB_ENABLED: '0' });
+        expect(f.deps.config.tabEnabled).toBe(false);
+        await f.run(7200);
+        expect(f.stop).toHaveBeenCalledTimes(1);
+    });
+
+    it('a Cloudflare (free-cf) session of the same owner keeps the ordinary policy: the override lane never touches Cloudflare', async () => {
+        const f = overridden([epoch({ size: 'free-cf', lastHeartbeatAt: iso(0) })]);
+        expect(await f.run(7200)).toMatchObject({ closed: 1, heartbeatClosed: 1 });
+    });
+
+    it('a recent policy close of the owner is not retried through the unfenced stop while the override holds', async () => {
+        const f = overridden([epoch({ endedAt: iso(100), endReason: 'session_max' })]);
+        f.isStillRunning.mockResolvedValue(true);
+        expect(await f.run(200)).toMatchObject({ retried: 0, stopped: 0 });
+        expect(f.stop).not.toHaveBeenCalled();
+    });
+
+    it('a RUNNING host with no session is not a held overrun under the override (no stop, no held-overrun line)', async () => {
+        const f = overridden([epoch({ endedAt: iso(-86_400), endReason: 'session_max' })]);
+        const runningAwsPlacements = vi.fn(async () => ({ candidates: [{ ...ref, state: 'RUNNING' as const, since: at(-600), closedAt: at(-86_400), stoppedSinceClose: true }], next: null }));
+        expect(await f.run(0, { runningAwsPlacements })).toMatchObject({ heldOverrun: 0, stopped: 0 });
+        expect(f.stop).not.toHaveBeenCalled();
     });
 });
 

@@ -39,6 +39,7 @@ vi.mock('@/server/billing/ai-credits-pending', () => ({ aiCreditsPendingFor: vi.
 vi.mock('./handler', () => ({ handleBillingSessionSweep: vi.fn(), RUNNING_GRACE_MS: 120_000,
     reverseMoveInFlightFor: vi.fn((executor: unknown) => Object.assign(async () => false, { executor })) }));
 vi.mock('@/server/lib/compute/provider-reverse-runtime', () => ({ advanceReverseMoves: vi.fn() }));
+vi.mock('@/server/lib/compute/provider-reverse-override', () => ({ freeOverrideLaneEnabled: vi.fn(() => false) }));
 
 const now = new Date('2026-10-18T06:00:00Z');
 const computer = { userId: 'epoch-owner', computerId: 'computer' };
@@ -89,7 +90,7 @@ describe('GET /api/cron/billing-session-sweep', () => {
         expect(await response.json()).toEqual(counts);
         expect(handleBillingSessionSweep).toHaveBeenCalledExactlyOnceWith({ deps, now, stop: expect.any(Function),
             isStillRunning: expect.any(Function), awsStopProof: expect.any(Function), runningAwsPlacements: expect.any(Function),
-            reverseMoveInFlight: expect.any(Function), refreshAiPlans: expect.any(Function) });
+            reverseMoveInFlight: expect.any(Function), refreshAiPlans: expect.any(Function), overrideLane: expect.any(Boolean) });
         expect(maxDuration).toBe(300);
         // Phase B (§5.4): the held pass's reverse-move read is built over the app database, once per sweep.
         expect(reverseMoveInFlightFor).toHaveBeenCalledExactlyOnceWith(db);
