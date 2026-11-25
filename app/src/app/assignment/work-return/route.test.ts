@@ -11,7 +11,11 @@ const id='ba4cf399-1f9b-43e5-be10-45e403bc0190', origin='https://os-staging.ezil
 const returned='/assignment/work-return?attempt='+id;
 const repo='https://github.ezil.work/default/u-0123456789abcdef-a-'+id+'.git';
 const request=(path=returned, dest='document',host=origin)=>new Request(host+path,{headers:{'sec-fetch-dest':dest}});
-beforeEach(()=>{vi.clearAllMocks();mocks.enabled.mockReturnValue(true);mocks.context.mockResolvedValue({user:{id:'signed-in'},delegation:null});});
+const stageEnv=()=>{vi.unstubAllEnvs();vi.stubEnv('BILLING_FUNDING_URL','https://ai-staging.ezil.work');vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED','');
+    vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN',universe);};
+const productionEnv=()=>{vi.unstubAllEnvs();vi.stubEnv('BILLING_FUNDING_URL','https://ai.ezil.work');vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED','1');
+    vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN','https://universe.ezil.work');};
+beforeEach(()=>{vi.clearAllMocks();stageEnv();mocks.enabled.mockReturnValue(true);mocks.context.mockResolvedValue({user:{id:'signed-in'},delegation:null});});
 
 describe('return from top-level OS sign-in to the original Universe assignment',()=>{
     it('preserves an exact local OAuth transaction and sends the verified OS user to one fixed stage destination',async()=>{
@@ -30,7 +34,49 @@ describe('return from top-level OS sign-in to the original Universe assignment',
         expect(login.origin+login.pathname).toBe(origin+'/login');
         expect(login.searchParams.get('returnUrl')).toBe(returned);
     });
+    it('returns an embedded assignment to its Universe workspace in the same document',async()=>{
+        const embedded=returned+'&workspace=1';
+        expect(safeReturnUrl(embedded)).toBe(embedded);
+        const signedIn=await GET(request(embedded));
+        expect(signedIn.status).toBe(303);
+        expect(signedIn.headers.get('location')).toBe(universe+'/assignment/workspace/'+id);
+        mocks.context.mockResolvedValue({user:null,delegation:null});
+        const login=await GET(request(embedded));
+        expect(new URL(login.headers.get('location')!).searchParams.get('returnUrl')).toBe(embedded);
+        const enrollment='/app/assignment-enrollment?attempt='+id+'&workspace=1';
+        expect(safeReturnUrl(enrollment)).not.toBe(enrollment);
+    });
+    it('on production serves only the embedded workspace return, on os.ezil.work, to universe.ezil.work',async()=>{
+        productionEnv();
+        const prod='https://os.ezil.work', embedded=returned+'&workspace=1';
+        const signedIn=await GET(request(embedded,'document',prod));
+        expect(signedIn.status).toBe(303);
+        expect(signedIn.headers.get('location')).toBe('https://universe.ezil.work/assignment/workspace/'+id);
+        expect(signedIn.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+        mocks.context.mockResolvedValue({user:null,delegation:null});
+        const login=new URL((await GET(request(embedded,'document',prod))).headers.get('location')!);
+        expect(login.origin+login.pathname).toBe(prod+'/login');
+        expect(login.searchParams.get('returnUrl')).toBe(embedded);
+        mocks.context.mockClear();
+        // The production top-level assignment tab never used this route, the staging host is another deployment, and
+        // an unowned or sibling host is not this deployment's OS origin.
+        for(const [path,dest,host] of [[returned,'document',prod],[embedded,'iframe',prod],[embedded,'document',origin],
+            [embedded,'document','https://os-prod.ezil.work'],[embedded,'document','https://os.ezil.org'],[embedded,'document','https://evil.example']] as const)
+            expect((await GET(request(path,dest,host))).status).toBe(404);
+        expect(mocks.context).not.toHaveBeenCalled();
+    });
+    it('serves nothing when no deployment authority is selected, or the staging authority is asked on production',async()=>{
+        const embedded=returned+'&workspace=1';
+        vi.unstubAllEnvs();vi.stubEnv('BILLING_FUNDING_URL','');
+        expect((await GET(request(embedded))).status).toBe(404);
+        expect((await GET(request(embedded,'document','https://os.ezil.work'))).status).toBe(404);
+        stageEnv();
+        expect((await GET(request(embedded,'document','https://os.ezil.work'))).status).toBe(404);
+        expect(mocks.context).not.toHaveBeenCalled();
+    });
     it.each([returned+'&returnUrl=https://example.org',returned+'&attempt='+id,returned+'&x=1',
+        returned+'&workspace=0',returned+'&workspace=1&workspace=1',returned+'&workspace=1&x=1',
+        '/assignment/work-return?workspace=1&attempt='+id,
         '/assignment/work-return?attempt=../os','//universe-staging.ezil.work/assignment/work/'+id,
         '/assignment/work-return?attempt='+id.toUpperCase()])('rejects a supplied alternative return target %s',async value=>{
         expect(workReturnAttempt(value)).toBeNull();

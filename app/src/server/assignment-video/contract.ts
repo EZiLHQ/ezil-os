@@ -69,6 +69,12 @@ export const eligible = z.object({...optionalClock, status: z.literal('eligible'
     upgradeOperationId: uuid.optional(),
     /** Direct AWS: the workspace Universe bound for this attempt (64-hex), or null before its first opening. Absent from an older Universe. */
     boundWorkspaceId: z.string().regex(/^[a-f0-9]{64}$/).nullable().optional(),
+    /**
+     * Exactly `'workspace'`, from a Universe that started this attempt's window itself, in its own workspace page, before
+     * any computer opened it: the one case in which a window that is already running has no bound workspace yet. Absent
+     * otherwise (and from an older Universe); any other value is not a preflight this OS understands.
+     */
+    startMode: z.literal('workspace').optional(),
 }).refine(state => (state.upgradedWorkspaceId !== undefined) === (state.upgradeOperationId !== undefined));
 const control = {
     ...optionalClock,

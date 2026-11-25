@@ -758,6 +758,99 @@ describe('a reserved assignment repository whose computer or Universe is not rea
         expect(await old.text()).not.toContain('preview-bootstrap');
     });
 
+    it('seals a Universe-workspace-started AWS attempt only at its first prepare, inside its valid running window', async () => {
+        const { open, prep, universe, enrolled, repositoryUrl, now } = await enrolledFixture();
+        const { readOpen, workspaceIdentity } = await import('@/server/assignment-video/repo-open');
+        vi.stubEnv('AWS_STANDALONE_REPO_OPEN_ENABLED', '1');
+        Object.assign(s.preview, { computeProvider: 'aws-ec2', sandboxId: SANDBOX, generation: 3, leaseEpoch: 1 });
+        const workspace = workspaceIdentity(USER, COMPUTER, SANDBOX), foreign = '0'.repeat(64);
+        const iso = (ms: number) => new Date(ms).toISOString();
+        const started = { windowStartedAt: iso(now - 30000), deadlineAt: iso(now + 3570000) };
+        const fresh = { ...enrolled, boundWorkspaceId: null, ...started, startMode: 'workspace' };
+        const operation = '99999999-9999-4999-8999-999999999999';
+        const committed = { id: operation, state: 'committed', userId: USER, computerId: COMPUTER, fromProvider: 'cloudflare', toProvider: 'aws-ec2' };
+        const pg = (ms: number) => iso(ms).replace('T', ' ').replace('Z', '+00');
+        const run = (assignment: object) => { s.aws = Array<boolean>(6).fill(true); return open(assignment); };
+        const refused = async (enrollment: object, migration: typeof s.migration = null, assignment: object = prep) => {
+            universe.preflight = () => Response.json(enrollment);
+            s.migration = migration; s.order = [];
+            const response = await run(assignment);
+            expect(response.status).toBe(409);
+            expect((await response.json()).error.code).toBe('assignment_aws_unverified');
+            expect(s.order).not.toContain('codePreviewUrl');
+            expect(s.order).not.toContain('worker');
+        };
+        // The existing refusal is untouched: a running window with no binding and no mode, or any other mode.
+        await refused({ ...enrolled, boundWorkspaceId: null, ...started });
+        await refused({ ...fresh, startMode: 'tab' });
+        await refused({ ...fresh, startMode: 'Workspace' });
+        await refused({ ...fresh, startMode: true });
+        // The mode never widens a binding: an older Universe (no field), a foreign or malformed one stay refused.
+        const { boundWorkspaceId: _absent, ...older } = fresh;
+        await refused(older);
+        await refused({ ...fresh, boundWorkspaceId: foreign });
+        await refused({ ...fresh, boundWorkspaceId: 'not-a-workspace' });
+        // Only a valid running window: not paused, not ended, not yet to begin, not longer than an unextended hour.
+        await refused({ ...fresh, pausedAt: iso(now - 1000), pauseReason: 'system_upgrade', revision: 1, remainingMs: 3000000, serverNow: iso(now) });
+        await refused({ ...fresh, deadlineAt: iso(now - 1) });
+        await refused({ ...fresh, windowStartedAt: iso(now + 60000) });
+        await refused({ ...fresh, deadlineAt: iso(now + 3 * 3600000) });
+        await refused({ ...fresh, windowStartedAt: null });
+        await refused({ ...fresh, deadlineAt: null });
+        // The settled-migration safeguards hold: an unfinished move, an operator hold, or a move during the running window.
+        await refused(fresh, { ...committed, state: 'provisioning' });
+        await refused(fresh, { ...committed, state: 'failed_needs_operator' });
+        for (const updatedAt of [pg(now - 5000), pg(now - 30000), 'yesterday', undefined]) await refused(fresh, { ...committed, updatedAt });
+        // Upgrade metadata keeps its own exact rule and gains nothing from the mode.
+        await refused({ ...fresh, upgradedWorkspaceId: foreign, upgradeOperationId: operation }, committed);
+
+        s.worker = body => {
+            const { repositoryId, assignmentPreload } = JSON.parse(body);
+            const folder = '/workspace/projects/' + repositoryId;
+            return Response.json({ ok: true, status: 'fetched', folder, checkoutFolder: folder + '/' + repositoryUrl.split('/').at(-1)!.slice(0, -4),
+                assignmentPreload: { eventId: assignmentPreload.eventId, nonce: assignmentPreload.nonce, port: 5679, status: 'acknowledged' } });
+        };
+        // The binding is read again after the mint: a workspace Universe bound elsewhere meanwhile never reaches the Worker.
+        universe.preflight = () => Response.json(s.order.includes('codePreviewUrl') ? { ...fresh, boundWorkspaceId: foreign } : fresh);
+        s.migration = null; s.order = [];
+        const raced = await run(prep);
+        expect(raced.status).toBe(409);
+        expect(s.order).toContain('codePreviewUrl');
+        expect(s.order).not.toContain('worker');
+
+        // The first prepare of the workspace-started attempt: sealed for this workspace, carrying Universe's own window.
+        universe.preflight = () => Response.json(fresh);
+        s.migration = { ...committed, updatedAt: pg(now - 60000) }; // moved to AWS strictly before the window began
+        const prepared = await run(prep);
+        expect(prepared.status).toBe(200);
+        const preparation = await prepared.json();
+        expect(preparation).toMatchObject({ ok: true, assignmentOpen: { attemptId, ...started } });
+        expect(preparation.codePreviewUrl).toBeUndefined();
+        expect(preparation.url).toBeUndefined();
+        const proof = preparation.assignmentOpen.proof;
+        const actor = { userId: USER, issuer: 'https://id.ezil.work/', subject, sessionId: s.sessionId, expiresAt: now + 600000 };
+        const opened = readOpen(proof, actor, attemptId, Date.now(), signingKey);
+        expect(opened.workspaceId).toBe(workspace);
+
+        // The mode opens nothing by itself: the editor still needs the workspace `begin` bound, the recorded first frame
+        // and `editor-ready`, which answers with the window Universe started, never a new one.
+        const editorReady = () => s.requests.filter(request => request.url.pathname.endsWith('/editor-ready')).length;
+        universe.status = () => Response.json({ captureSessionId, recordingId, repositoryOpenReceiptId: opened.eventId, status: 'recording',
+            revoked: false, stopRequestedAt: null, ...{ startedAt: started.windowStartedAt, deadlineAt: started.deadlineAt },
+            firstFrameAt: iso(now - 1000), phaseReady: true, workspaceUnlocked: true });
+        universe.ready = () => Response.json({ startedAt: started.windowStartedAt, deadlineAt: started.deadlineAt,
+            serverNow: iso(now), revision: 0, remainingMs: 3570000, pausedAt: null, pauseReason: null });
+        const enter = { phase: 'open', attemptId, captureSessionId, repoOpenProof: proof };
+        await refused(fresh, null, enter);
+        expect(editorReady()).toBe(0);
+        universe.preflight = () => Response.json({ ...enrolled, boundWorkspaceId: workspace, ...started });
+        s.migration = null;
+        const entered = await run(enter);
+        expect(entered.status).toBe(200);
+        expect(new URL((await entered.json()).codePreviewUrl).searchParams.get('folder')).toBe(preparation.repository.workspaceFolder);
+        expect(editorReady()).toBe(1);
+    });
+
     it('a cold computer answers its wake fields only (no Universe, no Worker, no URL, no capability), so the wake loop waits', async () => {
         const { open, prep } = await enrolledFixture();
         s.preview = { ok: false, errorCode: 'sandbox_starting', error: 'sandbox_starting', retryable: true, retryAfterMs: 2000,

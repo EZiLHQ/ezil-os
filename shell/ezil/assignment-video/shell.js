@@ -3,6 +3,7 @@ import { currentTabPicker, assignmentOsOrigin } from './current-tab.js';
 import { encodeTabSegments, seedFrame } from './tab-segments.js';
 import { createCountdown } from './countdown.js';
 import { createStatusControl } from './status-control.js';
+import { embeddedWorkHost, respondToWorkDiscover, WORK_PROTOCOL } from './work-protocol.js';
 import telemetry from '../telemetry.js';
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const canonical=/^https:\/\/github\.ezil\.work\/default\/u-[0-9a-f]{16}-a-([0-9a-f-]{36})\.git$/;
@@ -113,8 +114,505 @@ async function retry(operation, codes, times=2, live=()=>true) {
             await new Promise(resolve=>setTimeout(resolve,320*(i+1)));}}
 }
 
+/**
+ * Why this production computer may not hold the assignment yet, or null when it may. Cloudflare always may. AWS only as
+ * a committed upgrade of this workspace (`upgradedWorkspaceId` + `upgradeOperationId`) or a direct start: Universe's
+ * trusted `boundWorkspaceId` must be present, null only before a window started, or the workspace it bound. The server
+ * alone checks it against this computer's own workspace.
+ * `workspaceStart`: the embedded workspace also accepts the one other first opening, the window Universe itself started
+ * in its workspace page before any computer opened the attempt (`startMode:'workspace'`, still unbound). The top-level
+ * tab keeps refusing a running window without a binding.
+ */
+function computerRefusal(result,info,workspaceStart=false) {
+    const provider = info?.provider;
+    const upgradedAssignment = provider === 'aws-ec2'
+        && /^[a-f0-9]{64}$/.test(result.upgradedWorkspaceId ?? '')
+        && uuid.test(result.upgradeOperationId ?? '');
+    const bound = result.boundWorkspaceId;
+    const startedByWorkspace = workspaceStart && result.startMode === 'workspace'
+        && Number.isFinite(Date.parse(result.windowStartedAt)) && Number.isFinite(Date.parse(result.deadlineAt));
+    const directAssignment = provider === 'aws-ec2'
+        && ((bound === null && ((!result.windowStartedAt && !result.deadlineAt) || startedByWorkspace)) || /^[a-f0-9]{64}$/.test(bound ?? ''));
+    if (provider !== 'cloudflare' && !upgradedAssignment && !directAssignment) return provider === 'aws-ec2' ? 'aws_unverified' : 'provider_unknown';
+    if (provider === 'aws-ec2' && ['STOPPING','DRAINING','RETIRING'].includes(info.lifecycleState)) return 'stopping';
+    if (provider === 'aws-ec2' && info.lifecycleState === 'RUNNING' && info.assignmentSession === 'stop_then_reopen') return 'stop_then_reopen';
+    return null;
+}
+const COMPUTER_REFUSAL={
+    aws_unverified:['Choose an assignment-ready computer','Universe has not verified this AWS computer for this assignment. Reopen the assignment from Universe, or select a Cloudflare computer you own in EZiL OS.'],
+    provider_unknown:['Choose an assignment-ready computer','EZiL OS could not verify this computer’s assignment support. Check its provider in Settings → System, then try again.'],
+    stopping:['Stopping your computer','Wait until Settings → Computer shows Stopped, then reopen this assignment on this same computer.'],
+    stop_then_reopen:['Update this computer for your assignment',
+        'Save your work, then choose Stop in Settings → Computer. Wait until it says Stopped and reopen this assignment from Universe on this same computer. Your files stay on its disk.'],
+};
+
+const EMBED_SIGN_IN='Continue to EZiL OS sign-in from your Universe assignment tab.';
+const EMBED_UNAVAILABLE='This assignment workspace could not be verified here. Return to your Universe assignment to try again.';
+const EMBED_AGAIN='Share this tab again from Universe to resume your assignment.';
+const EMBED_PAUSED=['Sharing paused',EMBED_AGAIN];
+const EMBED_HELD=['Assignment time paused',
+    'Universe paused your assignment time and recording for a system upgrade. Saved footage and your assignment attempt are kept. Share this tab again from Universe when your time is running again.'];
+/** The parent's heartbeat: checked every `EMBED_WATCH_MS`, and a share whose parent has been silent for `EMBED_SILENT_MS` is saved as interrupted. */
+export const EMBED_WATCH_MS=2800;
+export const EMBED_SILENT_MS=14000;
+/** Two reports of the canonical start are the same clock within this (the same instant serialized at another precision). */
+const SAME_START_MS=1000;
+const identityCodes=['identity_refresh_required','IDENTITY_REFRESH_REQUIRED','assignment_identity_mismatch'];
+const replyCode=error=>typeof error?.code==='string' && /^[A-Za-z_]{1,64}$/.test(error.code) ? error.code : 'workspace_unavailable';
+const isoOrNull=value=>typeof value==='string' && Number.isFinite(Date.parse(value)) ? value : null;
+/** The frame's copy for a share that failed: the cause's own sentence, then how to resume (the picker is Universe's). */
+function embedMessage(cause) {
+    if(cause==='assignment_paused')return EMBED_HELD[1];
+    if(cause==='repo_open_unsupported_provider')return 'This computer does not support assignment recording. Select a Cloudflare computer you own in EZiL OS, then reopen the assignment.';
+    if(cause==='assignment_aws_unverified')return 'This AWS computer is not verified for this assignment. Reopen it from Universe on the computer you started with, or select a Cloudflare computer you own.';
+    if(cause==='assigned_checkout_unverified')return 'The assigned checkout could not be verified. '+EMBED_AGAIN;
+    if(WAKING.includes(cause))return 'Your computer is still starting. '+EMBED_AGAIN;
+    if(UNREACHABLE.includes(cause))return 'EZiL OS could not reach Universe to verify your assignment. '+EMBED_AGAIN;
+    if(/^billing_/.test(cause))return 'This computer could not start under your EZiL OS plan. Check Settings, then try again. '+EMBED_AGAIN;
+    if(/^capacity_/.test(cause))return 'No computer is available to start right now. '+EMBED_AGAIN;
+    return EMBED_AGAIN;
+}
+
+/**
+ * The assignment framed by its own Universe workspace page, which records ITS tab (`ezil.assignment.work/v2`). Only the
+ * exact paired origins (`./work-protocol.js`): os.ezil.work inside universe.ezil.work, os-staging inside
+ * universe-staging. The top-level assignment tab above is untouched.
+ *
+ * WINDOW (exact origin and the actual parent window only): the parent's `discover {challenge}` is answered with one of
+ * `authentication_required | preparing | ready | unavailable`, echoing that challenge. `preparing` while no port is
+ * bound invites ONE `bind {challenge}` carrying exactly one MessagePort, for the latest answered challenge. Nothing is
+ * fetched before a valid discover; one bind per document.
+ *
+ * PORT (the Universe `assignment-work-capture.js` vocabulary): parent `request {id, method}` for `begin | upload |
+ * status | unlock | end`, plus `pulse | lock | cancel`; child `ready` (bound, eligible, computer-checked and the server's
+ * clock not paused: sharing may start), `reply {id, ok, value | code}`, `pause {reason, effectiveAt}` and `reopen`. The
+ * parent owns consent, the browser picker and the encoder, and sends only frame bytes. This document keeps the sealed
+ * repository proof, the recording transport and every Universe answer; replies carry only the fields the parent reads.
+ *
+ * THREE TIMES, never mixed:
+ *  - encoder time is the parent's: each part's `startMs`/`endMs`, relative to the media window's start;
+ *  - the media window (`startedAt`, `deadlineAt`, `serverNow` in the seed's reply and in `unlock`) is the recording's own
+ *    and bounds the footage only;
+ *  - the assignment's clock is the server's (`clock`, and the `editor-ready` answer returned as `unlock`'s `clock`).
+ *    Nothing here starts, restarts or extends it. Its start, once reported (Universe's preflight window for an attempt
+ *    its workspace page started, a `clock` report or `editor-ready`), is the original: a later answer naming another
+ *    start is ignored, and an `editor-ready` that names one never opens the editor.
+ *
+ * The server gate is production's own: `prepare` seals the checkout, `begin` binds that receipt to the parent's capture
+ * session, the seed must be confirmed phase-ready, the `open` mint re-checks the same session, receipt, unlock and
+ * deadline and commits `editor-ready`, and the editor is shown only after Code reports the verified folder AND
+ * `editor-ready` answers here. Window `ready` = the editor is open on the verified folder.
+ *
+ * PAUSE / RE-SHARE: a server pause (`clock`) covers the editor, ends the live capture phase at the pause's own time
+ * (`pause {reason:'paused', effectiveAt}`; the parent seals and ends it, or the heartbeat watch does) and refuses a new
+ * `begin` (`assignment_paused`) until the clock runs again, when the port says `ready` once more. The port, the
+ * eligibility and the clock outlive every share: stopping, a pause or a failure never needs a new document.
+ */
+function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body, park, prepare, computerInfo, win, host, clockLiveMs, clockIdleMs,
+    watchMs=EMBED_WATCH_MS, silentMs=EMBED_SILENT_MS}) {
+    const owner=actor(), ui=buildGate(body), name=repo.split('/').at(-1).slice(0,-4);
+    // The server's clock for this assignment. Universe draws it; here it only gates capture and the editor.
+    const countdown=createCountdown();
+    let state='preparing', locked=true, armed=false, eligible=false, closing=false, closePromise, port=null, challenge=null;
+    let active=null, clockStart, pulseAt=0, watch, drained, clockTimer, over=false, held=false;
+    const inflight=new Set();
+    const owned=()=>Boolean(owner) && actor()===owner;
+    const isHere=()=>!closing && current===gate && owned();
+    const terminal=()=>state==='unavailable' || state==='authentication_required';
+    const live=item=>isHere() && active===item && !item.ending && !item.shareEnded;
+    const check=item=>{if(!live(item))throw failure('recording_phase_changed');};
+    const send=(type,fields={})=>{try{port?.postMessage({protocol:WORK_PROTOCOL,attemptId,type,...fields});}catch{/* closed by the parent */}};
+    const reply=respondToWorkDiscover(attemptId,win,()=>state,arm);
+    function lock(title,message){locked=true;park(true);ui.clear();ui.set(title,message);}
+    function setState(next,announce=true){if(state===next)return;state=next;if(announce)reply.push();}
+    // `announce`: false only inside a discover, whose own reply follows and carries the new state.
+    function settle(next,title,message,announce=true){
+        if(closing)return;
+        if(active){const item=active;suspend(item,false);send('pause',{reason:'connection_lost',effectiveAt:null});void end(item,'connection_lost',item.expected);}
+        clearTimeout(clockTimer);
+        lock(title,message);setState(next,announce);
+    }
+    function failed(error,announce=true){
+        const cause=error?.code||error?.message;
+        if(!owned() || identityCodes.includes(cause))settle('authentication_required','Sign in to EZiL OS',EMBED_SIGN_IN,announce);
+        else settle('unavailable','Assignment unavailable',EMBED_UNAVAILABLE,announce);
+    }
+    function arm(latest){
+        if(closing)return;
+        challenge=latest;
+        if(!owned()){if(state!=='authentication_required')settle('authentication_required','Sign in to EZiL OS',EMBED_SIGN_IN,false);return;}
+        if(!armed){armed=true;void eligibility();}
+    }
+    /** True unless `report` names a start other than the original one. The first start reported is the original. */
+    function originalStart(report){
+        const start=typeof report?.startedAt==='string'?Date.parse(report.startedAt):NaN;
+        if(!Number.isFinite(start))return true;
+        if(clockStart===undefined){clockStart=start;return true;}
+        return Math.abs(start-clockStart)<SAME_START_MS;
+    }
+    /** A report of the canonical clock (`clock`, `editor-ready`). Only the server pauses or resumes; this follows it. */
+    function applyClock(report){
+        if(closing || over || !originalStart(report) || !countdown.sync(report))return;
+        if(countdown.state()==='paused')hold();else if(held)release();
+    }
+    async function refreshClock(){
+        if(closing || over)return;
+        try{applyClock(await checkAssignmentClock(attemptId));}catch{/* the next poll asks again */}
+    }
+    function scheduleClock(){
+        clearTimeout(clockTimer);
+        if(closing || over || terminal() || countdown.state()==='ended')return;
+        clockTimer=setTimeout(async()=>{await refreshClock();scheduleClock();},active&&!active.ending?clockLiveMs:clockIdleMs);
+    }
+    /** The server stopped the assignment's time: the editor is covered at once and the live capture phase ends at that time. */
+    function hold(){
+        if(held)return;
+        held=true;
+        const item=active;
+        if(item && !item.ending && !item.shareEnded){
+            const at=countdown.serverPausedAt();
+            suspend(item,true,EMBED_HELD);
+            send('pause',{reason:'paused',effectiveAt:at===null?null:new Date(at).toISOString()});
+        }else if(!terminal() && !active)lock(...EMBED_HELD);
+    }
+    function release(){
+        held=false;
+        if(terminal() || active || !eligible)return;
+        lock('Assignment time is running again',EMBED_AGAIN);
+        if(port)send('ready');
+    }
+    async function eligibility(){
+        lock('Preparing assignment','Verifying the assigned repository and OS session…');
+        try{
+            const result=await retry(()=>checkAssignmentVideoEligibility(attemptId,{repositoryUrl:repo}),['media_unavailable','recording_unavailable'],2,isHere);
+            if(!isHere())return;
+            if(result.status!=='eligible' || result.attemptId!==attemptId || result.repositoryUrl!==repo)throw failure('assignment_mismatch');
+            // An attempt whose window already runs (Universe's workspace page started it) keeps that start for good.
+            originalStart({startedAt:result.windowStartedAt});
+            // Asked before the port may say `ready`: a share is never offered into a pause that is already there. A
+            // clock that does not answer delays nothing (the broker refuses a `begin` into a pause anyway).
+            await refreshClock();scheduleClock();
+            if(!isHere())return;
+            if(win.location.origin==='https://os.ezil.work'){
+                const info=await Promise.resolve(computerInfo?.()).catch(()=>null);
+                if(!isHere())return;
+                const refusal=computerRefusal(result,info,true);
+                if(refusal){
+                    // Not a refusal of the attempt: the frame says what to do, and the same check runs again on request.
+                    lock(...COMPUTER_REFUSAL[refusal]);
+                    ui.action('Check this computer again',()=>{if(isHere() && !eligible && !terminal())void eligibility();});
+                    return;
+                }
+            }
+            eligible=true;
+            if(held)lock(...EMBED_HELD);
+            else{
+                lock('Share this assignment tab from Universe','Your editor opens after Universe confirms the recording.');
+                if(port)send('ready');
+            }
+        }catch(error){if(!closing && current===gate)failed(error);}
+    }
+    function onWindow(event){
+        const data=event.data;
+        if(event.source!==win.parent || event.origin!==host || data?.protocol!==WORK_PROTOCOL || data.type!=='bind' || data.attemptId!==attemptId
+            || !challenge || data.challenge!==challenge || event.ports?.length!==1 || port || terminal() || !isHere())return;
+        port=event.ports[0];port.onmessage=onPort;port.start?.();
+        if(eligible && !held)send('ready');
+    }
+    // The parent's sharing stopped, the server paused or this document lost it: the editor locks at once; the phase is then ended.
+    function suspend(item,announce=true,copy=EMBED_PAUSED){
+        item.shareEnded=true;item.allowMint=false;item.ctl.abort();item.editor?.reject(failure('workspace_locked'));
+        lock(...copy);if(state==='ready')setState('preparing',announce);
+    }
+    function startIdleWatch(){
+        clearInterval(watch);pulseAt=Date.now();
+        watch=setInterval(()=>{
+            const item=active;if(!item || item.ending)return;
+            if(!owned()){failed(failure('identity_refresh_required'));return;}
+            if(Date.now()-pulseAt>silentMs){
+                if(!item.shareEnded){suspend(item);send('pause',{reason:'connection_lost',effectiveAt:null});}
+                void end(item,'connection_lost',item.expected);
+            }
+        },watchMs);
+    }
+    /** The recording's own media window (seed confirm, status). It bounds how far a clip may end, never the assignment's clock. */
+    function syncMedia(item,report){
+        const deadline=Date.parse(report?.deadlineAt),start=Date.parse(report?.startedAt),revision=report?.revision??0;
+        if(active!==item || !Number.isFinite(deadline) || !Number.isSafeInteger(revision) || revision<(item.mediaRevision??0)
+            || (item.mediaDeadline!==undefined && deadline<item.mediaDeadline))return;
+        if(Number.isFinite(start)){
+            if(item.mediaStart!==undefined && item.mediaStart!==start)return;
+            item.mediaStart=start;
+        }
+        item.mediaRevision=revision;item.mediaDeadline=deadline;
+    }
+    async function begin(d){
+        if(!eligible || d.consentVersion!==4 || !uuid.test(d.captureSessionId??''))throw failure('assignment_not_ready');
+        if(active){
+            if(active.id===d.captureSessionId && active.grant && !active.ending && !active.shareEnded)
+                return {captureSessionId:active.id,status:active.grant.status,nextSequence:active.grant.nextSequence};
+            throw failure('recording_in_use');
+        }
+        // A paused assignment starts no phase: the broker would refuse it, and the checkout must not be re-sealed for it.
+        if(held || countdown.state()==='paused')throw failure('assignment_paused');
+        const item=active={id:d.captureSessionId,expected:0,ctl:new AbortController(),startedAt:Date.now(),stage:'prepare'};
+        startIdleWatch();scheduleClock();lock('Preparing assignment','Verifying the assigned repository…');
+        try{
+            const result=await retry(()=>prepare(attemptId,{signal:item.ctl.signal}),['sandbox_starting','media_unavailable','assignment_open_unavailable'],3,
+                ()=>live(item) && !item.ctl.signal.aborted);
+            check(item);
+            const sealed=result?.assignmentOpen, meta=result?.repository;
+            if(result?.ok!==true || result.codePreviewUrl || result.url || sealed?.attemptId!==attemptId || !/^[A-Za-z0-9_-]{48,1700}$/.test(sealed.proof)
+                || !meta?.id || typeof meta.workspaceFolder!=='string' || meta.checkoutFolder!==meta.workspaceFolder+'/'+name)
+                throw failure('assigned_checkout_unverified');
+            item.meta=meta;item.proof=sealed.proof;item.stage='begin';
+            item.transport=createAssignmentVideoTransport({attemptId,repoOpenProof:item.proof,captureSessionId:item.id,consentVersion:4,
+                onClock:report=>syncMedia(item,report),paused:()=>countdown.state()==='paused',
+                // The timeline is the real wall clock: time the server gave back after a pause lets a clip end past the first hour.
+                maxEndMs:()=>{
+                    if(item.mediaStart===undefined)return 0;
+                    const media=item.mediaDeadline===undefined?0:item.mediaDeadline-item.mediaStart;
+                    const canonicalEnd=countdown.serverDeadlineAt();
+                    return Math.max(media,canonicalEnd===null?0:canonicalEnd-item.mediaStart);
+                },
+                onStop:(why,at)=>{
+                    if(active!==item || item.ending)return;
+                    if(!item.shareEnded)suspend(item);
+                    send('pause',{reason:why==='submitted'||why==='timeout'?why:'connection_lost',effectiveAt:at??null});
+                }});
+            item.grant=await retry(()=>item.transport.begin(),['media_unavailable'],2,()=>live(item));
+            check(item);
+            if(item.grant.captureSessionId!==item.id || item.grant.status!=='awaiting_frame' || !Number.isSafeInteger(item.grant.nextSequence))
+                throw failure('recording_phase_changed');
+            item.expected=item.grant.nextSequence;item.stage='seed';
+            ui.set('Checking recording','Saving the first frame before opening your editor…');
+            return {captureSessionId:item.id,status:item.grant.status,nextSequence:item.grant.nextSequence};
+        }catch(error){
+            if(identityCodes.includes(error?.code))failed(error);
+            else{
+                await end(item,'connection_lost',item.expected).catch(()=>{});
+                if(isHere() && !terminal() && !active)lock(held?EMBED_HELD[0]:EMBED_PAUSED[0],held?EMBED_HELD[1]:embedMessage(error?.code||error?.message));
+            }
+            throw error;
+        }
+    }
+    const digestOf=async bytes=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),n=>n.toString(16).padStart(2,'0')).join('');
+    async function upload(d){
+        const item=active,p=d.part;
+        // A stopping share may still deliver its final clip (`lock` precedes `end`); a seed may not.
+        if(!item || item.id!==d.captureSessionId || item.ending || !item.grant || !owned())throw failure('recording_phase_changed');
+        if(!p || !(p.bytes instanceof ArrayBuffer) || !p.bytes.byteLength || p.bytes.byteLength>8*1024*1024 || p.mimeType!=='video/webm'
+            || !Number.isSafeInteger(p.sequence) || p.sequence<0 || p.sequence>=600 || !Number.isSafeInteger(p.startMs) || !Number.isSafeInteger(p.endMs))
+            throw failure('invalid_segment');
+        const seedShape=p.startMs===0 && p.endMs===1 && p.bytes.byteLength<=1024*1024;
+        // A retransmitted first frame (the parent missed the reply) gets the same acknowledgement again, without a new
+        // request: only the identical bytes, by SHA-256 against the frame this document already sent, are accepted.
+        if(item.seedTask && p.sequence===item.seedTask.sequence){
+            const task=item.seedTask;
+            if(!seedShape || await digestOf(p.bytes)!==await task.digest || active!==item || item.ending)throw failure('invalid_segment');
+            return task.reply(true);
+        }
+        if(item.seedTask){
+            if(!item.seed)throw failure('seed_not_confirmed');
+            const ack=await item.transport.upload({sequence:p.sequence,startMs:p.startMs,endMs:p.endMs,mimeType:'video/webm',bytes:p.bytes});
+            if(active!==item || item.ending || !ack?.confirmed)throw failure('recording_phase_changed');
+            item.expected=Math.max(item.expected,p.sequence+1);return {confirmed:true,sequence:p.sequence};
+        }
+        if(item.shareEnded || p.sequence!==item.expected || !seedShape)throw failure('invalid_segment');
+        // Registered before any await, so a concurrent retransmit joins this attempt instead of starting another.
+        const task=item.seedTask={sequence:p.sequence,digest:digestOf(p.bytes)};
+        task.done=(async()=>{
+            await task.digest;
+            const ack=await item.transport.upload({sequence:p.sequence,startMs:0,endMs:1,mimeType:'video/webm',bytes:p.bytes});
+            const receivedAt=Date.now();
+            if(active!==item || item.ending)throw failure('recording_phase_changed');
+            if(!ack.phaseReady || ack.captureSessionId!==item.id || ack.nextSequence!==task.sequence+1 || !ack.firstFrameAt)throw failure('seed_not_confirmed');
+            const startAt=Date.parse(ack.startedAt), deadline=Date.parse(ack.deadlineAt), serverNow=Date.parse(ack.serverNow);
+            const offset=Number.isFinite(serverNow)?serverNow-receivedAt:0;
+            // Confirm bounds remaining time; trusted pauses can make the elapsed media window longer than an hour.
+            if(!Number.isFinite(startAt) || !Number.isFinite(deadline) || deadline<=receivedAt+offset || deadline<=startAt)throw failure('recording_closed');
+            item.seed=ack;item.accepted=true;item.expected=Math.max(item.expected,ack.nextSequence);item.stage='record';
+            return {ack,serverNow,receivedAt};
+        })();
+        // A refused first frame leaves no acknowledgement to replay: the parent's next attempt is a real upload.
+        task.done.catch(()=>{if(item.seedTask===task)item.seedTask=null;});
+        task.reply=async replay=>{
+            const {ack,serverNow,receivedAt}=await task.done;
+            // The broker's own clock at confirmation: the parent's encoder offsets its segment times by it. A replay
+            // advances it by the time elapsed here, so the parent's offset stays the broker's.
+            const now=!Number.isFinite(serverNow) ? null : replay ? new Date(serverNow+Math.max(0,Date.now()-receivedAt)).toISOString() : ack.serverNow;
+            // The MEDIA window, for the encoder alone. `revision` > 0 marks a window the server extended past an hour.
+            return {confirmed:true,phaseReady:true,captureSessionId:item.id,nextSequence:ack.nextSequence,startedAt:ack.startedAt,deadlineAt:ack.deadlineAt,serverNow:now,
+                ...(Number.isSafeInteger(ack.revision)?{revision:ack.revision}:{})};
+        };
+        return task.reply(false);
+    }
+    async function status(d){
+        const item=active;
+        if(!item || item.id!==d.captureSessionId || item.ending || !item.grant || !owned())throw failure('recording_phase_changed');
+        const s=await item.transport.status();
+        // The parent cuts its last clip here: Universe's stop, or the server's pause, whichever came first.
+        const cutoffs=[Date.parse(s.stopRequestedAt),countdown.serverPausedAt()].filter(Number.isFinite);
+        return {captureSessionId:s.captureSessionId,status:s.status,stopRequestedAt:cutoffs.length?new Date(Math.min(...cutoffs)).toISOString():null};
+    }
+    async function unlock(d){
+        const item=active;
+        if(!item || item.id!==d.captureSessionId)throw failure('recording_phase_changed');
+        check(item);
+        if(!item.seed)throw failure('seed_not_confirmed');
+        item.stage='confirm';
+        try{
+            await retry(async()=>{
+                const s=await item.transport.status();
+                if(s.phaseReady!==true || s.workspaceUnlocked!==true || s.captureSessionId!==item.id || s.startedAt!==item.seed.startedAt
+                    || s.deadlineAt!==item.seed.deadlineAt || !s.firstFrameAt)throw failure('seed_not_confirmed');
+            },['seed_not_confirmed','media_unavailable'],3,()=>live(item));
+            check(item);
+            item.stage='open';item.allowMint=true;
+            ui.set('Opening assigned editor','Recording is active. Checking your workspace…');
+            const editor=new Promise((resolve,reject)=>{item.editor={resolve,reject};});
+            const timer=setTimeout(()=>item.editor?.reject(failure('assigned_checkout_unverified')),80000);
+            let clock;
+            try{open();clock=await editor;}finally{clearTimeout(timer);item.editor=null;}
+            check(item);
+            // `startedAt`/`deadlineAt`: the media window (encoder). `clock`: the assignment's own, exactly as `editor-ready` answered.
+            return {status:'ready',captureSessionId:item.id,startedAt:item.seed.startedAt,deadlineAt:item.seed.deadlineAt,clock};
+        }catch(error){
+            if(identityCodes.includes(error?.code))failed(error);
+            else if(active===item && !item.ending){item.allowMint=false;lock(held?EMBED_HELD[0]:EMBED_PAUSED[0],held?EMBED_HELD[1]:embedMessage(error?.code));}
+            throw error;
+        }
+    }
+    function end(item,reason,count){
+        if(!item || item!==active)return Promise.resolve({});
+        if(item.ending)return item.ending;
+        if(!item.shareEnded)suspend(item);
+        item.ending=(async()=>{
+            clearInterval(watch);
+            try{
+                if(item.transport && item.grant){
+                    const expectedSegments=Math.min(600,Math.max(item.expected,Number.isSafeInteger(count) && count>=0 ? count : 0));
+                    if(reason==='submitted' || reason==='timeout')await item.transport.finalize({reason,expectedSegments});
+                    else await retry(()=>item.transport.checkpoint(reason==='sharing_stopped'?'sharing_stopped':'connection_lost'),['media_unavailable']);
+                }
+                return {};
+            }finally{
+                item.transport?.dispose();if(active===item)active=null;drained?.();
+                if((reason==='submitted' || reason==='timeout') && !closing){
+                    over=true;clearTimeout(clockTimer);
+                    lock('Assignment closed',reason==='submitted'?'Assignment submitted. Recording ended.':'The assignment time has ended.');setState('unavailable');
+                }else if(!closing){
+                    // A share that ended inside a pause says so, instead of inviting a share the server would refuse.
+                    if(held && isHere() && !terminal())lock(...EMBED_HELD);
+                    // The clock outlives the share: ask now, then on the idle schedule.
+                    void refreshClock();scheduleClock();
+                }
+            }
+        })();
+        return item.ending;
+    }
+    const methods={begin,upload,status,unlock,
+        end:d=>{
+            if(!['sharing_stopped','connection_lost','submitted','timeout'].includes(d.reason) || active?.id!==d.captureSessionId || !owned())
+                return Promise.reject(failure('recording_phase_changed'));
+            return end(active,d.reason,d.expectedSegments);
+        }};
+    function onPort(event){
+        const d=event.data;
+        if(d?.protocol!==WORK_PROTOCOL || d.attemptId!==attemptId)return;
+        if(d.type==='pulse'){if(active && active.id===d.captureSessionId)pulseAt=Date.now();return;}
+        if(d.type==='lock'){if(active && active.id===d.captureSessionId && !active.shareEnded)suspend(active);return;}
+        if(d.type==='cancel'){if(active && active.id===d.captureSessionId && !active.grant)void end(active,'connection_lost',active.expected);return;}
+        if(d.type!=='request' || !Number.isSafeInteger(d.id) || d.id<=0)return;
+        const method=Object.hasOwn(methods,d.method)?methods[d.method]:null;
+        const run=async()=>{
+            if(!method)throw failure('invalid_request');
+            // Only the drain of an already granted phase continues past a refusal; nothing new starts.
+            if(['begin','unlock'].includes(d.method) && (terminal() || !isHere()))
+                throw failure(state==='authentication_required'?'identity_refresh_required':'workspace_unavailable');
+            return method(d);
+        };
+        const task=run().then(value=>send('reply',{id:d.id,ok:true,value}),error=>{
+            const code=replyCode(error);
+            // Codes and stages only, as the top-level gate reports them.
+            if(['begin','unlock'].includes(d.method) && code!=='recording_in_use')
+                report('embed-'+d.method,code,active,{reason:error?.reason,correlationId:error?.correlationId});
+            send('reply',{id:d.id,ok:false,code});
+        });
+        inflight.add(task);void task.finally(()=>inflight.delete(task));
+    }
+    // The same folder rule as the OS tab: the editor must show the verified workspace or its checkout, and nothing else.
+    function confirm(frame,frameUrl,actualRoot){
+        const item=active;
+        if(!item?.allowMint || !item.editor || !live(item) || !frame.isConnected)return;
+        const url=new URL(frameUrl), folders=[item.meta.workspaceFolder,item.meta.checkoutFolder];
+        if(!folders.includes(actualRoot) || !folders.includes(url.searchParams.get('folder'))){item.editor.reject(failure('assigned_checkout_unverified'));return;}
+        void editorReady(item,frame);
+    }
+    /**
+     * The real Code folder was validated. Before the editor is shown, Universe is told (`editor-ready`, signed with this
+     * phase's repository-open proof): its answer is the assignment's clock, and the browser sends no time. An answer
+     * that names a start other than the original one never opens the editor; neither does a paused clock.
+     */
+    async function editorReady(item,frame){
+        if(item.readying)return;
+        item.readying=true;
+        const here=()=>live(item) && Boolean(item.editor) && item.allowMint && frame.isConnected;
+        ui.set('Checking your editor','Confirming your editor with Universe before it opens…');
+        try{
+            const clock=await retry(()=>item.transport.editorReady(),EDITOR_READY_TRANSIENT,EDITOR_READY_TRIES,here);
+            if(!here())return;
+            if(typeof clock.startedAt!=='string' || !originalStart(clock))throw failure('assignment_clock_changed');
+            applyClock(clock);
+            if(!here())return;
+            if(held || countdown.state()==='paused')throw failure('assignment_paused');
+            locked=false;park(false);ui.reveal();
+            item.editor.resolve({startedAt:clock.startedAt,deadlineAt:isoOrNull(clock.deadlineAt),serverNow:isoOrNull(clock.serverNow),
+                pausedAt:null,remainingMs:Number.isFinite(clock.remainingMs)?clock.remainingMs:null,revision:clock.revision});
+            setState('ready');
+        }catch(error){
+            if(here())item.editor.reject(error?.code?error:failure('editor_ready_failed'));
+        }finally{item.readying=false;}
+    }
+    /** Code's open-phase mint failed (`apps/code.js`): end the wait for the editor now, with the real cause. */
+    function failOpen(res){
+        const item=active;if(!item?.editor)return;
+        item.editor.reject(Object.assign(failure(res?.errorCode||'unknown'),{reason:res?.reason,correlationId:res?.correlationId}));
+    }
+    function close(){
+        if(closePromise)return closePromise;
+        closing=true;reply.dispose();clearInterval(watch);clearTimeout(clockTimer);
+        win.removeEventListener('message',onWindow);win.removeEventListener('pagehide',pageHide);
+        const item=active;
+        if(item && !item.shareEnded)suspend(item,false);else lock(...EMBED_PAUSED);
+        const bounded=(promise,timers)=>Promise.race([promise,new Promise(r=>{timers.push(setTimeout(r,2500));})]);
+        closePromise=(async()=>{
+            const timers=[];
+            try{
+                if(item){
+                    send('pause',{reason:'connection_lost',effectiveAt:null});
+                    await bounded(new Promise(r=>drained=r),timers);
+                    if(item===active)await end(item,'connection_lost',item.expected);
+                }
+                // The parent's own `end` (or any other request) is answered before the port goes away.
+                await bounded(Promise.allSettled([...inflight]),timers);
+            }catch{/* accepted footage stays saved */}
+            finally{timers.forEach(clearTimeout);send('reopen');port?.close();port=null;ui.remove();if(current===gate)current=null;}
+        })();
+        return closePromise;
+    }
+    function pageHide(){if(active?.grant)active.transport.checkpointOnExit('connection_lost');void close();}
+    const gate={repo,locked:()=>locked,confirm,close,fail:failOpen,
+        access:()=>active?.allowMint && live(active) ? {attemptId,phase:'open',repoOpenProof:active.proof,captureSessionId:active.id} : null};
+    current=gate;
+    lock('Open this assignment from Universe','Waiting for your Universe assignment page…');
+    win.addEventListener('message',onWindow);win.addEventListener('pagehide',pageHide,{once:true});
+    return gate;
+}
+
 export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare, computerInfo, settleMs=STOP_SETTLE_MS,
-    saveCeilingMs=STOP_SAVE_CEILING_MS, frameMs=FRESH_FRAME_MS, clockLiveMs=CLOCK_LIVE_MS, clockIdleMs=CLOCK_IDLE_MS, reconnectMs=RECONNECT_OFFER_MS}) {
+    saveCeilingMs=STOP_SAVE_CEILING_MS, frameMs=FRESH_FRAME_MS, clockLiveMs=CLOCK_LIVE_MS, clockIdleMs=CLOCK_IDLE_MS, reconnectMs=RECONNECT_OFFER_MS,
+    embedWatchMs=EMBED_WATCH_MS, embedSilentMs=EMBED_SILENT_MS}) {
     const win=globalThis.window, repo=project?.repoUrl;
     if(!win || !assignmentOsOrigin(win.location.origin)){queueMicrotask(open);return null;}
     const address=new URL(win.location.href);
@@ -122,6 +620,10 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     const attemptId=assignmentIntent(entry,repo);
     const explicit=address.pathname==='/app/code' && address.searchParams.has('assignment');
     if(!canonical.test(repo) && !explicit){queueMicrotask(open);return null;}
+    // Framed by its own paired Universe workspace: a separate gate that waits for that exact parent and never uses the picker.
+    const host=attemptId?embeddedWorkHost(win):null;
+    if(host)return openEmbeddedAssignment({attemptId,repo,computerId,actor,open,body,park,prepare,computerInfo,win,host,clockLiveMs,clockIdleMs,
+        watchMs:embedWatchMs,silentMs:embedSilentMs});
 
     const owner=actor(), ui=buildGate(body);
     // `shown`: the ended share whose result the gate is showing; a late save result refreshes only its own screen.
@@ -297,31 +799,10 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             void refreshClock();scheduleClock();
             if (win.location.origin === 'https://os.ezil.work') {
                 const info = await computerInfo?.();
-                const provider = info?.provider;
                 if (!isHere()) return;
-                const upgradedAssignment = provider === 'aws-ec2'
-                    && /^[a-f0-9]{64}$/.test(result.upgradedWorkspaceId ?? '')
-                    && uuid.test(result.upgradeOperationId ?? '');
-                // A direct AWS start: Universe's trusted `boundWorkspaceId` must be present, null only before a window
-                // started, or the workspace it bound. The server alone checks it against this computer's own workspace.
-                const bound = result.boundWorkspaceId;
-                const directAssignment = provider === 'aws-ec2'
-                    && ((bound === null && !result.windowStartedAt && !result.deadlineAt) || /^[a-f0-9]{64}$/.test(bound ?? ''));
-                if (provider !== 'cloudflare' && !upgradedAssignment && !directAssignment) {
-                    lockedView('Choose an assignment-ready computer',provider === 'aws-ec2'
-                        ? 'Universe has not verified this AWS computer for this assignment. Reopen the assignment from Universe, or select a Cloudflare computer you own in EZiL OS.'
-                        : 'EZiL OS could not verify this computer’s assignment support. Check its provider in Settings → System, then try again.');
-                    ui.action('Check this computer again',eligible);
-                    return;
-                }
-                if (provider === 'aws-ec2' && ['STOPPING','DRAINING','RETIRING'].includes(info.lifecycleState)) {
-                    lockedView('Stopping your computer','Wait until Settings → Computer shows Stopped, then reopen this assignment on this same computer.');
-                    ui.action('Check this computer again',eligible);
-                    return;
-                }
-                if (provider === 'aws-ec2' && info.lifecycleState === 'RUNNING' && info.assignmentSession === 'stop_then_reopen') {
-                    lockedView('Update this computer for your assignment',
-                        'Save your work, then choose Stop in Settings → Computer. Wait until it says Stopped and reopen this assignment from Universe on this same computer. Your files stay on its disk.');
+                const refusal = computerRefusal(result,info);
+                if (refusal) {
+                    lockedView(...COMPUTER_REFUSAL[refusal]);
                     ui.action('Check this computer again',eligible);
                     return;
                 }
