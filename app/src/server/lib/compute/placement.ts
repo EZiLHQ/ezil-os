@@ -43,8 +43,7 @@
 
 import { TRPCError } from '@trpc/server';
 import { sql, type SQL } from 'drizzle-orm';
-import { operatorBranchEnabled } from '@/server/entitlements/operator/installed';
-import { paidComputeAccessCtes } from '@/server/billing/v3/paid-compute-access-sql';
+import { paidComputeAccessCtes, paidComputeBranches } from '@/server/billing/v3/paid-compute-access-sql';
 
 import { totalsOf, utcNextMonthStart, type MonthUsage, type UsageTotals } from './usage';
 import { INSTANCE_VCPU, instanceVcpu } from './aws-config';
@@ -2137,12 +2136,13 @@ export interface PaidMigrationCandidate {
 /**
  * One computer per paid owner, including the implicit Cloudflare placement. Product entitlements v1 (0019 applied): an
  * operator grant in effect is a paid owner too (provider-migrate-reconcile then re-checks the entitlement and admission).
+ * A live explicit override decides first: Standard/Premium is a paid owner, Free never is (whatever Stripe says).
  */
 export async function paidCloudflareCandidates(db: PlacementExecutor, now: Date, limit = 10): Promise<PaidMigrationCandidate[]> {
     const count = Number.isFinite(limit) ? Math.max(0, Math.min(10, Math.trunc(limit))) : 0;
     if (!count) return [];
     const at = now.toISOString();
-    const result = await db.execute(sql`WITH ${paidComputeAccessCtes(at, await operatorBranchEnabled(db))}
+    const result = await db.execute(sql`WITH ${paidComputeAccessCtes(at, await paidComputeBranches(db))}
         SELECT DISTINCT ON (s.user_id) s.user_id::text AS user_id, c.id::text AS computer_id, s.sku
         FROM eligible s
         JOIN public.ezil_computers c ON c.user_id = s.user_id AND c.deleted_at IS NULL
