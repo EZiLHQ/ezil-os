@@ -6,13 +6,16 @@
  * account still sits on AWS: this lane moves it onto Free Cloudflare with the EXISTING reverse machine, and it OWNS the
  * AWS stop of such a computer (the sweep's own policy, retry and held-overrun stops defer to it: handler.ts, through
  * `explicitFreeOverrideState`), because those stops are unfenced and the policy pass keeps a paid-era AWS session open
- * until at least the Free hour, while the operator asked for the move now.
+ * until at least the Free hour, while the operator asked for the move now. They defer ONLY while the lane can really run
+ * (`freeOverrideHandoffReady`: the AWS configuration and the installed schema, 0019 and 0012); production has no 0012,
+ * and there the ordinary Free accounting and stops keep such a host exactly as before.
  *
  * Bounded and fail-closed, one small pass per sweep (`billing-session-sweep`, before the forward migration steps and the
  * reverse pass, which stays last):
  * - no-op without placement reads, with AWS disabled or the admission kill switch on (a paused rollout), with billing off
  *   (`tabEnabled`: no standing, as `heldStanding`), or without 0019 (`ezil_operator_entitlements`) or 0012
- *   (`ezil_compute_reverse_moves`): nothing is read or written then;
+ *   (`ezil_compute_reverse_moves`; both re-probed by the pass itself, `freeOverrideSchemaPresent`): nothing is read or
+ *   written then;
  * - candidates are the account's OWN live computers whose placement is aws-ec2 and ACTIONABLE (RUNNING or STOPPED with
  *   no lifecycle job, no reverse row holding it), joined to a LIVE explicit Free override row
  *   (`to_jsonb(o)->>'access_override' = 'true'`: a database without 0038's column simply yields none), at most
@@ -39,8 +42,12 @@ import type { ComputerMoveStartOutputV3 } from '@/server/billing/v3/contract';
 import { accessOverrideInEffect, type AccessRow } from '@/server/billing/v3/effective-access';
 import type { ComputeBillingState } from '@/server/billing/v2/compute-access';
 import type { StopOutcome } from './stop-policy';
+import { operatorEntitlementsInstalled } from '@/server/entitlements/operator/installed';
 import { isPlacementReadEnabled, readAwsAdmissionConfig, type Env } from './aws-config';
-import { ImageJobConflictError, PlacementIntegrityError, PlacementOwnerError, readPlacement, type Placement, type PlacementDb, type PlacementExecutor } from './placement';
+import {
+    ImageJobConflictError, PlacementIntegrityError, PlacementOwnerError, readFreeOverrideMoveCandidates, readPlacement,
+    type Placement, type PlacementDb, type PlacementExecutor,
+} from './placement';
 import { createProviderReverseStore, forwardMoveBusy, reverseMovesTablePresent } from './provider-reverse-store';
 
 /** Candidates one pass considers (and the SQL's own bound). */
@@ -83,32 +90,43 @@ export function explicitFreeOverrideState(state: Pick<ComputeBillingState, 'summ
 const rowsOf = (result: unknown): Record<string, unknown>[] =>
     (Array.isArray(result) ? result : (result as { rows?: Record<string, unknown>[] } | null)?.rows) ?? [];
 
-/** The live explicit Free override predicate, in SQL: `access_override` through to_jsonb, so a schema without 0038 yields none. */
-const liveFreeOverride = (at: string) => sql`o.sku = 'free_v3' AND to_jsonb(o)->>'access_override' = 'true' AND o.ended_at IS NULL
-    AND o.starts_at <= ${at}::timestamptz AND (o.ends_at IS NULL OR o.ends_at > ${at}::timestamptz)`;
-/** The override set: the account's own live computers whose placement is aws-ec2, with a live explicit Free override. */
-const overrideSet = (at: string) => sql`FROM public.ezil_computers c
-    JOIN public.ezil_computer_placements p ON p.computer_id = c.id AND p.owner_user_id = c.user_id AND p.provider = 'aws-ec2'
-    WHERE c.deleted_at IS NULL AND EXISTS (SELECT 1 FROM public.ezil_operator_entitlements o WHERE o.user_id = c.user_id AND ${liveFreeOverride(at)})`;
-/** Actionable: RUNNING or STOPPED with no lifecycle job, and no reverse row holding the computer (requires 0012). */
-const actionable = sql`p.state IN ('RUNNING', 'STOPPED') AND p.lifecycle_job_id IS NULL
-    AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_reverse_moves m WHERE m.computer_id = c.id AND m.state NOT IN ('committed', 'failed_reopened'))`;
+/**
+ * Whether the lane's schema is installed: 0019 (`ezil_operator_entitlements`, the override rows) AND 0012
+ * (`ezil_compute_reverse_moves`, the move the handoff ends in). Production has no 0012 today: then there is no handoff,
+ * and the sweep's ordinary Free accounting and stops must keep every such host. The existing probes, 0019 first (its
+ * "no" is cached a minute, installed.ts); a read error THROWS, for each caller to fail closed its own way.
+ */
+export async function freeOverrideSchemaPresent(db: PlacementExecutor): Promise<boolean> {
+    return await operatorEntitlementsInstalled(db) && await reverseMovesTablePresent(db);
+}
 
 /**
- * The actionable override set, oldest placement write first (a stable order: a bounded pass makes progress), with the
- * count of the set's other computers (deferred until they settle). Requires 0019 and 0012 (the caller probes both).
+ * Whether the sweep's ordinary policy, retry and held-overrun stops may DEFER an explicit-override owner's AWS host to
+ * this lane (handler.ts `overrideLane`): the AWS configuration allows the lane (`freeOverrideLaneEnabled`) AND its schema
+ * is installed (`freeOverrideSchemaPresent`). Nothing is read while the flags say no. A read error is `false`: a stop
+ * deferred to a lane that cannot run would leave the host running unaccounted, so the ordinary stop keeps it (fail
+ * closed for the handoff). The lane itself (`reconcileFreeOverrideMovesInSweep`) re-probes before it moves anything.
+ */
+export async function freeOverrideHandoffReady(db: PlacementExecutor, env: Env = process.env): Promise<boolean> {
+    if (!freeOverrideLaneEnabled(env)) return false;
+    try {
+        return await freeOverrideSchemaPresent(db);
+    } catch (error) {
+        console.warn('[reverse-move] override handoff readiness unavailable', { error: error instanceof Error ? error.name : 'unknown' });
+        return false;
+    }
+}
+
+/**
+ * The actionable override set, oldest placement write first, with the count of the set's other computers (deferred until
+ * they settle): placement.ts `readFreeOverrideMoveCandidates` (C-2: only that module names the placement table), bounded
+ * here to OVERRIDE_PASS_LIMIT. Requires 0019 and 0012 (the caller probes both: `freeOverrideSchemaPresent`).
  */
 export async function freeOverrideCandidates(db: PlacementExecutor, now: Date, limit = OVERRIDE_PASS_LIMIT):
     Promise<{ candidates: OverrideMoveCandidate[]; deferred: number }> {
     const count = Number.isFinite(limit) ? Math.max(0, Math.min(OVERRIDE_PASS_LIMIT, Math.trunc(limit))) : 0;
     if (!count) return { candidates: [], deferred: 0 };
-    const at = now.toISOString();
-    const listed = rowsOf(await db.execute(sql`/* reverse:override-candidates */ SELECT c.id::text AS computer_id, c.user_id::text AS user_id
-        ${overrideSet(at)} AND ${actionable}
-        ORDER BY p.updated_at ASC, c.id LIMIT ${count}`));
-    const other = rowsOf(await db.execute(sql`/* reverse:override-deferred */ SELECT count(*)::int AS n ${overrideSet(at)} AND NOT (${actionable})`));
-    return { candidates: listed.map(row => ({ userId: String(row.user_id).toLowerCase(), computerId: String(row.computer_id).toLowerCase() })),
-        deferred: Number(other[0]?.n ?? 0) || 0 };
+    return readFreeOverrideMoveCandidates(db, now, count);
 }
 
 /**
@@ -226,9 +244,9 @@ export async function reconcileFreeOverrideMovesInSweep(startedAt: number, env: 
     const enabled = freeOverrideLaneEnabled(env);
     if (!enabled || Date.now() - startedAt >= OVERRIDE_PASS_BUDGET_MS) return null;
     try {
-        const [{ db }, { operatorEntitlementsInstalled }, dispatch, { stopComputerForPolicy }, { getBillingDeps }, { billingMeteringActive },
+        const [{ db }, dispatch, { stopComputerForPolicy }, { getBillingDeps }, { billingMeteringActive },
             { readComputerMeta, resolveTransition, TRANSITION_IN_FLIGHT }] = await Promise.all([
-            import('@/server/db'), import('@/server/entitlements/operator/installed'), import('@/server/api/routers/compute-dispatch'),
+            import('@/server/db'), import('@/server/api/routers/compute-dispatch'),
             import('./stop-policy'), import('@/server/billing/deps'), import('@/server/billing/v2/compute-access'), import('./progress'),
         ]);
         const placements = db as unknown as PlacementDb;
@@ -250,7 +268,8 @@ export async function reconcileFreeOverrideMovesInSweep(startedAt: number, env: 
         return await reconcileFreeOverrideMoves({
             startedAt,
             enabled: () => enabled,
-            schemaPresent: async () => await operatorEntitlementsInstalled(placements) && await reverseMovesTablePresent(placements),
+            // The mover's own re-check of both schemas, every pass: the sweep's deferral gate (`freeOverrideHandoffReady`) is no proof here.
+            schemaPresent: () => freeOverrideSchemaPresent(placements),
             candidates: limit => freeOverrideCandidates(placements, now(), limit),
             overrideLive,
             conflicting,
