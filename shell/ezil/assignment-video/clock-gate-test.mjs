@@ -33,9 +33,9 @@ const MIN=60000;
  * Scripted broker: the recording protocol (begin, seed, prepare/confirm, status, checkpoint, finalize) and the clock.
  * `clock` is the server's state; `setClock` bumps its revision the way the server does.
  */
-function broker({started=false}={}){
+function broker({started=false,mediaMs=10*MIN}={}){
     // The media window (begin / seed) bounds the recording; the canonical countdown is `clock`, started by `editor-ready`.
-    const startedAt=new Date().toISOString(),mediaDeadlineAt=new Date(Date.now()+10*MIN).toISOString();
+    const startedAt=new Date().toISOString(),mediaDeadlineAt=new Date(Date.now()+mediaMs).toISOString();
     const clock={startedAt:null,deadlineAt:null,pausedAt:null,pauseReason:null,remainingMs:null,revision:1};
     let phase;const prepared=[],clockCalls=[],readyCalls=[],readyScript=[];
     const state={resumeOnReady:false};
@@ -83,10 +83,10 @@ const mediaElement={
     canvas:()=>Object.assign(new Element(),{width:0,height:0,getContext:()=>({fillStyle:'',fillRect(){},drawImage(){}})}),
 };
 
-function harness(t,{server=broker(),clockLiveMs=60,clockIdleMs=80,reconnectMs=250,project={repoUrl:repo},href}={}){
+function harness(t,{server=broker(),clockLiveMs=60,clockIdleMs=80,reconnectMs=250,project={repoUrl:repo},href,origin=ORIGIN,computerProvider}={}){
     const calls=[],elements=[];
     const saved=['location','VideoEncoder','VideoFrame'].map(key=>[key,Object.getOwnPropertyDescriptor(globalThis,key)]);
-    Object.defineProperty(globalThis,'location',{value:new URL(ORIGIN+'/app/code'),configurable:true,writable:true});
+    Object.defineProperty(globalThis,'location',{value:new URL(origin+'/app/code'),configurable:true,writable:true});
     Object.assign(globalThis,{VideoEncoder:FakeEncoder,VideoFrame:FakeFrame});
     t.after(()=>{for(const [key,descriptor] of saved)if(descriptor)Object.defineProperty(globalThis,key,descriptor);else delete globalThis[key];});
     t.mock.method(globalThis,'fetch',async(url,options)=>{
@@ -110,7 +110,7 @@ function harness(t,{server=broker(),clockLiveMs=60,clockIdleMs=80,reconnectMs=25
     const stream=()=>{const track=new Track();tracks.push(track);return {getTracks:()=>[track],getVideoTracks:()=>[track],getAudioTracks:()=>[]};};
     const doc={body:new Element(),createElement(tag){const e=mediaElement[tag]?mediaElement[tag]():new Element();e.tag=tag;elements.push(e);return e;}};
     // No `clearTimeout` on this window: the control must use the page's own timers.
-    const win={location:new URL(href??ORIGIN+'/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id),crypto:globalThis.crypto,
+    const win={location:new URL(href??origin+'/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id),crypto:globalThis.crypto,
         isSecureContext:true,document:doc,addEventListener(){},removeEventListener(){},MediaStreamTrack:Track,
         VideoFrame:FakeFrame,VideoEncoder:FakeEncoder,performance:globalThis.performance,
         setTimeout:(...a)=>setTimeout(...a),clearTimeout:x=>clearTimeout(x),
@@ -118,7 +118,7 @@ function harness(t,{server=broker(),clockLiveMs=60,clockIdleMs=80,reconnectMs=25
     win.top=win;win.parent=win;Object.assign(globalThis,{window:win,document:doc});
     let opened=0;
     const gate=openWithAssignmentConsent({project,actor:()=>'owner',computerId:'fixture',body:new Element(),park(){},open(){opened++;},
-        prepare:async()=>checkout,settleMs:40,saveCeilingMs:3000,clockLiveMs,clockIdleMs,reconnectMs});
+        prepare:async()=>checkout,computerProvider,settleMs:40,saveCeilingMs:3000,clockLiveMs,clockIdleMs,reconnectMs});
     const by=cls=>elements.findLast(e=>e.className==='ezil-assignment-recording-'+cls);
     const buttons=()=>elements.filter(e=>e.tag==='button'&&e.textContent===SHARE);
     return {gate,calls,server,tracks,elements,doc,opened:()=>opened,by,
@@ -321,6 +321,88 @@ test('a pause that lasts through a stop leaves the frozen time up and a re-share
         assert.equal(h.time(),'33:00');
         await tick(300);
         assert.equal(h.time(),'33:00','frozen by the server');
+        // Sharing again while the server's clock is still paused: a new phase, but the editor stays covered and nothing runs.
+        await h.share();
+        await waitFor(()=>h.opened()>=2,6000);
+        await waitFor(()=>h.label()==='Paused for system upgrade');
+        assert.equal(h.calls.filter(c=>c==='begin').length,2);
+        assert.equal(h.gate.locked(),true);
+        const readyBefore=h.server.readyCalls.length;
+        const frames=encoded.count;
+        h.reveal();
+        await waitFor(()=>h.server.readyCalls.length===readyBefore+1);
+        await tick(1500);
+        assert.equal(h.gate.locked(),true,'a verified editor does not run while Universe has the clock paused');
+        assert.ok(encoded.count-frames<=1,'no frames are recorded for the paused share: '+(encoded.count-frames));
+        assert.equal(h.time(),'33:00');
+    }finally{await h.gate.close();}
+});
+
+test('a share that starts while the server clock is already paused is gated from its first frame and never says Recording', async t=>{
+    const server=broker();
+    server.set(pause({remainingMs:25*MIN}));
+    const h=harness(t,{server});
+    try{
+        await h.share();
+        await waitFor(()=>h.opened()>=1);
+        await waitFor(()=>h.label()==='Paused for system upgrade');
+        assert.equal(h.gate.locked(),true);
+        const seen=new Set();
+        for(let i=0;i<8;i++){seen.add(h.label());await tick(150);}
+        assert.deepEqual([...seen],['Paused for system upgrade']);
+        const frames=encoded.count;
+        await tick(2300);
+        assert.ok(encoded.count-frames<=1,'at most the frame sampled as the recorder started: '+(encoded.count-frames));
+        server.set(resume());
+        server.state.resumeOnReady=false;
+        h.reveal();
+        await waitFor(()=>!h.gate.locked(),6000);
+        assert.equal(h.label(),'Recording');
+    }finally{await h.gate.close();}
+});
+
+test('the media window ending never ends a share Universe still has time for', async t=>{
+    const server=broker({mediaMs:3500});
+    const h=harness(t,{server});
+    try{
+        await h.recording();
+        await tick(5200);
+        assert.equal(h.gate.locked(),false);
+        assert.equal(h.label(),'Recording');
+        assert.equal(h.calls.includes('finalize'),false,'no timeout finalize while the canonical countdown has 49 minutes');
+        assert.equal(h.calls.includes('checkpoint'),false);
+        assert.match(h.time(),/^(49|50):\d\d$/);
+        h.stop();
+        await waitFor(()=>h.calls.includes('checkpoint'));
+        assert.equal(h.label(),'Sharing stopped','not "Time ended"');
+    }finally{await h.gate.close();}
+});
+
+test('a refused re-open after the pause ends the share with the real cause instead of waiting forever', async t=>{
+    const h=harness(t);
+    try{
+        await h.recording();
+        await tick(1300);
+        h.server.set(pause());
+        await waitFor(()=>h.gate.locked()&&h.label()==='Paused for system upgrade');
+        h.gate.fail({errorCode:'repo_open_unsupported_provider'});
+        await waitFor(()=>h.calls.includes('checkpoint'));
+        assert.match(h.elements.filter(e=>e.tag==='p').at(-1).textContent,/does not support assignment recording/);
+        assert.equal(h.gate.locked(),true);
+        assert.equal(h.root().isConnected,true,'the countdown stays');
+        assert.equal(h.calls.includes('finalize'),false);
+    }finally{await h.gate.close();}
+});
+
+test('on the production origin the AWS-computer screen keeps its check and still shows the time left', async t=>{
+    const h=harness(t,{server:broker({started:true}),origin:'https://os.ezil.work',computerProvider:async()=>'aws-ec2'});
+    try{
+        await waitFor(()=>h.title()==='Choose an assignment-ready computer');
+        await waitFor(()=>h.root());
+        assert.equal(h.gate.locked(),true);
+        assert.match(h.time(),/^(49|50):\d\d$/);
+        assert.equal(h.label(),'Not recording');
+        assert.equal(h.elements.some(e=>e.tag==='button'&&e.textContent===SHARE),false,'no share is offered on an unsupported computer');
     }finally{await h.gate.close();}
 });
 

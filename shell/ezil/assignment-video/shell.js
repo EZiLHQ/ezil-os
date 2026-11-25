@@ -149,7 +149,19 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     /** A share ended: keep the corner control (stopped, or time ended) while the server's clock is running, else drop it. */
     function endIndicator(reason){
         if(reason==='submitted' || !countdown.started())removeIndicator();
-        else showIndicator(reason==='timeout'?'ended':'stopped');
+        // "Time ended" only when the canonical clock says so; the recording's window ending is not the assignment's time.
+        else showIndicator(reason==='timeout'&&countdown.state()!=='running'?'ended':'stopped');
+    }
+    /**
+     * When the share's own deadline is, in server time: the later of the recording's media window and the canonical
+     * countdown while that runs. The client never ends a share as timed out while Universe's countdown still has time.
+     */
+    const endsAt=item=>Math.max(item.mediaDeadline??0,countdown.state()==='running'?countdown.serverDeadlineAt():0);
+    const canonicalRunning=()=>countdown.state()==='running'&&countdown.remaining()>1500;
+    function retarget(item){
+        if(item.mediaDeadline===undefined)return;
+        item.recorder?.setDeadline(endsAt(item));
+        armDeadline(item);
     }
     /**
      * A report of the canonical assignment countdown: the shell route's `clock` action, or the `editor-ready` answer.
@@ -159,7 +171,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     function applyClock(report){
         if(disposed || !countdown.sync(report))return;
         const item=activity&&!activity.ended&&isHere()?activity:null;
-        if(item)applyGate(item);
+        if(item){applyGate(item);retarget(item);}
         else if(!indicator && !over && countdown.started())showIndicator(countdown.state()==='ended'?'ended':'idle');
         indicator?.sync();
     }
@@ -172,8 +184,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         if(!samePhase(item)||!Number.isFinite(deadline))return;
         if(Number.isFinite(start))item.mediaStart=start;
         item.mediaDeadline=deadline;
-        item.recorder?.setDeadline(deadline);
-        armDeadline(item);
+        retarget(item);
     }
     async function refreshClock(){
         if(disposed)return;
@@ -190,15 +201,15 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         clearTimeout(item.deadline);
         // A server-stopped clock has no deadline to meet; the resume report re-arms it.
         if(countdown.state()==='paused' || item.mediaDeadline===undefined || item.offset===undefined)return;
-        item.deadline=setTimeout(()=>void deadlineReached(item),Math.max(0,item.mediaDeadline-item.offset-Date.now()));
+        item.deadline=setTimeout(()=>void deadlineReached(item),Math.max(0,endsAt(item)-item.offset-Date.now()));
     }
     /** The local copy of the recording's deadline passed: ask the server first, since it may have moved it. */
     async function deadlineReached(item){
         if(!samePhase(item))return;
         await Promise.all([refreshClock(),item.transport.status().catch(()=>{})]);
         if(!samePhase(item))return;
-        if(countdown.state()==='paused' || item.mediaDeadline-item.offset-Date.now()>1500){armDeadline(item);return;}
-        void finish(item,'timeout',{at:new Date(item.mediaDeadline).toISOString(),cause:'deadline'});
+        if(countdown.state()==='paused' || endsAt(item)-item.offset-Date.now()>1500){armDeadline(item);return;}
+        void finish(item,'timeout',{at:new Date(endsAt(item)).toISOString(),cause:'deadline'});
     }
     /**
      * The server's pause gates capture. Paused: recording stops (the clip so far is sealed and kept), the editor is
@@ -274,6 +285,9 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             const result=await retry(()=>checkAssignmentVideoEligibility(attemptId),['media_unavailable','recording_unavailable']);
             if(!isHere())return;
             if(result.status!=='eligible' || result.attemptId!==attemptId || result.repositoryUrl!==repo)throw failure('assignment_mismatch');
+            // A refresh loses the page's state, not Universe's clock: show the time left on every screen below, including the
+            // provider screen. The clock needs no lease and the provider check itself is unchanged.
+            void refreshClock();scheduleClock();
             if (win.location.origin === 'https://os.ezil.work') {
                 const provider = await computerProvider?.();
                 if (!isHere()) return;
@@ -287,8 +301,6 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             }
             picker??=currentTabPicker(win);
             displayConsent();
-            // A refresh loses the page's state, not the server's clock: show the time left before sharing again.
-            void refreshClock();scheduleClock();
         }catch(e){
             if(!isHere())return;
             if(e.code==='identity_refresh_required'){showSignIn();return;}
@@ -341,7 +353,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             }
             item.stage='begin';
             item.transport=createAssignmentVideoTransport({attemptId,repoOpenProof:item.proof,captureSessionId:item.id,consentVersion:4,
-                onClock:report=>syncMedia(item,report),paused:()=>countdown.state()==='paused',
+                onClock:report=>syncMedia(item,report),paused:()=>countdown.state()==='paused'||canonicalRunning(),
                 // The timeline is the real wall clock: time the server gave back after a pause lets a clip end past the first hour.
                 maxEndMs:()=>{
                     if(item.mediaStart===undefined)return 0;
@@ -396,6 +408,9 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
                 },
                 onAwaitFrame:()=>{if(samePhase(item))ui.set('Opening assigned editor','Recording is active. Checking your workspace…');}});
             check(item);
+            item.recorder.setDeadline(endsAt(item));
+            // A share that starts while Universe's clock is already paused is gated from its first frame.
+            if(item.gated)item.recorder.hold();
             item.stage='confirm';
             await retry(async()=>{
                 const state=await item.transport.status();
@@ -406,9 +421,9 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             while(item.paused)await item.paused.promise;
             check(item);
             item.stage='open';
-            item.allowMint=true;showIndicator('recording');
+            item.allowMint=true;showIndicator(item.gated?'paused':'recording');
             const editor=new Promise((resolve,reject)=>{item.editor={resolve,reject};});
-            item.editorTimeout=setTimeout(()=>item.editor?.reject(failure('assigned_checkout_unverified')),80000);
+            if(!item.gated)item.editorTimeout=setTimeout(()=>item.editor?.reject(failure('assigned_checkout_unverified')),80000);
             open();await editor;
         }catch(error){
             if(activity!==item||item.ended)return;
@@ -569,8 +584,18 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     }
     /** Code's open-phase mint failed (`apps/code.js`): end the wait for the editor now, with the real cause. */
     function failOpen(res){
-        const item=activity;if(!item?.editor)return;
-        item.editor.reject(Object.assign(failure(res?.errorCode||'unknown'),{reason:res?.reason,correlationId:res?.correlationId}));
+        const item=activity;
+        if(item?.editor){
+            item.editor.reject(Object.assign(failure(res?.errorCode||'unknown'),{reason:res?.reason,correlationId:res?.correlationId}));
+            return;
+        }
+        // A re-open after the server's pause was refused (for example by the computer's provider): never wait on it forever.
+        // The share ends with the real cause; saved footage and the countdown stay, and no unsupported path is tried.
+        if(item?.gated&&samePhase(item)){
+            const cause=res?.errorCode||'unknown';
+            report('reopen',cause,item,{reason:res?.reason,correlationId:res?.correlationId});
+            void finish(item,'connection_lost',{cause,message:causeMessage(cause,null,item)});
+        }
     }
     const gate={repo,locked:()=>locked,confirm:confirmed,close,fail:failOpen,
         access:()=>activity?.allowMint&&mintSource(activity)?{attemptId,phase:'open',repoOpenProof:activity.proof,captureSessionId:activity.id}:null};

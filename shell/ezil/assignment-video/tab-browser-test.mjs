@@ -64,7 +64,11 @@ try {
                 assignmentOpen:{attemptId,proof,openedAt:new Date().toISOString(),windowStartedAt:stage,deadlineAt:deadline}});
         }
         if (u.pathname==='/api/shell/assignment-video') {
-            const d=post(); events.push(d.action);
+            const d=post();
+            // Universe's canonical countdown: the lease-free `clock` and the verified editor's `editor-ready` (not recording events).
+            if (d.action==='clock' || d.action==='editor-ready') return json({serverNow:new Date().toISOString(),startedAt:stage,deadlineAt:deadline,
+                pausedAt:null,pauseReason:null,remainingMs:null,revision:1});
+            events.push(d.action);
             if (d.action==='preflight') return json({status:'eligible',attemptId,jobId:'1',repositoryUrl:repo,expiresAt:deadline,windowStartedAt:stage,deadlineAt:deadline});
             if (d.action==='begin') { assert.equal(received,true); assert.equal(d.repoOpenProof,proof); return json({recordingId,status:'recording',startedAt:stage,deadlineAt:deadline}); }
             if (d.action==='status') return json({recordingId,status:'recording',revoked:false});
