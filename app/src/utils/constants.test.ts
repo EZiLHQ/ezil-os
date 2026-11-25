@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import {
-    Routes, SHELL_APP_ALIASES, SHELL_APP_IDS, getReturnUrlQueryParam, isShellAppId, returnUrlFor, safeReturnUrl, shellAppRoute,
+    Routes, SHELL_APP_ALIASES, SHELL_APP_IDS, computerViewerRoute, getReturnUrlQueryParam, isShellAppId, returnUrlFor, safeReturnUrl,
+    shellAppRoute,
 } from './constants';
 
 /**
@@ -18,8 +19,8 @@ describe('safeReturnUrl', () => {
     it('keeps ordinary same-origin paths, including the ones this app uses', () => {
         expect(safeReturnUrl('/os')).toBe('/os');
         expect(safeReturnUrl(Routes.COMPUTERS)).toBe(Routes.COMPUTERS);
-        expect(safeReturnUrl('/computer/9d5b0a1e-0000-4000-8000-000000000000')).toBe(
-            '/computer/9d5b0a1e-0000-4000-8000-000000000000',
+        expect(safeReturnUrl('/app/browser?computer=9d5b0a1e-0000-4000-8000-000000000000')).toBe(
+            '/app/browser?computer=9d5b0a1e-0000-4000-8000-000000000000',
         );
         expect(safeReturnUrl('/computers?created=1#top')).toBe('/computers?created=1#top');
     });
@@ -122,9 +123,8 @@ describe('safeReturnUrl — the OS routes (docs/APP-ROUTES.md)', () => {
 
     it('positive controls for every page this app sends back through login', () => {
         // The producers: `/os` + `/app/[appId]` pages, `computers/layout.tsx`,
-        // `computer/layout.tsx`, `billing/return/page.tsx`, the pricing CTA.
+        // `billing/return/page.tsx`, the pricing CTA.
         expect(safeReturnUrl('/computers')).toBe('/computers');
-        expect(safeReturnUrl('/computer/9D5B0A1E-0000-4000-8000-000000000000')).toBe('/computer/9D5B0A1E-0000-4000-8000-000000000000');
         expect(safeReturnUrl('/billing/return?session_id=cs_1')).toBe('/billing/return?session_id=cs_1');
         expect(safeReturnUrl('/os?settings=billing&upgrade=standard')).toBe('/os?settings=billing&upgrade=standard');
     });
@@ -176,7 +176,6 @@ describe('safeReturnUrl — compatibility decisions (docs/APP-ROUTES.md §6)', (
             `/app/code?project=${P}&repo=${R}&path=src/main.ts`, `/app/code?project=${P}&repo=${R}&path=src%2Fmain.ts`,
             '/app/desktop?computer=11111111-1111-4111-8111-111111111111', '/app/settings?tab=billing&section=ai-credits',
             '/computers', '/computers?created=1#top',
-            '/computer/9d5b0a1e-0000-4000-8000-000000000000', '/computer/9D5B0A1E-0000-4000-8000-000000000000',
             '/billing/return', '/billing/return?session_id=cs_test_1',
         ]) {
             expect(safeReturnUrl(url), url).toBe(url);
@@ -203,7 +202,7 @@ describe('safeReturnUrl — compatibility decisions (docs/APP-ROUTES.md §6)', (
      */
     it('case 5: any other rejected path lands on /computers, including pages base used to keep', () => {
         // Positive controls: the exact pages next to the refused shapes below.
-        for (const url of ['/os', '/computers', '/billing/return', '/computer/9d5b0a1e-0000-4000-8000-000000000000']) {
+        for (const url of ['/os', '/computers', '/billing/return']) {
             expect(safeReturnUrl(url), url).toBe(url);
         }
         for (const url of [
@@ -214,6 +213,38 @@ describe('safeReturnUrl — compatibility decisions (docs/APP-ROUTES.md §6)', (
             '/computer/9d5b0a1e-0000-4000-8000-000000000000/x', '/api/trpc/x', '/auth/callback', '/os/bundle.min.js',
         ]) {
             expect(safeReturnUrl(url), url).toBe(Routes.COMPUTERS);
+        }
+    });
+
+    /**
+     * 🔴 `/computer/<uuid>` was a return page until its page was removed
+     * (2026-11-25). A sign-in that still carries one must land on the list,
+     * never on a path that now answers 404. Restore the `/computer/` branch
+     * in `isReturnPath` and this goes red.
+     */
+    it('🔴 the removed /computer/<uuid> page is no longer a return page', () => {
+        for (const url of [
+            '/computer', '/computer/', '/computer/9d5b0a1e-0000-4000-8000-000000000000',
+            '/computer/9D5B0A1E-0000-4000-8000-000000000000', '/computer/9d5b0a1e-0000-4000-8000-000000000000?x=1',
+        ]) {
+            expect(safeReturnUrl(url), url).toBe(Routes.COMPUTERS);
+        }
+        expect(Object.values(Routes)).not.toContain('/computer');
+    });
+});
+
+describe('computerViewerRoute — where "open this computer" goes', () => {
+    const ID = '9d5b0a1e-0000-4000-8000-000000000000';
+
+    it('is the shell Browser app on that computer, and survives sign-in byte for byte', () => {
+        expect(computerViewerRoute(ID)).toBe(`/app/browser?computer=${ID}`);
+        expect(safeReturnUrl(computerViewerRoute(ID))).toBe(`/app/browser?computer=${ID}`);
+        expect(computerViewerRoute(ID.toUpperCase())).toBe(`/app/browser?computer=${ID.toUpperCase()}`);
+    });
+
+    it('🔴 never builds a path from anything but a computer id', () => {
+        for (const id of ['', 'not-a-uuid', `${ID}/x`, `${ID}&app=code`, `${ID}#x`, '../os', ` ${ID}`, `${ID}\n`]) {
+            expect(() => computerViewerRoute(id), id).toThrow('Not a computer id');
         }
     });
 });

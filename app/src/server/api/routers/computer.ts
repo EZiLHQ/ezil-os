@@ -11,7 +11,7 @@
  * `server/lib/cloudflare-guacamole-provider.ts` and
  * `worker/src/index.ts`'s `deriveSandboxId` / `ensureWorkspaceMount`).
  *
- * Procedures: list / create / get / rename / touch / delete. `delete` is
+ * Procedures: list / create / get / rename / delete. `delete` is
  * SOFT delete only — it stamps `deleted_at` and never issues a SQL DELETE;
  * see `./computer-store.ts` for the full rationale and the type-level
  * guarantee that enforces it.
@@ -347,27 +347,6 @@ export const computerRouter = createTRPCRouter({
             const [updated] = await ctx.db
                 .update(computers)
                 .set({ name: input.name.trim() })
-                .where(liveOwnedComputer(ctx.user.id, input.id))
-                .returning();
-
-            if (!updated) {
-                throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
-            }
-
-            return updated;
-        }),
-
-    /**
-     * Stamp `lastOpenedAt = now()`. Called when the user opens a computer
-     * into the EZiL OS desktop, so `list` can order/surface "recently used"
-     * later.
-     */
-    touch: protectedProcedure
-        .input(z.object({ id: z.string().uuid() }))
-        .mutation(async ({ ctx, input }) => {
-            const [updated] = await ctx.db
-                .update(computers)
-                .set({ lastOpenedAt: new Date() })
                 .where(liveOwnedComputer(ctx.user.id, input.id))
                 .returning();
 

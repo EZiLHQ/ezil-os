@@ -1,9 +1,8 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
 
-import { Routes } from '@/utils/constants';
+import { computerViewerRoute } from '@/utils/constants';
 
 export interface ComputerRowData {
     id: string;
@@ -49,12 +48,24 @@ export function ComputerRow({
     /** True while this row's delete mutation is in flight. */
     isDeleting?: boolean;
 }) {
-    const router = useRouter();
     const navigatingRef = useRef(false);
+
+    useEffect(() => {
+        const resetNavigation = () => {
+            navigatingRef.current = false;
+        };
+        window.addEventListener('pageshow', resetNavigation);
+        return () => window.removeEventListener('pageshow', resetNavigation);
+    }, []);
+
+    // 🔴 A document load, never the App Router: the destination is the shell,
+    // whose scripts only execute on a real page load (`../../os/page.tsx`,
+    // cost 3). `/computer/<id>` is gone; this is the one way a row opens.
     const handleOpen = () => {
         if (readOnly || navigatingRef.current) return;
+        const destination = computerViewerRoute(computer.id);
         navigatingRef.current = true;
-        router.push(`${Routes.COMPUTER}/${computer.id}`);
+        window.location.assign(destination);
     };
     const details = (
         <div className="min-w-0">

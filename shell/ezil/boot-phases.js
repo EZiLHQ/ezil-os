@@ -7,7 +7,8 @@
 //
 //   `app/src/components/desktop/boot-phases.shell.test.ts` contains a 7-test
 //   DRIFT GUARD that runs the .js copy and the TypeScript original
-//   (`boot-phases.ts`, still used by the /computer/[id] React canvas) against
+//   (`boot-phases.ts`; the /computer/[id] React canvas that ran it was removed
+//   on 2026-11-25, and the server honesty tests still import it) against
 //   each other input by input — 5,616 `computeBootUiState` combinations, 119
 //   `applyDisplayEvidence` ones, and every `phaseVisualState` pair. That guard
 //   is the only thing stopping the two copies of this logic from quietly
@@ -21,10 +22,10 @@
 //   dimension is added, as "576" did. Recompute before quoting.)
 //
 // So there is exactly ONE copy of the module, it stays where its test can see
-// it, and esbuild follows this import across the tree at bundle time. When
-// `/computer/[id]` is eventually retired and `boot-phases.ts` with it, the
-// guard becomes moot and the file can move here — at which point only this
-// re-export changes.
+// it, and esbuild follows this import across the tree at bundle time.
+// `/computer/[id]` is retired; once `boot-phases.ts` and the tests that still
+// import it follow, the guard becomes moot and the file can move here — at
+// which point only this re-export changes.
 //
 // The logic itself is deliberately untouched: it already refused to lie
 // during a live failure (it marks a phase `confirmed` ONLY on the real

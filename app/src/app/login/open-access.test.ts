@@ -40,7 +40,6 @@ function code(source: string): string {
 
 const osPage = read('../os/page.tsx');
 const computersLayout = read('../computers/layout.tsx');
-const computerLayout = read('../computer/layout.tsx');
 const loginPage = read('./page.tsx');
 const rootPage = read('../page.tsx');
 const trpcSource = read('../../server/api/trpc.ts');
@@ -52,7 +51,6 @@ const inviteCli = read('../../../../tools/invite.ts');
 const PROTECTED = {
     'os/page.tsx': osPage,
     'computers/layout.tsx': computersLayout,
-    'computer/layout.tsx': computerLayout,
 };
 
 describe('🔴 no surface consults an allow-list', () => {

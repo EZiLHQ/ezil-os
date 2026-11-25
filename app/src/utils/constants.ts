@@ -4,7 +4,6 @@ export const Routes = {
     HOME: '/',
     LOGIN: '/login',
     COMPUTERS: '/computers',
-    COMPUTER: '/computer',
     /**
      * The EZiL OS shell. This is where a successful sign-in with no explicit
      * `returnUrl` lands (see `safeReturnUrl`'s empty-input branch). `/computers`
@@ -38,6 +37,22 @@ export function isShellAppId(id: unknown): id is string {
 export function shellAppRoute(id: string): string {
     if (!isShellAppId(id)) throw new Error('Not a shell app id');
     return `${Routes.APP}/${id}`;
+}
+
+const COMPUTER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Where "open this computer" goes: the shell's Browser app on that computer,
+ * `/app/browser?computer=<uuid>` (docs/APP-ROUTES.md §1, §9). The `/os` page
+ * serves it and checks ownership through `computer.get`. It replaced the
+ * removed `/computer/<uuid>` page; nothing may build that path again.
+ *
+ * 🔴 The destination is the shell, so the caller must navigate with a document
+ * load (`window.location.assign` or a plain `<a>`), never the App Router.
+ */
+export function computerViewerRoute(computerId: string): string {
+    if (!COMPUTER_ID.test(computerId)) throw new Error('Not a computer id');
+    return `${shellAppRoute('browser')}?computer=${computerId}`;
 }
 
 /**
@@ -95,7 +110,7 @@ export function getReturnUrlQueryParam(pathname: string): string {
  *     backslash anywhere;
  *   - and its PATH must be, exactly, one this app sends people back to:
  *     `/os`, `/app/<shell app id>` (see `SHELL_APP_IDS`), `/computers`,
- *     `/computer/<uuid>`, `/billing/return`. Matching whole paths is also
+ *     `/billing/return`. Matching whole paths is also
  *     what refuses dot segments (`/app/../admin`) and encoded separators or
  *     dots (`/app/%2e%2e/x`, `/os%2fadmin`): none of those shapes can be on
  *     the list. The query is data and is kept as it is (`%2F` there is
@@ -118,7 +133,8 @@ export function getReturnUrlQueryParam(pathname: string): string {
  * Compatibility (docs/APP-ROUTES.md §6 has the table). Before `/app/<id>`
  * existed, any path that passed the shape checks was kept, so a few paths
  * that used to come back now land on `/computers`: `/`, `/pricing`,
- * `/login`, `/admin/*`, `/os/`, `/computers/`. No producer in this repository
+ * `/login`, `/admin/*`, `/os/`, `/computers/`. `/computer/<uuid>` joined them
+ * when that page was removed (2026-11-25). No producer in this repository
  * sends any of them. The cases below are numbered as the tests name them
  * (`constants.test.ts`, "compatibility decisions"); their ORDER is part of
  * the rule.
@@ -160,8 +176,6 @@ export function safeReturnUrl(value: string | string[] | undefined | null): stri
     return Routes.COMPUTERS;
 }
 
-const UUID_PATH = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 /** The pages a sign-in may return to, matched as whole paths (so no dot
  * segment, encoded separator, trailing slash or extra segment can pass). */
 function isReturnPath(path: string): boolean {
@@ -174,7 +188,5 @@ function isReturnPath(path: string): boolean {
     // own key of `SHELL_APP_ALIASES`, so `__proto__` and friends fail).
     // Produced by the `/app/[appId]` page.
     if (path.startsWith(`${Routes.APP}/`)) return isShellAppId(path.slice(Routes.APP.length + 1));
-    // `/computer/<uuid>`: `computer/layout.tsx` (`x-pathname`); either case.
-    if (path.startsWith(`${Routes.COMPUTER}/`)) return UUID_PATH.test(path.slice(Routes.COMPUTER.length + 1));
     return false;
 }
