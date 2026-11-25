@@ -7,6 +7,7 @@ import { freeSkuFor, planFromSubscriptions } from './catalog';
 import { planFromSubscriptions as planV3 } from '../v3/catalog';
 import { admitStart as admitStartV3, HOLD_SIZE } from '../v3/admission';
 import { deriveStanding, operatorAccessFor, paidAccess } from '../v3/standing';
+import { withoutAccessOverrides } from '../v3/effective-access';
 import { buildSummaryV3, fairUseAllowance, renewalGrantPending, usedSecondsInWindow } from '../v3/summary';
 import { CATALOG_V3, type PlanSkuV3, type BillingSummaryV3, type AdmitDecisionV3, type AdmitRefusalV3 } from '../v3/contract';
 import { CATALOG_V2, SESSION_MAX_SECONDS, type ComputeEpoch, type AdmitDecision, type AdmitRefusal, type BillingSummaryV2, type PlanFamily, type PlanSku, type SizeCode, type Window } from './contract';
@@ -70,14 +71,20 @@ export function billingMeteringActive(config: Pick<BillingConfig, 'tabEnabled' |
     return config.tabEnabled || config.enforcementEnabled;
 }
 
-/** The Billing tab's reads and arithmetic, without its storage/customer reads. */
-export async function loadComputeBillingState(deps: BillingDeps, userId: string, now: Date): Promise<ComputeBillingState> {
-    const [subs, userCreatedAt, planChanges, operatorGrants] = await Promise.all([
+/**
+ * The Billing tab's reads and arithmetic, without its storage/customer reads. `accessOverrides: false` resolves the plan
+ * as before explicit overrides (Stripe, else an ordinary grant, else Free): AI model policy reads it (ai-models.ts),
+ * because an override decides compute only.
+ */
+export async function loadComputeBillingState(deps: BillingDeps, userId: string, now: Date,
+    options: { accessOverrides?: boolean } = {}): Promise<ComputeBillingState> {
+    const [subs, userCreatedAt, planChanges, rows] = await Promise.all([
         deps.store.subscriptionsFor(userId),
         deps.store.userCreatedAt(userId),
         deps.store.openPlanChanges(userId),
         deps.store.operatorEntitlementsFor?.(userId) ?? [],
     ]);
+    const operatorGrants = options.accessOverrides === false ? withoutAccessOverrides(rows) : rows;
     // Product entitlements v1: a live explicit override decides the plan; otherwise an operator grant decides it only where
     // Stripe gives no paid access (paid wins).
     const operator = operatorGrants.length

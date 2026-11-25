@@ -39,7 +39,7 @@ import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 import { operatorGrantInEffect } from '@/server/billing/v3/operator-access';
-import { accessOverrideInEffect, isAccessOverride, ordinaryGrants, type AccessRow } from '@/server/billing/v3/effective-access';
+import { accessOverrideInEffect, ordinaryGrants, withoutAccessOverrides, type AccessRow } from '@/server/billing/v3/effective-access';
 
 /**
  * An assigned plan in effect blocks a new Stripe purchase: an ordinary operator grant (the operator ends it first), or a
@@ -81,11 +81,15 @@ async function currentPlan(deps: BillingDeps, userId: string) {
     return { plan, subs, userCreatedAt, changes: changes.filter(change => change.subscriptionId === plan.subscriptionId) };
 }
 
-/** Product access reads may resolve operator grants; Stripe mutation helpers keep using currentPlan above. */
-async function currentEffectivePlan(deps: BillingDeps, userId: string) {
-    const [current, grants, paymentIssues] = await Promise.all([
+/**
+ * Product access reads may resolve operator grants; Stripe mutation helpers keep using currentPlan above.
+ * `accessOverrides: false`: the plan as before explicit overrides (they decide compute only), for the portal.
+ */
+async function currentEffectivePlan(deps: BillingDeps, userId: string, options: { accessOverrides?: boolean } = {}) {
+    const [current, rows, paymentIssues] = await Promise.all([
         currentPlan(deps, userId), deps.store.operatorEntitlementsFor?.(userId) ?? [], deps.store.openPaymentIssues(userId),
     ]);
+    const grants = options.accessOverrides === false ? withoutAccessOverrides(rows) : rows;
     const now = deps.now();
     const operator = operatorAccessFor({ subscriptions: current.subs, paymentIssues, grants, now });
     return planFromSubscriptions({ subs: current.subs, now, userCreatedAt: current.userCreatedAt, operator });
@@ -1111,11 +1115,10 @@ export function createBillingRouter(getDeps: () => BillingDeps,
         portal: protectedProcedure.mutation(async ({ ctx }) => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
-            const effective = await currentEffectivePlan(deps, ctx.user.id);
-            // An ordinary operator grant has no Stripe billing to manage. An explicit override decides access only: the
-            // account's own Stripe subscription keeps its portal, checked as the Stripe-only plan.
-            if (effective.operator && !isAccessOverride(effective.operator)) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
-            const plan = effective.operator ? (await currentPlan(deps, ctx.user.id)).plan : effective;
+            // An explicit override decides compute only: the portal follows the plan as before overrides (a Stripe payer
+            // keeps it; an ordinary grant-only account has none).
+            const plan = await currentEffectivePlan(deps, ctx.user.id, { accessOverrides: false });
+            if (plan.operator) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
             const customerId = await deps.store.stripeCustomerFor(ctx.user.id);
             if (!customerId) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
             if (plan.subscriptionId) await ownedSubscription(deps, stripe, ctx.user.id, plan.subscriptionId);
