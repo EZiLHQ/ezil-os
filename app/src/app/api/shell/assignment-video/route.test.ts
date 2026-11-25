@@ -8,6 +8,7 @@ vi.mock('@/server/shell/http',()=>({
     shellJson:(data:unknown,status=200)=>Response.json(data,{status,headers:{'cache-control':'no-store'}}),
 }));
 import { POST } from './route';
+import { expectedRepositoryURL } from '@/server/git/assignment-repository-name';
 const attemptId='00000000-0000-4000-8000-000000000001';
 const action={attemptId,action:'status'};
 const defaults = {'content-type':'application/json','origin':'https://os-staging.ezil.work','sec-fetch-site':'same-origin',
@@ -57,6 +58,24 @@ describe('same-origin actual assignment shell route',()=>{
             expect((await post(defaults,invalid)).status).toBe(400);
         }
         expect(mocks.action).not.toHaveBeenCalled();
+    });
+    it('checks the presented repository against the current identity without querying Universe for a mismatched link',async()=>{
+        const preflight = {attemptId,action:'preflight'};
+        const repositoryUrl = expectedRepositoryURL('participant', 'a-' + attemptId);
+        const otherUrl = expectedRepositoryURL('different-account', 'a-' + attemptId);
+        const withRepo = (url: string) => ({...defaults,'x-ezil-assignment-repository':url});
+        const wrong = await post(withRepo(otherUrl),preflight);
+        expect(wrong.status).toBe(409);
+        expect(await wrong.json()).toEqual({error:{code:'assignment_identity_mismatch'}});
+        for (const invalid of [otherUrl.replace(attemptId,'00000000-0000-4000-8000-000000000099'),
+            repositoryUrl.replace('github.ezil.work','other.example'), repositoryUrl+'?hint=1']) {
+            expect((await post(withRepo(invalid),preflight)).status).toBe(400);
+        }
+        expect((await post(defaults,{...action,repositoryUrl})).status).toBe(400);
+        expect(mocks.action).not.toHaveBeenCalled();
+        expect((await post(withRepo(repositoryUrl),preflight)).status).toBe(200);
+        expect((await post(defaults,preflight)).status).toBe(200); // Older builds send no repository hint.
+        for (const call of mocks.action.mock.calls) expect(call[1]).toEqual(preflight);
     });
     it('exposes the authenticated clock without a recording phase or client-supplied state',async()=>{
         const clock = {attemptId,action:'clock'};

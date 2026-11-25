@@ -141,6 +141,47 @@ test('an assignment sign-in refresh keeps the selected computer, repository and 
         assert.deepEqual([...back.searchParams],[['repo',repo],['assignment',id],['computer',computerId]]);
     }finally{await gate.close();}
 });
+test('a mismatched assignment account offers explicit sign-in and preserves the exact link',async t=>{
+    const origin='https://os.ezil.work';
+    const signedRepo=repo.replace('https:', 'https%3A');
+    const actions=[];
+    const assigned=[];
+    const requests=[];
+    const doc={createElement(){const element=new Element();actions.push(element);return element;}};
+    t.mock.method(globalThis,'fetch',async(_path,options)=>{
+        requests.push({ body:JSON.parse(options.body), repositoryUrl:options.headers['X-Ezil-Assignment-Repository'] });
+        return Response.json({error:{code:'assignment_identity_mismatch'}},{status:409});
+    });
+    for (const path of ['/app/code?repo='+signedRepo,
+        '/app/code?computer='+id+'&repo='+signedRepo+'&assignment='+id+'#workspace']) {
+        const location=Object.assign(new URL(origin+path),{assign:target=>assigned.push(target)});
+        const win={location,document:doc,addEventListener(){},removeEventListener(){}};
+        win.top=win;
+        Object.assign(globalThis,{window:win,document:doc});
+        const gate=openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>'owner',computerId:id,body:new Element(),
+            park(){},open(){assert.fail('editor must stay closed');},prepare(){assert.fail('checkout must stay closed');}});
+        try {
+            await new Promise(r=>setImmediate(r));
+            assert.ok(actions.some(e=>e.textContent==='Use the same EZiL ID you used on Universe.'));
+            const signIn=actions.findLast(e=>typeof e.onclick==='function'&&e.textContent==='Sign in to EZiL OS');
+            assert.ok(signIn);
+            assert.equal(gate.locked(),true);
+            assert.equal(gate.access(),null);
+            const before=assigned.length;
+            signIn.onclick({isTrusted:false});
+            assert.equal(assigned.length,before);
+            signIn.onclick({isTrusted:true});
+            const login=new URL(assigned.at(-1),origin);
+            assert.equal(login.pathname,'/auth/auth0/login');
+            assert.equal(login.searchParams.get('prompt'),'login');
+            assert.equal(login.searchParams.get('returnUrl'),path);
+        } finally {
+            await gate.close();
+        }
+    }
+    const preflight={body:{action:'preflight',attemptId:id},repositoryUrl:repo};
+    assert.deepEqual(requests,[preflight,preflight]);
+});
 test('only a confirmed old AWS session blocks consent; Stop and recheck retain the same attempt',async t=>{
     const texts=[], actions=[], requests=[];
     const doc={createElement(){const e=new Element();Object.defineProperty(e,'textContent',{set(v){this.label=v;texts.push(v);}});

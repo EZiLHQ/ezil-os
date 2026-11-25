@@ -1,13 +1,16 @@
 import { type NextRequest, NextResponse } from 'next/server';
 
 import { AUTH0_COOKIE, AUTH0_COOKIE_OPTIONS, Auth0Error, buildAuthorizeUrl } from '@/server/auth/auth0';
+import { isAssignmentCodeReturn } from '@/utils/assignment-work-auth';
 import { safeReturnUrl } from '@/utils/constants';
 import { ownedPublicOrigin } from '@/utils/forwarded';
 
 export async function GET(request: NextRequest) {
-    // `prompt=none` exactly, or nothing: the silent re-auth that refreshes the retained ID token.
-    const prompt = request.nextUrl.searchParams.get('prompt') === 'none' ? 'none' : undefined;
     const returnUrl = request.nextUrl.searchParams.get('returnUrl');
+    const requestedPrompt = request.nextUrl.searchParams.get('prompt');
+    const assignmentSignIn = requestedPrompt === 'login' && returnUrl !== null
+        && returnUrl === safeReturnUrl(returnUrl) && isAssignmentCodeReturn(returnUrl);
+    const prompt = requestedPrompt === 'none' ? 'none' : assignmentSignIn ? 'login' : undefined;
     let response: NextResponse;
     try {
         const url = await buildAuthorizeUrl({ origin: ownedPublicOrigin(request.headers, request.url), returnUrl, prompt });
