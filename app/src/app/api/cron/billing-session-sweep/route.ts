@@ -20,6 +20,7 @@ import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { readLastUsageStop, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { ComputerRef } from '@/server/lib/compute/provider';
+import { freeOverrideLaneEnabled } from '@/server/lib/compute/provider-reverse-override';
 import { advanceReverseMoves } from '@/server/lib/compute/provider-reverse-runtime';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { handleBillingSessionSweep, reverseMoveInFlightFor, RUNNING_GRACE_MS } from './handler';
@@ -128,6 +129,8 @@ export async function GET(req: Request): Promise<Response> {
         isStillRunning: isStillRunningAt(now),
         awsStopProof,
         refreshAiPlans: aiPlanRefresh(now),
+        // The explicit Free override lane (provider-reverse-override.ts) owns such an owner's AWS stops while it runs.
+        overrideLane: freeOverrideLaneEnabled(process.env),
         // The held bound reads placements (C-2, through placement.ts): only where placement reads are on, as sandbox-reap.
         ...(isPlacementReadEnabled(process.env)
             ? { runningAwsPlacements: (after: string | null, limit: number) => runningAwsComputersAfterEpochs(db, after, limit),
