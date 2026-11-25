@@ -285,7 +285,7 @@ function parentPort(){
 }
 // The OS's own assignment-video route and the media bucket, as the transport sees them.
 function fakeServer({stopReason=null,readyBeforeSeed=false}={}){
-    const log=[],started=Date.now();let seeded=false,stopAt=null;
+    const log=[],started=Date.now();let seeded=false,stopAt=null,serverNow=null;
     const startedAt=new Date(started-1000).toISOString(),deadlineAt=new Date(started+1800000).toISOString(),firstFrameAt=new Date(started).toISOString();
     async function handler(path,options){
         if(String(path).startsWith(bucket)){log.push('put');return new Response(null,{status:200});}
@@ -299,13 +299,13 @@ function fakeServer({stopReason=null,readyBeforeSeed=false}={}){
         if(body.action==='confirm'){
             const seed=!seeded;seeded=true;
             return Response.json(seed?{...same,sequence:body.sequence,confirmed:true,phaseReady:true,nextSequence:body.sequence+1,firstFrameAt,startedAt,deadlineAt,
-                serverNow:new Date().toISOString()}:{recordingId,sequence:body.sequence,confirmed:true});
+                serverNow:serverNow=new Date(Date.now()+2345).toISOString()}:{recordingId,sequence:body.sequence,confirmed:true});
         }
         if(body.action==='status')return Response.json({...same,status:'recording',phaseReady:seeded||readyBeforeSeed,workspaceUnlocked:seeded||readyBeforeSeed,startedAt,deadlineAt,firstFrameAt,
             stopRequestedAt:stopAt,stopReason:stopAt?stopReason:null,revoked:false});
         return Response.json({...same,status:'paused',startedAt,deadlineAt,stopRequestedAt:null,revoked:false});
     }
-    return {log,handler,startedAt,deadlineAt,stop(at){stopAt=at;}};
+    return {log,handler,startedAt,deadlineAt,serverNow:()=>serverNow,stop(at){stopAt=at;}};
 }
 function embeddedGate(w,{who='owner',prepare=()=>assert.fail('checkout must stay closed'),open=()=>assert.fail('editor must stay closed'),...rest}={}){
     return openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>who,computerId:'fixture',body:new Element(),park(){},prepare,open,...rest});
@@ -334,7 +334,10 @@ test('the paired Universe parent records, unlocks and ends the embedded assignme
         assert.equal(gate.access(),null,'no mint before the first frame is confirmed');
         const seed=seedPart();
         const ready=await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
-        assert.deepEqual(ready.value,{confirmed:true,phaseReady:true,captureSessionId:session,nextSequence:1,startedAt:server.startedAt,deadlineAt:server.deadlineAt});
+        // The broker's own (here deliberately skewed) clock reaches the parent unchanged, for its segment and deadline timing.
+        assert.match(server.serverNow(),/^\d{4}-\d\d-\d\dT/);
+        assert.deepEqual(ready.value,{confirmed:true,phaseReady:true,captureSessionId:session,nextSequence:1,startedAt:server.startedAt,deadlineAt:server.deadlineAt,
+            serverNow:server.serverNow()});
         assert.deepEqual((await p.rpc('status',{captureSessionId:session})).value,{captureSessionId:session,status:'recording',stopRequestedAt:null});
         assert.equal(gate.access(),null);
         const unlocked=await p.rpc('unlock',{captureSessionId:session});

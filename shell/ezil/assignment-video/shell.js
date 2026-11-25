@@ -213,7 +213,9 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
         // Reopening after a stop resumes the attempt's own window; a different start is never a new clock.
         if(windowStart!==undefined && windowStart!==startAt)throw failure('recording_closed');
         windowStart=startAt;item.seed=ack;item.expected=ack.nextSequence;
-        return {confirmed:true,phaseReady:true,captureSessionId:item.id,nextSequence:ack.nextSequence,startedAt:ack.startedAt,deadlineAt:ack.deadlineAt};
+        // The broker's own clock at confirmation: the parent's recorder offsets its segment and deadline timing by it.
+        return {confirmed:true,phaseReady:true,captureSessionId:item.id,nextSequence:ack.nextSequence,startedAt:ack.startedAt,deadlineAt:ack.deadlineAt,
+            serverNow:Number.isFinite(serverNow)?ack.serverNow:null};
     }
     async function status(d){
         const item=active;
