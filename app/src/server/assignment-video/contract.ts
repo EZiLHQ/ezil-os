@@ -3,6 +3,7 @@ import { z } from 'zod';
 
 export const osOrigin = 'https://os-staging.ezil.work';
 export const universeOrigin = 'https://universe-staging.ezil.work';
+export const creatorUnlinked = 'assignment_video_creator_unlinked';
 export const worksOrigin = 'https://api-staging.ezil.work';
 export const objectOrigin = 'https://ezil-universe-staging-assignment-media-452630323510-aps1.s3.ap-south-1.amazonaws.com';
 export const issuer = 'https://id.ezil.work/';

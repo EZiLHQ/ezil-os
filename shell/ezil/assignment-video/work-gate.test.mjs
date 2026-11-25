@@ -78,7 +78,7 @@ test('the native Stop during a delayed private checkout cannot later start media
     }finally{await gate.close();}
 });
 function consentWindow(url){
-    const elements=[],assigned=[];let handle;
+    const elements=[],assigned=[],opened=[];let handle;
     class Track{
         readyState='live';muted=false;listeners={};
         getCaptureHandle(){return {origin:'https://os-staging.ezil.work',handle};}
@@ -88,16 +88,40 @@ function consentWindow(url){
     const track=new Track(),stream={getTracks:()=>[track],getVideoTracks:()=>[track],getAudioTracks:()=>[]};
     const doc={body:new Element(),createElement(tag){const e=new Element();e.tag=tag;elements.push(e);return e;}};
     const location=Object.assign(new URL(url),{assign:target=>assigned.push(target)});
-    const win={location,crypto:globalThis.crypto,isSecureContext:true,document:doc,addEventListener(){},removeEventListener(){},
+    const win={location,open:(...args)=>opened.push(args),crypto:globalThis.crypto,isSecureContext:true,document:doc,addEventListener(){},removeEventListener(){},
         MediaStreamTrack:Track,VideoFrame:class{},VideoEncoder:class{},
         navigator:{mediaDevices:{setCaptureHandleConfig(config){handle=config.handle;},getDisplayMedia:async()=>stream}}};
     win.top=win;win.parent=win;Object.assign(globalThis,{window:win,document:doc});
     const button=label=>elements.find(e=>typeof e.onclick==='function'&&e.textContent===label);
-    return {elements,assigned,track,button};
+    return {elements,assigned,opened,track,button};
 }
 const entry='https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id;
 const eligibleBody=extra=>({status:'eligible',attemptId:id,repositoryUrl:repo,expiresAt:new Date(Date.now()+60000).toISOString(),
     windowStartedAt:null,deadlineAt:null,...extra});
+test('a Creator-link refusal keeps the editor closed and offers a trusted route back to Universe',async t=>{
+    const requests=[];
+    t.mock.method(globalThis,'fetch',async(_path,options)=>{
+        requests.push(JSON.parse(options.body).action);
+        return Response.json({error:{code:'assignment_video_creator_unlinked'}},{status:409});
+    });
+    const w=consentWindow(entry);
+    const gate=openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>'owner',computerId:'fixture',body:new Element(),
+        park(){},open(){assert.fail('editor must stay closed');},prepare(){assert.fail('checkout must stay closed');}});
+    try{
+        await new Promise(r=>setImmediate(r));
+        assert.ok(w.elements.some(e=>e.textContent==='The Creator needs to connect EZiL ID'));
+        assert.ok(w.elements.some(e=>e.textContent?.includes('verified EZiL ID')));
+        assert.equal(w.button('Share this OS tab and open assignment'),undefined);
+        assert.equal(w.button('Retry verification'),undefined);
+        const back=w.button('Return to Universe jobs');
+        assert.ok(back);
+        back.onclick({isTrusted:false});assert.deepEqual(w.opened,[]);
+        back.onclick({isTrusted:true});
+        assert.deepEqual(w.opened,[['https://universe-staging.ezil.work/builder-jobs','_self','noreferrer']]);
+        assert.deepEqual(requests,['preflight']);
+        assert.equal(gate.locked(),true);assert.equal(gate.access(),null);
+    }finally{await gate.close();}
+});
 test('an AWS computer needs Universe\'s explicit binding answer; every other provider keeps its own path',async t=>{
     const bound='b'.repeat(64),now=Date.now();
     const window=(from,until)=>({windowStartedAt:new Date(now-from).toISOString(),deadlineAt:new Date(now+until).toISOString()});

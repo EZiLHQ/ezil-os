@@ -128,6 +128,11 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         }catch(e){
             if(!isHere())return;
             if(e.code==='identity_refresh_required'){showSignIn();return;}
+            if(e.code==='assignment_video_creator_unlinked'){
+                lockedView('The Creator needs to connect EZiL ID','This assignment can open after the job Creator signs in to Universe with their verified EZiL ID. Return to the job for your application options.');
+                ui.action('Return to Universe jobs',()=>win.open('https://universe-staging.ezil.work/builder-jobs','_self','noreferrer'));
+                return;
+            }
             const unsupported=e.message==='unsupported';
             lockedView('Assignment unavailable',unsupported?'This browser cannot verify sharing of this OS tab.':'The assigned repository or recording service could not be verified.');
             if(!unsupported)ui.action('Retry verification',eligible);

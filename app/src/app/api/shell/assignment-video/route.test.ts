@@ -8,6 +8,7 @@ vi.mock('@/server/shell/http',()=>({
     shellJson:(data:unknown,status=200)=>Response.json(data,{status,headers:{'cache-control':'no-store'}}),
 }));
 import { POST } from './route';
+import { BrokerError, creatorUnlinked } from '@/server/assignment-video/contract';
 const attemptId='00000000-0000-4000-8000-000000000001';
 const action={attemptId,action:'status'};
 const defaults = {'content-type':'application/json','origin':'https://os-staging.ezil.work','sec-fetch-site':'same-origin',
@@ -51,6 +52,20 @@ describe('same-origin actual assignment shell route',()=>{
         expect(mocks.action).not.toHaveBeenCalled();
         mocks.identity.mockResolvedValueOnce({sessionId:'a',subject:'actor'}).mockResolvedValueOnce({sessionId:'b',subject:'actor'});
         expect((await post()).status).toBe(401);
+    });
+    it('returns the known Creator refusal only from preflight for the same still-current session',async()=>{
+        const preflight={attemptId,action:'preflight'};
+        mocks.action.mockRejectedValue(new BrokerError(creatorUnlinked,409));
+        const refused=await post(defaults,preflight);
+        expect(refused.status).toBe(409);
+        expect(await refused.json()).toEqual({error:{code:creatorUnlinked}});
+        expect(refused.headers.get('cache-control')).toContain('no-store');
+        mocks.identity.mockResolvedValueOnce({sessionId:'a',subject:'actor'}).mockResolvedValueOnce({sessionId:'b',subject:'actor'});
+        const changed=await post(defaults,preflight);
+        expect(changed.status).toBe(401);
+        expect(await changed.json()).toEqual({error:{code:'identity_refresh_required'}});
+        const status=await post();
+        expect(await status.json()).toEqual({error:{code:'recording_refused'}});
     });
     it('bounds the body and rejects supplied participant credentials or session fields',async()=>{
         for(const invalid of [{...action,userIdToken:'supplied'},{...action,osSessionId:'supplied'},{...action,filler:'a'.repeat(2049)}]){

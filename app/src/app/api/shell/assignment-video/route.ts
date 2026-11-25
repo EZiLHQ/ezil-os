@@ -1,7 +1,7 @@
 import { createTRPCContext } from '@/server/api/trpc';
 import { retainedIdentity } from '@/server/auth/retained-identity';
 import { recordingAction } from '@/server/assignment-video/broker';
-import { boundedJson, BrokerError, osOrigin, requestSchema, universeOrigin } from '@/server/assignment-video/contract';
+import { boundedJson, BrokerError, creatorUnlinked, osOrigin, requestSchema, universeOrigin } from '@/server/assignment-video/contract';
 import { shellJson, shellUnauthenticated } from '@/server/shell/http';
 import { isCrossOriginWrite } from '@/utils/request-origin';
 
@@ -30,13 +30,19 @@ export async function POST(req: Request) {
         if (!parsed.success) return fail('invalid_request', 400);
         const identity = await retainedIdentity(ctx.user.id).catch(() => null);
         if (!identity) return fail('identity_refresh_required', 401);
-        const result = await recordingAction(identity, parsed.data, {signal: req.signal});
+        const result = await recordingAction(identity, parsed.data, {signal: req.signal}).catch((error: unknown) => {
+            if (parsed.data.action === 'preflight' && error instanceof BrokerError
+                && error.code === creatorUnlinked && error.status === 409) return null;
+            throw error;
+        });
         const current = await retainedIdentity(ctx.user.id).catch(() => null);
         if (!current || current.sessionId !== identity.sessionId || current.subject !== identity.subject)
             return fail('identity_refresh_required', 401);
-        return shellJson(result);
+        return result === null ? fail(creatorUnlinked, 409) : shellJson(result);
     } catch (error) {
         // Control errors must never put private upstream bodies, auth headers or presigned URLs into a browser or log.
-        return error instanceof BrokerError ? fail(error.code, error.status) : fail('media_unavailable', 503);
+        return error instanceof BrokerError
+            ? fail(error.code === creatorUnlinked ? 'recording_refused' : error.code, error.status)
+            : fail('media_unavailable', 503);
     }
 }

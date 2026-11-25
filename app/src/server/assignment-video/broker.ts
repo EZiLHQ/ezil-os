@@ -1,7 +1,7 @@
 import { eligibleForActor, readOpen, repoOpenSecret, signBegin } from './repo-open';
 import { createHash } from 'node:crypto';
 import type { RetainedIdentity } from '@/server/auth/retained-identity';
-import { boundedJson, checkedPut, drain, eligible, hour, issuer, refuse, started, summary, universeOrigin, worksOrigin, type Input } from './contract';
+import { boundedJson, checkedPut, creatorUnlinked, drain, eligible, hour, issuer, refuse, started, summary, universeOrigin, worksOrigin, type Input } from './contract';
 
 type Identity = Pick<RetainedIdentity, 'token' | 'issuer' | 'subject' | 'sessionId' | 'expiresAt' | 'userId'>;
 type Capability = { recording: string; token: string; deadline: number; preparedEnds: Map<number, number>; phase?: string; seed?: number };
@@ -10,6 +10,7 @@ const storage = globalThis as typeof globalThis & { ezilAssignmentMediaLeases?: 
 // The same process already holds the verified OS session identity. A process loss requires a new authenticated begin.
 // No Works capability, retained ID token, signature, signed URL or storage key is persisted.
 const defaults = storage.ezilAssignmentMediaLeases ??= new Map<string, Capability>();
+const preflightUrl = universeOrigin + '/internal/assignment-video/preflight';
 
 export function recordingAction(identity: Identity, input: Extract<Input, {action: 'preflight'}>, deps?: Dependencies):
     Promise<ReturnType<typeof eligible.parse>>;
@@ -35,7 +36,14 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
                 signal: deps.signal ? AbortSignal.any([timeout, deps.signal]) : timeout});
         } catch { return refuse('media_unavailable', 503); }
         if (!response.ok) {
-            void response.body?.cancel().catch(() => {});
+            if (url === preflightUrl && response.status === 409
+                && response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() === 'application/json') {
+                const reason = await boundedJson(response.body, 512, 409).catch(() => null);
+                if (reason && typeof reason === 'object' && Object.keys(reason).length === 1
+                    && 'error' in reason && reason.error === creatorUnlinked) return refuse(creatorUnlinked, 409);
+            } else {
+                void response.body?.cancel().catch(() => {});
+            }
             if (response.status === 401 || response.status === 403 || response.status === 404) return refuse('recording_unavailable', 404);
             if (response.status === 409 || response.status === 429) return refuse('recording_refused', response.status);
             return refuse('media_unavailable', 503);

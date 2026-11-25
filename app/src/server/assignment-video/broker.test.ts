@@ -4,7 +4,7 @@ import { makeChallenge, readOpen, sealOpen, signBegin } from './repo-open';
 import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { recordingAction } from './broker';
-import { checkedPut, drain, hour, issuer, objectOrigin, requestSchema, type Prepare } from './contract';
+import { checkedPut, creatorUnlinked, drain, hour, issuer, objectOrigin, requestSchema, type Prepare } from './contract';
 
 const attempt = '00000000-0000-4000-8000-000000000001';
 const recording = '00000000-0000-4000-8000-000000000002';
@@ -48,6 +48,25 @@ vi.mock('server-only',()=>({}));
 beforeEach(()=>{vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET',testSigner);clock=initial+5000;remoteState={...state};calls.length=0;});
 
 describe('assignment media broker',()=>{
+    it('carries only an exact creator-link refusal from the verified Universe preflight',async()=>{
+        const preflight = {action:'preflight' as const,attemptId:attempt};
+        const reply = (payload:unknown,status=409) => ({...deps(),fetcher:async()=>Response.json(payload,{status})});
+        await expect(recordingAction(identity,preflight,reply({error:creatorUnlinked})))
+            .rejects.toMatchObject({code:creatorUnlinked,status:409});
+        for (const response of [
+            reply({error:'private_provider_reason'}),
+            reply({error:creatorUnlinked,identity:'private'}),
+            reply({error:creatorUnlinked.repeat(60)}),
+            {...deps(),fetcher:async()=>new Response(JSON.stringify({error:creatorUnlinked}),{status:409})},
+            {...deps(),fetcher:async()=>new Response('{broken',{status:409,headers:{'content-type':'application/json'}})},
+        ]) {
+            await expect(recordingAction(identity,preflight,response)).rejects.toMatchObject({code:'recording_refused',status:409});
+        }
+        await expect(recordingAction(identity,begin,reply({error:creatorUnlinked})))
+            .rejects.toMatchObject({code:'recording_refused',status:409});
+        await expect(recordingAction(identity,preflight,reply({error:creatorUnlinked},404)))
+            .rejects.toMatchObject({code:'recording_unavailable',status:404});
+    });
     it('requires a real retained session and strict inputs before a capability is usable',async()=>{
         expect(requestSchema.safeParse({...begin,creatorSub:'not trusted'}).success).toBe(false);
         expect(requestSchema.safeParse({...begin,consentAccepted:false}).success).toBe(false);
