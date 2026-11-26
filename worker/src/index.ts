@@ -125,6 +125,7 @@ import { WORKER_DESKTOP_READY_TIMEOUT_MS } from './preview-timeouts';
 export { ContainerProxy } from '@cloudflare/sandbox';
 
 interface Env extends SandboxEnv {
+  EZIL_PRODUCTION_ASSIGNMENT_PRELOAD?: string;
   /** Approved bare preview zone; unset preserves production's ezil.org routing. */
   SANDBOX_PREVIEW_ZONE_ROOT?: string;
   /** AWS computers (GW-4): routing and the tunnel API are off unless this is 1/true/on. */
@@ -645,6 +646,15 @@ import {
   type RepoOpenRoot,
 } from './repo-open';
 import {
+  ASSIGNMENT_PRELOAD_PORT,
+  ASSIGNMENT_PRELOAD_TIMEOUT_MS,
+  authorizeAssignmentPreload,
+  isAssignmentPreloadForward,
+  notifyAssignmentPreload,
+  splitAssignmentPreload,
+  type AssignmentPreloadWitness,
+} from './assignment-preload';
+import {
   parseRepoGrantRequest,
   repoGrantStatus,
   repoGrantSubject,
@@ -1032,7 +1042,8 @@ interface EzilWorkspacePersistRpc {
     fallbackMode: DesktopMode,
   ): Promise<RestartReport & { url?: string; appPreviewUrl?: string | null; codePreviewUrl?: string | null }>;
   /** `POST /sandbox/:name/repo-open` (`./repo-open.ts`). A running computer only; never starts one. */
-  repoOpen(request: RepoOpenRequest, root: RepoOpenRoot, grantSubject?: string): Promise<RepoOpenAnswer>;
+  repoOpen(request: RepoOpenRequest, root: RepoOpenRoot, grantSubject?: string,
+    preload?: AssignmentPreloadWitness): Promise<RepoOpenAnswer>;
   /** `POST /sandbox/:name/repo-grant` (`./repo-grant.ts`): refresh push access only. A running computer only. */
   repoGrant(request: RepoGrantRequest, root: RepoOpenRoot, subject: string): Promise<RepoGrantAnswer>;
 }
@@ -2841,9 +2852,20 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * in a shell session of its own (`ownSessionExec`), so a slow clone holds up
    * neither viewer traffic nor the probes in the default session.
    */
-  async repoOpen(request: RepoOpenRequest, root: RepoOpenRoot, grantSubject?: string): Promise<RepoOpenAnswer> {
+  async repoOpen(request: RepoOpenRequest, root: RepoOpenRoot, grantSubject?: string,
+    preload?: AssignmentPreloadWitness): Promise<RepoOpenAnswer> {
+    const started = Date.now();
+    const deps = this.repoOpenDeps();
     // An EZiL Git open with a scope also installs push access for `grantSubject` (`./repo-grant.ts`).
-    return repoOpenThenGrant(this.repoOpenDeps(), request, root, grantSubject);
+    const answer = await repoOpenThenGrant(deps, request, root, grantSubject);
+    if (!preload || !answer.ok || !answer.checkoutFolder || answer.status === 'created') return answer;
+    const checkout = answer.checkoutFolder;
+    const acknowledged = await this.withRuntimeMutation(async () => {
+      if (Date.now() - started + ASSIGNMENT_PRELOAD_TIMEOUT_MS >= request.timeoutMs
+        || !this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) return false;
+      return notifyAssignmentPreload(deps.exec, checkout, preload);
+    }).catch(() => false);
+    return acknowledged ? { ...answer, assignmentPreloadAcknowledged: true } : answer;
   }
   /** `POST /sandbox/:name/repo-grant`: rewrite this repository's /run grant only; never fetches or touches the folder. */
   async repoGrant(request: RepoGrantRequest, root: RepoOpenRoot, subject: string): Promise<RepoGrantAnswer> {
@@ -5583,8 +5605,8 @@ async function handleNativeSession(request: Request, env: Env, sandboxName: stri
  * sandbox), so a v1-signed open is refused outright with `hmac_v2_required`,
  * as `/internal/aws/tunnels` does. `preauthorizeV2` (top of `fetch`) has
  * already verified the signature over these exact body bytes and that the
- * claims name THIS sandbox. Cloudflare computers only: an AWS computer's
- * container is not reachable from here.
+ * claims name THIS sandbox. Cloudflare opens go to the sandbox. AWS opens
+ * use the enrolled host's narrow repository operation.
  *
  * The caller (the OS server) calls this only after `/sandbox/preview` has
  * answered for the computer, so the workspace is hydrated and the desktop up;
@@ -5601,11 +5623,16 @@ async function handleRepoOpen(request: Request, env: Env, sandboxName: string): 
     const registry = awsRegistryFor(env);
     const read = await readProjectFilesBody(request, REPO_OPEN_MAX_BODY_BYTES);
     if (!read.ok) return read.response;
-    return openAwsStandaloneRepo(request, v2, sandboxName, read.body, {
+    const assignmentEnabled = env.EZIL_PRODUCTION_ASSIGNMENT_PRELOAD === '1';
+    const body = assignmentEnabled ? read.body : splitAssignmentPreload(read.body).repoBody;
+    return openAwsStandaloneRepo(request, v2, sandboxName, body, {
       enabled: awsRoutingEnabled(env.AWS_ROUTING_ENABLED) && awsRoutingEnabled(env.AWS_STANDALONE_REPO_OPEN_ENABLED),
       zone: resolveAwsOriginZone(env),
       lookup: sid => registry ? lookupAwsTunnel(registry, sid) : Promise.resolve(null),
       fetch: (input, init) => fetch(input, init),
+      authorizeAssignment: assignmentEnabled
+        ? (input, op) => authorizeAssignmentPreload(input, op, env, new URL(request.url).origin)
+        : undefined,
     });
   }
   if (v2.provider !== 'cloudflare') {
@@ -5614,22 +5641,31 @@ async function handleRepoOpen(request: Request, env: Env, sandboxName: string): 
   const read = await readProjectFilesBody(request, REPO_OPEN_MAX_BODY_BYTES);
   if (!read.ok) return read.response;
   // os-staging also accepts git-qa.ezil.work (ordinary Builder-created projects, repo-open.ts `repoOpenRemotesFor`).
-  const parsed = parseRepoOpenRequest(read.body, Date.now(), repoOpenRemotesFor(env));
+  const { repoBody, preload } = splitAssignmentPreload(read.body);
+  const parsed = parseRepoOpenRequest(repoBody, Date.now(), repoOpenRemotesFor(env));
   if (!parsed.ok) return json({ ok: false, error: parsed.error }, repoOpenStatus(parsed.error));
   const root = repoOpenRoot(env);
   if (!root) {
     return json({ ok: false, error: 'repo_open_workspace_unavailable' }, repoOpenStatus('repo_open_workspace_unavailable'));
   }
+  const assignment = await authorizeAssignmentPreload(preload, parsed.request, env, new URL(request.url).origin);
   let answer: RepoOpenAnswer;
   try {
     // The subject binds this computer's push access for the repository to the v2 claims' user (`./repo-grant.ts`).
-    answer = await openSandbox(env, sandboxName).repoOpen(parsed.request, root,
-      parsed.request.privatePacket ? undefined : await repoGrantSubject(v2.userId));
+    const sandbox = openSandbox(env, sandboxName);
+    const subject = parsed.request.privatePacket ? undefined : await repoGrantSubject(v2.userId);
+    answer = assignment
+      ? await sandbox.repoOpen(parsed.request, root, subject, assignment.witness)
+      : await sandbox.repoOpen(parsed.request, root, subject);
   } catch {
     answer = { ok: false, error: 'repo_open_failed' };
   }
   if (!answer.ok) return json({ ok: false, error: answer.error }, repoOpenStatus(answer.error));
-  return json({ ok: true, folder: answer.folder, head: answer.head, status: answer.status });
+  const assignmentPreload = assignment && answer.assignmentPreloadAcknowledged === true
+    ? { eventId: assignment.witness.eventId, nonce: assignment.nonce, port: ASSIGNMENT_PRELOAD_PORT, status: 'acknowledged' }
+    : undefined;
+  return json({ ok: true, folder: answer.folder, head: answer.head, status: answer.status, assignmentPreload,
+    ...(assignmentPreload && answer.checkoutFolder ? {checkoutFolder:answer.checkoutFolder} : {}) });
 }
 
 /**
@@ -8059,6 +8095,12 @@ const worker = {
         return json({ ok: false, error: 'preview_hostname_outside_zone' }, 421);
       }
     }
+
+    const awsBrowserPort = url.hostname.startsWith('aws-')
+      ? parseAwsBrowserHost(url.hostname, resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT))?.port
+      : undefined;
+    const codeHost = awsBrowserPort === CODE_PREVIEW_PORT || parseBridgeHost(url.hostname)?.target === 'code';
+    if (isAssignmentPreloadForward(url, codeHost)) return json({ ok: false, error: 'not_found' }, 404);
 
     // 0) Option D bridge hostnames — app-preview (`<APP_PREVIEW_PORT>-<id>-app.<zone>`)
     //    AND code-server (`<CODE_PREVIEW_PORT>-<id>-code.<zone>`): handled

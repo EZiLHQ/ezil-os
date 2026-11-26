@@ -89,11 +89,11 @@ describe('standalone CLI v2 Worker open', () => {
     expect(JSON.parse(prepared.packet)).toEqual({ ...packet(), gitAccess: true });
     const output = JSON.stringify({ canonicalUrl: URL, folder: `/workspace/projects/${CHECKOUT}/os-code-url-20261110-a`,
       repository: packet().repository, identity: packet().identity, status: 'cloned' });
-    expect(parsePrivateCliOutput(output, request, root)).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned' });
+    expect(parsePrivateCliOutput(output, request, root)).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, checkoutFolder: `/workspace/projects/${CHECKOUT}/${URL.split('/').at(-1)!.slice(0,-4)}`, status: 'cloned' });
     let env: Record<string, string> | undefined;
     const result = await runRepoOpen(async (_command, options) => { env = options.env; return { exitCode: 0, stdout: output }; },
       request, root, async () => true, () => NOW);
-    expect(result).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned' });
+    expect(result).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, checkoutFolder: `/workspace/projects/${CHECKOUT}/${URL.split('/').at(-1)!.slice(0,-4)}`, status: 'cloned' });
     expect(env).toEqual({ EZIL_REPO_OPEN_CLI_PACKET: JSON.stringify({ ...packet(), gitAccess: true }) });
     expect(parsePrivateCliOutput(output.replace('/os-code-url-20261110-a', '/outside'), request, root)).toBeNull();
     expect(parsePrivateCliOutput(output.replace(`/workspace/projects/${CHECKOUT}/os-code-url-20261110-a`, `/workspace/projects/${CHECKOUT}`), request, root)).toBeNull();
@@ -118,7 +118,7 @@ describe('standalone CLI v2 Worker open', () => {
       expect(options.timeout).toBe(59_000);
       return { exitCode: 0, stdout: output };
     }, accepted(), root, undefined, () => NOW);
-    expect(answer).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned' });
+    expect(answer).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, checkoutFolder: `/workspace/projects/${CHECKOUT}/${URL.split('/').at(-1)!.slice(0,-4)}`, status: 'cloned' });
     expect(calls).toBe(2);
   });
   it('renews an existing checkout after the full staging allowance within the route budget', async () => {
@@ -144,7 +144,7 @@ describe('standalone CLI v2 Worker open', () => {
       expect(JSON.parse(options.env!.EZIL_REPO_OPEN_CLI_PACKET!)).toEqual({ ...packet(), gitAccess: true, refreshOnly: true });
       return { exitCode: 0, stdout: output };
     }, parsed.request, root, undefined, () => clock);
-    expect(answer).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'fetched' });
+    expect(answer).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, checkoutFolder: `/workspace/projects/${CHECKOUT}/repository`, status: 'fetched' });
     expect(calls).toBe(2);
   });
   it('fails closed before cloning when public runtime staging fails', async () => {

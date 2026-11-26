@@ -332,7 +332,7 @@ export interface RepoOpenRoot {
 export type RepoOpenStatus = 'cloned' | 'fetched' | 'created';
 
 export type RepoOpenAnswer =
-  | { ok: true; folder: string; head?: string; status: RepoOpenStatus }
+  | { ok: true; folder: string; head?: string; status: RepoOpenStatus; checkoutFolder?: string; assignmentPreloadAcknowledged?: true }
   | { ok: false; error: RepoOpenError | 'runtime_not_running' };
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
@@ -791,7 +791,7 @@ export function parsePrivateCliOutput(stdout: string, request: RepoOpenRequest, 
   const folder = `${root.path}/projects/${request.repositoryId}`;
   const name = request.canonicalURL.slice(request.canonicalURL.lastIndexOf('/') + 1, -4);
   if (value.folder !== `${folder}/${name}` && !(request.refreshOnly && value.folder === `${folder}/${REPO_OPEN_NESTED_DIR}`)) return null;
-  return { ok: true, folder, status: value.status === 'reused' ? 'fetched' : 'cloned' };
+  return { ok: true, folder, checkoutFolder: value.folder as string, status: value.status === 'reused' ? 'fetched' : 'cloned' };
 }
 
 export type RepoOpenExec = (

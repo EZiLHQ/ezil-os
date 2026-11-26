@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { authorizeAssignmentPreload } from './assignment-preload';
 import { openAwsStandaloneRepo, REPO_OPEN_DIAGNOSTIC_REASONS, type AwsRepoOpenDeps } from './aws-repo-open';
 import { verifyGatewayHeader, decodeControlKey, type AwsTunnelRecord } from './aws-origin';
 import type { PreviewTokenV2Claims } from './hmac';
@@ -64,6 +65,47 @@ describe('AWS standalone repository operation', () => {
    }
    const f = setup(); f.deps.enabled = false;
    expect((await f.run()).status).toBe(409); expect(f.calls).toHaveLength(0);
+ });
+ it('forwards only a scoped signed assignment and returns the nonce from the verified AWS host', async () => {
+   const attemptId = '44444444-4444-4444-8444-444444444444';
+   const eventId = '55555555-5555-4555-8555-555555555555';
+   const hash = async (value: string) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',
+     new TextEncoder().encode(value))), byte => byte.toString(16).padStart(2, '0')).join('');
+   const ownerSha256 = await hash(raw().privatePacket.identity.subject);
+   const canonicalURL = `https://github.ezil.work/default/u-${ownerSha256.slice(0, 16)}-a-${attemptId}.git`;
+   const id = (await hash(`ezil-os/repo-url/v1|${canonicalURL}`)).slice(0, 32).split('');
+   id[12] = '8'; id[16] = '89ab'[parseInt(id[16]!, 16) & 3]!;
+   const joined = id.join('');
+   const repositoryId = [joined.slice(0, 8), joined.slice(8, 12), joined.slice(12, 16), joined.slice(16, 20), joined.slice(20)].join('-');
+   const assignmentPreload = { eventId, attemptId, manifestSha256: 'f'.repeat(64), nonce: 'e'.repeat(64) };
+   const input = raw();
+   input.privatePacket.repository.canonicalURL = canonicalURL;
+   input.privatePacket.git.scope = 'write';
+   const payload = { ...input, repositoryId, assignmentPreload };
+   const folder = `/workspace/projects/${repositoryId}`;
+   const ack = { eventId, nonce: assignmentPreload.nonce, port: 5679, status: 'acknowledged' };
+   const qualified = { ok: true, folder, status: 'fetched',
+     checkoutFolder: folder + '/' + canonicalURL.split('/').at(-1)!.slice(0, -4), assignmentPreload: ack };
+   const configure = () => {
+     const f = setup();
+     f.deps.authorizeAssignment = (challenge, req) => authorizeAssignmentPreload(challenge, req,
+       { EZIL_PRODUCTION_ASSIGNMENT_PRELOAD: '1', EZIL_AI_GATEWAY_URL: 'https://ai.ezil.work' }, 'https://api-desktop.ezil.org');
+     return f;
+   };
+   const f = configure();
+   f.answers[1] = Response.json({ ...success, result: qualified });
+   expect(await (await f.run(payload)).json()).toEqual(qualified);
+   expect(JSON.parse(String(f.calls[0]!.init.body)).assignmentPreload).toMatchObject({
+     ...assignmentPreload, ownerSha256, canonicalURL, repositoryId, ref: 'refs/heads/main',
+   });
+   for (const bad of [success.result, { ...qualified, checkoutFolder: folder }, { ...qualified,
+     assignmentPreload: { ...ack, nonce: '0'.repeat(64) } }]) {
+     const rejected = configure(); rejected.answers[1] = Response.json({ ...success, result: bad });
+     expect((await rejected.run(payload)).status).toBe(502);
+   }
+   const unqualified = setup();
+   expect((await unqualified.run(payload)).status).toBe(400);
+   expect(unqualified.calls).toHaveLength(0);
  });
  it('checks placement before admission, every poll and after completed status', async () => {
    for (const badAt of [1, 2, 3]) {

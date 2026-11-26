@@ -5,8 +5,9 @@
  * the computer" is an assertion. The DO method's own running check and exec
  * are `repo-open.test.ts`'s; real git is `repo-open.git.test.ts`'s.
  */
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { describe, expect, it, mock } from 'bun:test';
+import { describe, expect, it, mock, spyOn } from 'bun:test';
 
 mock.module('cloudflare:workers', () => ({
   DurableObject: class {},
@@ -41,10 +42,10 @@ const claims = (patch: Partial<PreviewTokenV2Claims> = {}): PreviewTokenV2Claims
 });
 
 function fakeNamespace(answer: RepoOpenAnswer | (() => never) = { ok: true, folder: `/workspace/projects/${REPO}`, head: HEAD, status: 'cloned' }) {
-  const calls: Array<{ request: RepoOpenRequest; root: RepoOpenRoot }> = [];
+  const calls: Array<{ request: RepoOpenRequest; root: RepoOpenRoot; preload?: unknown }> = [];
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
     repoOpen: async (...args) => {
-      calls.push({ request: args[0] as RepoOpenRequest, root: args[1] as RepoOpenRoot });
+      calls.push({ request: args[0] as RepoOpenRequest, root: args[1] as RepoOpenRoot, preload: args[3] });
       return typeof answer === 'function' ? answer() : answer;
     },
   };
@@ -236,5 +237,187 @@ describe('POST /sandbox/:name/repo-open on the real route table', () => {
     const list = /const PUBLIC_ERROR_CODES = \[([\s\S]*?)\] as const;/.exec(source)![1]!;
     const codes = new Set([...list.matchAll(/'([^']+)'/g)].map((m) => m[1]));
     expect([...REPO_OPEN_ERRORS, 'runtime_not_running', 'hmac_v2_required'].filter((c) => !codes.has(c))).toEqual([]);
+  });
+});
+
+describe('staging assignment repo-open preload', () => {
+  const attemptId = '33ac68a4-750a-400b-a2ca-512e3975a849';
+  const eventId = '46fc47ce-b0af-4d4f-81b9-3b1f23c3061e';
+  const subject = 'auth0|assignment-fixture';
+  const digest = (value: string) => createHash('sha256').update(value).digest('hex');
+  const ownerSha256 = digest(subject);
+  const canonicalURL = `https://github.ezil.work/default/u-${ownerSha256.slice(0, 16)}-a-${attemptId}.git`;
+  const gitPassword = 'fixtureGitGrant0123456789';
+  const nonce = 'de'.repeat(32);
+  const manifestSha256 = 'ab'.repeat(32);
+  const challenge = { eventId, attemptId, nonce, manifestSha256 };
+  const ref = 'refs/heads/main';
+  const hex = digest(`ezil-os/repo-url/v1|${canonicalURL}`).slice(0, 32);
+  const folderId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-${'89ab'[parseInt(hex[16]!, 16) & 3]}${hex.slice(17, 20)}-${hex.slice(20)}`;
+  const stage = { EZIL_AI_GATEWAY_URL: 'https://ai-staging.ezil.work' };
+  const packet = () => ({
+    version: 2,
+    repository: { id: 'fixture1', canonicalURL, ref },
+    identity: { issuer: 'https://id.ezil.work/', subject },
+    git: { username: 'ezil', token: gitPassword, scope: 'write', expiresAt: new Date(Date.now() + 240_000).toISOString() },
+  });
+  const body = (patch: Record<string, unknown> = {}) => JSON.stringify({
+    repositoryId: folderId, privatePacket: packet(), assignmentPreload: challenge, ...patch,
+  });
+  const folder = `/workspace/projects/${folderId}`;
+  const checkoutFolder = folder + '/' + canonicalURL.split('/').at(-1)!.slice(0,-4);
+
+  it('only a matching signed assignment checkout can return the correlated empty-of-credentials ack', async () => {
+    const worker = await loadWorker();
+    const { binding, calls } = fakeNamespace({ ok: true, folder, checkoutFolder, status: 'cloned', assignmentPreloadAcknowledged: true });
+    const res = await worker.fetch(await signed({ signBody: body() }), env(binding, stage));
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(JSON.parse(text)).toEqual({ ok: true, folder, checkoutFolder, status: 'cloned',
+      assignmentPreload: { eventId, nonce, port: 5679, status: 'acknowledged' } });
+    expect(text).not.toContain(gitPassword);
+    expect(calls[0]?.preload).toEqual({ eventId, attemptId, ownerSha256, canonicalURL, repositoryId: folderId, ref, manifestSha256 });
+    expect(JSON.stringify(calls[0]?.preload)).not.toContain(nonce);
+  });
+
+  it('production opt-in binds the authenticated control host, production gateway and canonical owner packet', async () => {
+    const worker = await loadWorker();
+    const production = { EZIL_AI_GATEWAY_URL: 'https://ai.ezil.work', EZIL_PRODUCTION_ASSIGNMENT_PRELOAD: '1' };
+    const desk = 'https://api-desktop.ezil.org';
+    for (const [settings, origin, allowed] of [
+      [production, desk, true], [{ ...production, EZIL_PRODUCTION_ASSIGNMENT_PRELOAD:'0' }, desk, false],
+      [{ ...production, EZIL_AI_GATEWAY_URL:'https://ai-staging.ezil.work' }, desk, false],
+      [production, 'https://api-desktop-staging.ezil.work', false],
+    ] as const) {
+      const { binding, calls } = fakeNamespace({ ok:true, folder, checkoutFolder, status:'cloned', assignmentPreloadAcknowledged:true });
+      const res = await worker.fetch(await signed({ signBody:body(), url:origin + PATH }), env(binding,settings));
+      const response = await res.json() as { assignmentPreload?: unknown };
+      expect(!!response.assignmentPreload).toBe(allowed);
+      expect(!!calls[0]?.preload).toBe(allowed);
+    }
+  });
+
+  it('gates AWS assignment checkout on production authority and the enrolled host acknowledgment', async () => {
+    const worker = await loadWorker();
+    const { binding, calls } = fakeNamespace();
+    const userId = '11111111-1111-4111-8111-111111111111';
+    const computerId = '22222222-2222-4222-8222-222222222222';
+    const sandboxId = 'guac-1111111111114111-2222222222224222';
+    const path = `/sandbox/${sandboxId}/repo-open`;
+    const record = { computerId, sandboxId, generation: 2, leaseEpoch: 4, originVerified: true, controlKey: btoa('k'.repeat(32)) };
+    const request = (origin = 'https://api-desktop.ezil.org') => signed({
+      claims: claims({ userId, computerId, sandboxId, provider: 'aws-ec2', generation: 2, leaseEpoch: 4 }),
+      path, url: origin + path, signBody: body(),
+    });
+    const routes = {
+      AWS_ROUTING_ENABLED: 'on', AWS_STANDALONE_REPO_OPEN_ENABLED: 'on',
+      AWS_ORIGIN_ZONE: 'ezil.org', AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.org',
+      AWS_TUNNELS: { idFromName: (id: string) => id, get: () => ({ fetch: async () => Response.json({ record }) }) },
+    };
+    const production = { EZIL_AI_GATEWAY_URL: 'https://ai.ezil.work', EZIL_PRODUCTION_ASSIGNMENT_PRELOAD: '1' };
+    const ordinary = { ok: true, folder, status: 'cloned' };
+    const qualified = { ...ordinary, checkoutFolder,
+      assignmentPreload: { eventId, nonce, port: 5679, status: 'acknowledged' } };
+    let result = ordinary;
+    const host = spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => init?.method === 'POST'
+      ? Response.json({ ok: true, state: 'running' }, { status: 202 })
+      : Response.json({ ok: true, state: 'done', result }));
+    try {
+      for (const [origin, gateway] of [
+        ['https://api-desktop-staging.ezil.work', production.EZIL_AI_GATEWAY_URL],
+        ['https://api-desktop.ezil.org', 'https://ai-staging.ezil.work'],
+      ]) {
+        const refused = await worker.fetch(await request(origin), env(binding, { ...routes, ...production, EZIL_AI_GATEWAY_URL: gateway }));
+        expect(refused.status).toBe(400);
+        expect(host).not.toHaveBeenCalled();
+      }
+
+      const disabled = await worker.fetch(await request(), env(binding, { ...routes, ...production, EZIL_PRODUCTION_ASSIGNMENT_PRELOAD: '0' }));
+      expect(await disabled.json()).toEqual(ordinary);
+      expect(JSON.parse(String(host.mock.calls[0]![1]?.body))).not.toHaveProperty('assignmentPreload');
+      host.mockClear();
+
+      const missingAck = await worker.fetch(await request(), env(binding, { ...routes, ...production }));
+      expect(missingAck.status).toBe(502);
+      host.mockClear();
+
+      result = qualified;
+      const response = await worker.fetch(await request(), env(binding, { ...routes, ...production }));
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(JSON.parse(text)).toEqual(qualified);
+      expect(text).not.toContain(gitPassword);
+      expect(calls).toHaveLength(0);
+      expect(host.mock.calls.map(([, init]) => init?.method)).toEqual(['POST', 'GET']);
+      const [target, init] = host.mock.calls[0]!;
+      expect(new URL(String(target)).hostname).toBe(`c-${sandboxId}-g2-e4.ezil.org`);
+      expect(JSON.parse(String(init?.body)).assignmentPreload).toEqual({
+        eventId, attemptId, nonce, ownerSha256, canonicalURL, repositoryId: folderId, ref, manifestSha256,
+      });
+    } finally {
+      host.mockRestore();
+    }
+  });
+
+  it('keeps Code open when the runtime has no loopback ack; no inferred receipt from a repo or a port', async () => {
+    const worker = await loadWorker();
+    const { binding, calls } = fakeNamespace({ ok: true, folder, status: 'fetched' });
+    const res = await worker.fetch(await signed({ signBody: body() }), env(binding, stage));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, folder, status: 'fetched' });
+    expect(calls[0]?.preload).toBeDefined();
+  });
+
+  it('ordinary, non-stage, mismatched, read-only, refresh and malformed requests never signal preload', async () => {
+    const worker = await loadWorker();
+    const base = packet();
+    const alternatives: Array<[string, Record<string, string>]> = [
+      [BODY, stage],
+      [body({ assignmentPreload: undefined }), stage],
+      [body(), { EZIL_AI_GATEWAY_URL: 'https://ai.ezil.work' }],
+      [body({ assignmentPreload: { ...challenge, attemptId: eventId } }), stage],
+      [body({ assignmentPreload: { ...challenge, nonce: 'short' } }), stage],
+      [body({ assignmentPreload: { ...challenge, executable: true } }), stage],
+      [body({ privatePacket: { ...base, identity: { ...base.identity, subject: 'auth0|different' } } }), stage],
+      [body({ privatePacket: { ...base, repository: { ...base.repository, ref: 'refs/heads/ordinary' } } }), stage],
+      [body({ privatePacket: { ...base, git: { ...base.git, scope: 'read' } } }), stage],
+      [body({ repositoryId: REPO }), stage],
+      [body({ refreshOnly: true }), stage],
+    ];
+    for (const [value, settings] of alternatives) {
+      const { binding, calls } = fakeNamespace();
+      const res = await worker.fetch(await signed({ signBody: value }), env(binding, settings));
+      expect(res.status).toBe(200);
+      expect(await res.json()).not.toHaveProperty('assignmentPreload');
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.preload).toBeUndefined();
+    }
+  });
+
+  it('refuses a modified signed challenge before the runtime is reached', async () => {
+    const worker = await loadWorker();
+    const { binding, calls } = fakeNamespace();
+    const signBody = body();
+    const res = await worker.fetch(await signed({ signBody, sendBody: signBody.replace(nonce, 'ff'.repeat(32)) }), env(binding, stage));
+    expect(res.status).toBe(401);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('never forwards the reserved port through direct or nested Code HTTP and websocket entries', async () => {
+    const worker = await loadWorker();
+    const { binding } = fakeNamespace();
+    for (const target of [
+      'https://5679-guac-user1-comp1-code.ezil.org/',
+      'https://aws-5679-guac-user1-comp1-aws.ezil.org/',
+      'https://8443-guac-user1-comp1-code.ezil.org/proxy/5679/',
+      'https://8443-guac-user1-comp1-code.ezil.org/preview/absproxy/%35%36%37%39/',
+      'https://aws-8443-guac-user1-comp1-aws.ezil.org/preview/proxy/5679/',
+    ]) {
+      for (const upgrade of [false, true]) {
+        const res = await worker.fetch(new Request(target, { headers: upgrade ? { upgrade: 'websocket' } : {} }), env(binding));
+        expect(res.status).toBe(404);
+        expect(await res.json()).toEqual({ ok: false, error: 'not_found' });
+      }
+    }
   });
 });

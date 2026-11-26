@@ -4,7 +4,11 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const directory = dirname(fileURLToPath(import.meta.url));
-const files = [['stage.py', 'REPO_OPEN_STAGE'], ['supervise.py', 'REPO_OPEN_SUPERVISOR']];
+const files = [
+  ['stage.py', 'REPO_OPEN_STAGE'],
+  ['supervise.py', 'REPO_OPEN_SUPERVISOR'],
+  ['assignment-preload.py', 'ASSIGNMENT_PRELOAD'],
+];
 const lines = ['/** Generated from worker/repo-open/*.py; run `node worker/repo-open/generate.mjs`. */'];
 for (const [name, label] of files) {
   const bytes = fs.readFileSync(join(directory, name));

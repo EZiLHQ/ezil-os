@@ -58,6 +58,27 @@ def repo_layout_lock(root, repository_id, run_dir='/run/ezil'):
         raise
 
 
+def checked_assignment_terminal(folder, name):
+    """Permit only previously installed platform terminal settings beside the protected checkout."""
+    if not re.fullmatch(r'u-[a-f0-9]{16}-a-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', name):
+        return False
+    expected = (json.dumps({"terminal.integrated.cwd": os.path.join(folder, name),
+                            "terminal.integrated.splitCwd": "initial"}, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    try:
+        directory = os.open(os.path.join(folder, '.vscode'), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if os.listdir(directory) != ['settings.json']:
+                return False
+            fd = os.open('settings.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            with os.fdopen(fd, 'rb') as contents:
+                mode = os.fstat(fd).st_mode
+                return stat.S_ISREG(mode) and not mode & 0o111 and contents.read(len(expected) + 1) == expected
+        finally:
+            os.close(directory)
+    except OSError:
+        return False
+
+
 def repo_command(root, repository_id, url, hydrated, expected_sha, expected_version,
                  pin_path='/run/ezil/bin/cli-pin.json', cli_path='/run/ezil/bin/ezil',
                  installed_pin_path='/run/ezil/bin/installed-pin.json', owner=0, refresh_only=False):
@@ -81,6 +102,8 @@ def repo_command(root, repository_id, url, hydrated, expected_sha, expected_vers
     if '.git' in entries:
         raise RepoFailure('repo_open_folder_conflict')  # Code must never open the checkout as its workspace root.
     name = url.rsplit('/', 1)[1][:-4]
+    if '.vscode' in entries and checked_assignment_terminal(folder, name):
+        entries.remove('.vscode')
     if entries <= {name}:
         destination = os.path.join(folder, name)
     elif entries == {'repository'}:

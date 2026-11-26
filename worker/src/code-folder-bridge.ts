@@ -10,7 +10,10 @@
  * What the editor tells the shell (shell/ezil/apps/code-folder.js), and to whom:
  *   - only when framed, only to the OS shell that frames this realm's editors (`codeShellOriginsFor`: one exact
  *     origin per preview zone), never with a `*` target;
- *   - `ezil.code.ready` {v:1} once at load, so the shell says hello;
+ *   - `ezil.code.ready` {v:1} once when the bridge is listening, so the shell says hello;
+ *   - `ezil.code.workbench` {v:1, nonce, mint, kind:"folder", path} in reply to an opt-in hello for this mint,
+ *     after code-server constructs its Monaco workbench and editor group. The folder reply above remains a
+ *     document/address observation. It can arrive even when the workbench fails to start;
  *   - `ezil.code.folder` {v:1, nonce, mint, kind, path?, base?} only in answer to a hello whose source is
  *     window.parent, whose origin is allowed and whose nonce is 22 base64url characters. `kind` is `folder` (a path
  *     on this computer: code-server's `folder=` that starts with `/`), `workspace`, `foreign` (another scheme) or
@@ -184,6 +187,34 @@ function focusRepository(folder, name) {
 }
 `;
 
+// The preview document's static HTML does not contain these views. The workbench creates the root and its
+// editor group during initialization and marks completion after restoring its editors. An empty editor group also accepts normal Code actions, so this works
+// with both a restored file and an empty but usable workspace. Never send this from document load or URL echo.
+const WORKBENCH_READY_SCRIPT = String.raw`
+let workbenchNonce=null, workbenchObserver=null, workbenchExpiry=null;
+function stopWorkbenchObservation() {
+  clearInterval(workbenchObserver);
+  clearTimeout(workbenchExpiry);
+  workbenchObserver=null;
+}
+function observeWorkbench(source, origin, nonce) {
+  if (nonce===workbenchNonce) return;
+  workbenchNonce=nonce;
+  stopWorkbenchObservation();
+  const report=()=>{
+    const editor=document.querySelector(".monaco-workbench .part.editor .editor-group-container");
+    if (!editor?.isConnected || !editor.querySelector(".title") ||
+        !performance.getEntriesByName("code/didStartWorkbench","mark").length) return;
+    stopWorkbenchObservation();
+    try { source.postMessage({type:"ezil.code.workbench",v:1,nonce,mint,kind:"folder",path:here.path},origin); } catch {}
+  };
+  workbenchObserver=setInterval(report,125);
+  workbenchExpiry=setTimeout(stopWorkbenchObservation,80000);
+  report();
+}
+addEventListener("pagehide",stopWorkbenchObservation,{once:true});
+`;
+
 const ORIGIN_RE = /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 /** A CSP nonce as code-server writes it (a UUID today); anything else is not copied into an attribute. */
 const NONCE_RE = /^[A-Za-z0-9+/=_-]{8,128}$/;
@@ -223,9 +254,10 @@ export function codeFolderBridgeScript(origins: readonly string[]): string {
     + `let mint=null;try{const m=new URLSearchParams(location.search).get("ezil_mint");mint=m&&T.test(m)?m:null}catch{}`
     + `const tell=(m)=>{for(const o of O){try{window.parent.postMessage(m,o)}catch{}}};`
     + REPOSITORY_FOCUS_SCRIPT
+    + WORKBENCH_READY_SCRIPT
     + `let repositoryFocusStarted=false;const pending=new Map();`
     + `addEventListener("message",ev=>{try{const d=ev.data;if(ev.source!==window.parent||!O.includes(ev.origin)||!d||typeof d!=="object"||d.v!==1)return;`
-    + `if(d.type==="ezil.code.hello"&&typeof d.nonce==="string"&&T.test(d.nonce)){ev.source.postMessage({type:"ezil.code.folder",v:1,nonce:d.nonce,mint,...here},ev.origin);if(!repositoryFocusStarted&&mint!==null&&d.mint===mint&&here.kind==="folder"&&d.repositoryFocus?.folder===here.path)repositoryFocusStarted=focusRepository(here.path,d.repositoryFocus.name);return}`
+    + `if(d.type==="ezil.code.hello"&&typeof d.nonce==="string"&&T.test(d.nonce)){ev.source.postMessage({type:"ezil.code.folder",v:1,nonce:d.nonce,mint,...here},ev.origin);if(!repositoryFocusStarted&&mint!==null&&d.mint===mint&&here.kind==="folder"&&d.repositoryFocus?.folder===here.path)repositoryFocusStarted=focusRepository(here.path,d.repositoryFocus.name);if(d.workbenchReady===true&&mint!==null&&d.mint===mint&&here.kind==="folder")observeWorkbench(ev.source,ev.origin,d.nonce);return}`
     + `if(d.type==="ezil.code.go"&&typeof d.id==="string"&&pending.has(d.id)){const p=pending.get(d.id);pending.delete(d.id);clearTimeout(p.t);location.replace(p.url)}}catch{}});`
     + `const nav=window.navigation;if(nav&&typeof nav.addEventListener==="function"){nav.addEventListener("navigate",e=>{try{`
     + `if(e.navigationType!=="push"||!e.cancelable||e.hashChange||e.downloadRequest)return;`
