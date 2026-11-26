@@ -1,7 +1,7 @@
-import { createHash } from 'node:crypto';
 import { createTRPCContext } from '@/server/api/trpc';
 import { retainedIdentity } from '@/server/auth/retained-identity';
 import { recordingAction } from '@/server/assignment-video/broker';
+import { assignmentStageTag } from '@/server/assignment-video/stage-tag';
 import { boundedJson, BrokerError, creatorUnlinked, osOrigin, requestSchema, universeOrigin } from '@/server/assignment-video/contract';
 import { shellJson, shellUnauthenticated } from '@/server/shell/http';
 import { expectedRepositoryURL } from '@/server/git/assignment-enrollment';
@@ -49,7 +49,7 @@ export async function POST(req: Request) {
         const input = parsed.data;
         if (input.action === 'preflight' || input.action === 'begin' || input.action === 'editor-ready') {
             diagnostic = {event:'assignment.workspace.broker.'+input.action,
-                attemptTag:createHash('sha256').update('ezil.assignment.stage.v1\0').update(input.attemptId).digest('hex').slice(0,16)};
+                attemptTag:assignmentStageTag(input.attemptId)};
         }
         const identity = await retainedIdentity(ctx.user.id).catch(() => null);
         if (!identity) return finish(fail('identity_refresh_required',401),'identity_refresh_required');
