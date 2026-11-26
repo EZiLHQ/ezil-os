@@ -264,9 +264,13 @@ it.each(['pool-provision', 'pool-retire'] as const)('authenticates and echoes th
     // subscriber demand (aws-pool-dispatch.ts provisionEligible); retire needs neither.
     const demand = (standard: number) => ({ opens: 0, standard, premium: 0, boot_minutes: null, spares: 0, vcpu: 0, idle_ready: [], booting: [] });
     let eligible = 1;
+    let operatorTablePresent: unknown = false;
     const { PgDialect } = await import('drizzle-orm/pg-core');
-    execute.mockImplementation(async (q: Parameters<InstanceType<typeof PgDialect>['sqlToQuery']>[0]) =>
-        new PgDialect().sqlToQuery(q).sql.includes('FROM public.ezil_compute_pool_hosts WHERE id =') ? [host] : [demand(eligible)]);
+    execute.mockImplementation(async (q: Parameters<InstanceType<typeof PgDialect>['sqlToQuery']>[0]) => {
+        const text = new PgDialect().sqlToQuery(q).sql;
+        if (text.includes("to_regclass('public.ezil_operator_entitlements')")) return [{ present: operatorTablePresent }];
+        return text.includes('FROM public.ezil_compute_pool_hosts WHERE id =') ? [host] : [demand(eligible)];
+    });
     vi.stubEnv('EZIL_AWS_LIFECYCLE_DEPLOYMENTS', JSON.stringify({ [i.deployment.region]: i.deployment }));
     vi.stubEnv('AWS_REGIONS', i.deployment.region);
     vi.stubEnv(`EZIL_AWS_MAX_RUNNING_${i.deployment.region.toUpperCase().replace(/-/g, '_')}`, '5');
@@ -276,7 +280,15 @@ it.each(['pool-provision', 'pool-retire'] as const)('authenticates and echoes th
     const res = await POST(request(JSON.stringify(a)));
     expect(res.status).toBe(200); expect(await res.json()).toEqual({ authorized: true, ...a });
     for (const patch of [{ poolGeneration: 2 }, { operation: undefined }, { poolHostId: undefined }, { imageJobId: i.jobId, imageJobPhase: 'launch' }])
-        expect((await POST(request(JSON.stringify({ ...a, ...patch })))).status).toBe(403);    if (operation === 'pool-provision') {
+        expect((await POST(request(JSON.stringify({ ...a, ...patch })))).status).toBe(403);
+    if (operation === 'pool-provision') {
+        // A signed durable job still cannot authorize provisioning when operator-policy availability is unknown.
+        // String "false", null and missing are malformed probes, never verified absence or paid demand.
+        for (const malformed of ['false', null, undefined]) {
+            operatorTablePresent = malformed;
+            expect((await POST(request(JSON.stringify(a)))).status).toBe(503);
+        }
+        operatorTablePresent = false;
         // No eligible active subscriber: the same exact durable provision is refused.
         eligible = 0;
         expect((await POST(request(JSON.stringify(a)))).status).toBe(403);
