@@ -65,12 +65,12 @@ export const clockState = clockDetails.extend({
         && pause <= Date.parse(state.serverNow) && state.pauseReason !== null;
 });
 /**
- * The work clock a Universe that manages a preparation window (`editorReadySupported`) answers `editor-ready` with: it
- * starts at that signed call, or at the end of the preparation window, and never runs longer than the hour. That
- * Universe may send the full `clockState` instead; the pause and revision fields are then kept as it sent them.
+ * The bare work clock a Universe that manages a preparation window (`editorReadySupported`) may answer `editor-ready`
+ * with: it starts at that signed call, or at the end of the preparation window, and is never longer than the hour.
+ * A clock the server paused and extended is longer than that, and is accepted only as the complete `clockState`
+ * above (its revision, pause and remaining time all stated), never from these three fields.
  */
 export const editorReadyClock = z.object({
-    ...clockDetails.partial().shape,
     startedAt: moment, deadlineAt: moment, serverNow: moment,
 }).refine(clock => {
     const start = Date.parse(clock.startedAt);

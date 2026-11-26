@@ -16,6 +16,12 @@ const free = { enabled: true, plan: { sku: 'free_v3', status: 'active' } };
 // The webhook-backed plan as the server sends it: the SKU and a paid standing (the SKU alone is not access).
 const matching = { enabled: true, plan: { sku: STANDARD, status: 'active' }, computer: { standing: 'paid' } };
 const completed = (paymentStatus: unknown, sku: unknown = STANDARD) => ({ status: 'complete', paymentStatus, sku });
+const topupReceipt = (fulfillment = 'processing', overrides: object = {}) => ({
+    status: 'complete', paymentStatus: 'paid', fulfillment, credits: 1000, ...overrides,
+});
+const refusal = (httpStatus = 404, code = 'NOT_FOUND', message = 'unknown_checkout') => new Response(JSON.stringify({
+    error: { json: { message, code: httpStatus === 404 ? -32004 : -32600, data: { code, httpStatus } } },
+}), { status: httpStatus });
 const deferred = <T>() => {
     let resolve!: (value: T) => void;
     const promise = new Promise<T>(done => { resolve = done; });
@@ -27,6 +33,7 @@ let dom: { window: Window & typeof globalThis };
 let root: Root | null;
 let target: HTMLElement;
 let reads: Read[];
+let topup: (sessionId: string) => unknown | Promise<unknown>;
 let status: (sessionId: string) => unknown | Promise<unknown>;
 let summary: () => unknown | Promise<unknown>;
 let fetchMock: ReturnType<typeof vi.fn<typeof fetch>>;
@@ -49,7 +56,7 @@ async function checkAgain() {
 function assertReadOnly() {
     expect(fetchMock.mock.calls.length).toBeGreaterThan(0);
     for (const read of reads) {
-        expect(['billing.checkoutStatus', 'billing.summary']).toContain(read.procedure);
+        expect(['billing.topupStatus', 'billing.checkoutStatus', 'billing.summary']).toContain(read.procedure);
         expect(read.method).toBe('GET');
         expect(read.cache).toBe('no-store');
         expect(read.credentials).toBe('same-origin');
@@ -57,7 +64,7 @@ function assertReadOnly() {
     // Include replies supplied by mockResolvedValueOnce, which bypass the
     // default mock implementation's data selection and read bookkeeping.
     for (const [input, init] of fetchMock.mock.calls) {
-        expect(new URL(String(input), dom.window.location.href).pathname).toMatch(/^\/api\/trpc\/billing\.(checkoutStatus|summary)$/);
+        expect(new URL(String(input), dom.window.location.href).pathname).toMatch(/^\/api\/trpc\/billing\.(topupStatus|checkoutStatus|summary)$/);
         expect(init?.method ?? 'GET').toBe('GET');
         expect(init?.cache).toBe('no-store');
         expect(init?.credentials).toBe('same-origin');
@@ -77,6 +84,7 @@ beforeEach(async () => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     target = dom.window.document.querySelector('main')!;
     reads = [];
+    topup = () => refusal();
     status = () => completed('unpaid');
     summary = () => free;
     fetchMock = vi.fn<typeof fetch>(async (input, init) => {
@@ -85,7 +93,9 @@ beforeEach(async () => {
         const params = JSON.parse(url.searchParams.get('input') ?? '{}');
         const sessionId = params.json?.sessionId;
         reads.push({ procedure, sessionId, signal: init?.signal, method: init?.method ?? 'GET', cache: init?.cache, credentials: init?.credentials });
-        const data = procedure === 'billing.checkoutStatus' ? await status(sessionId) : await summary();
+        const data = procedure === 'billing.topupStatus' ? await topup(sessionId)
+            : procedure === 'billing.checkoutStatus' ? await status(sessionId) : await summary();
+        if (data instanceof Response) return data;
         return new Response(JSON.stringify({ result: { data: { json: data } } }), { status: 200 });
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -378,7 +388,7 @@ describe('Checkout return payment and plan confirmation', () => {
         summary = () => matching;
         await checkAgain();
         expect(active()).toBe(true);
-        expect(reads.slice(before).map(read => read.procedure)).toEqual(['billing.checkoutStatus', 'billing.summary']);
+        expect(reads.slice(before).map(read => read.procedure)).toEqual(['billing.topupStatus', 'billing.checkoutStatus', 'billing.summary']);
         expect(reads.filter(read => read.procedure === 'billing.checkoutStatus').every(read => read.sessionId === 'cs_test_return')).toBe(true);
         assertReadOnly();
     });
@@ -483,5 +493,236 @@ describe('Checkout return payment and plan confirmation', () => {
         expect(count('billing.summary')).toBe(2);
         expect(reads.filter(read => read.procedure === 'billing.checkoutStatus').map(read => read.sessionId))
             .toEqual(['cs_old', 'cs_new', 'cs_old']);
+    });
+});
+
+describe('Checkout return AI-credit fulfillment', () => {
+    beforeEach(() => {
+        topup = () => topupReceipt();
+        summary = () => ({ ...matching, ai: { account: { remainingMicro: '1234567890' } } });
+    });
+
+    afterEach(() => {
+        expect(count('billing.checkoutStatus')).toBe(0);
+        expect(reads.filter(read => read.procedure === 'billing.topupStatus').every(read => read.sessionId === 'cs_test_return')).toBe(true);
+    });
+
+    it('regression: a credited top-up shows credits and balance, never Waiting for your plan to update', async () => {
+        // The old page compared this credit-pack SKU to the plan and waited forever after delivery.
+        status = () => completed('paid', 'ai_credits_1000');
+        topup = () => topupReceipt('credited');
+        await render();
+        expect(text()).toBe('1,000 AI credits added. Your balance is now 1,234 credits.Back to Billing');
+        expect(text()).not.toContain('Waiting for your plan to update');
+        expect(count('billing.topupStatus')).toBe(1);
+        expect(count('billing.summary')).toBe(1);
+        const before = reads.length;
+        await tick(60_000);
+        expect(reads).toHaveLength(before);
+        expect(vi.getTimerCount()).toBe(0);
+        expect(target.querySelector('a')?.getAttribute('href')).toBe('/os?settings=billing');
+    });
+
+    it('processing transitions to credited only after server-confirmed fulfillment', async () => {
+        await render();
+        expect(text()).toBe('Payment received. Adding your AI credits…Back to Billing');
+        expect(count('billing.summary')).toBe(0);
+        topup = () => topupReceipt('awaiting_payment');
+        await tick(2000);
+        expect(text()).toBe('Payment received. Adding your AI credits…Back to Billing');
+        topup = () => topupReceipt('credited');
+        await tick(2000);
+        expect(text()).toContain('1,000 AI credits added. Your balance is now 1,234 credits.');
+        expect(count('billing.topupStatus')).toBe(3);
+        expect(count('billing.summary')).toBe(1);
+    });
+
+    it('review stops polling and explains that another payment is unnecessary', async () => {
+        topup = () => topupReceipt('review');
+        await render();
+        expect(text()).toBe("Payment received, but your credits couldn't be added automatically. You don't need to pay again. Contact support if they don't appear soon.Back to Billing");
+        await tick(60_000);
+        expect(count('billing.topupStatus')).toBe(1);
+        expect(count('billing.summary')).toBe(0);
+        expect(target.querySelector('button')).toBeNull();
+    });
+
+    it('expired stops polling and confirms no charge', async () => {
+        topup = () => topupReceipt('awaiting_payment', { status: 'expired', paymentStatus: 'unpaid', credits: null });
+        await render();
+        expect(text()).toBe('This checkout expired before payment, so you were not charged. Return to Billing to try again.Back to Billing');
+        await tick(60_000);
+        expect(count('billing.topupStatus')).toBe(1);
+        expect(count('billing.summary')).toBe(0);
+    });
+
+    it('an incomplete top-up waits in credit words and never mentions a plan', async () => {
+        topup = () => topupReceipt('awaiting_payment', { status: 'pending', paymentStatus: 'unpaid', credits: null });
+        await render();
+        expect(text()).toBe('Payment confirmation is pending. Your AI credits update after payment is confirmed.Back to Billing');
+        expect(text()).not.toMatch(/plan/i);
+        expect(count('billing.summary')).toBe(0);
+    });
+
+    it.each(['unpaid', null, 'no_payment_required'])('paymentStatus=%s waits for bank confirmation before claiming credits', async paymentStatus => {
+        topup = () => topupReceipt('awaiting_payment', { paymentStatus, credits: null });
+        await render();
+        expect(text()).toBe('Your payment is processing. Bank payments can take a few days. Your AI credits update after payment is confirmed.Back to Billing');
+        expect(count('billing.summary')).toBe(0);
+        await tick(60_000);
+        expect(text()).not.toMatch(/Payment received|credits added/);
+    });
+
+    it('a session the server never classified stays neutral at the deadline: no plan, no credits', async () => {
+        topup = () => new Promise(() => {});
+        await render();
+        await tick(60_000);
+        expect(text()).toBe('Payment confirmation is pending. Check Settings → Billing for updates.Check againBack to Billing');
+        expect(text()).not.toMatch(/plan|credit/i);
+        expect(count('billing.summary')).toBe(0);
+    });
+
+    it('the paid deadline offers Check again, reclassifies, and recovers to credited', async () => {
+        await render();
+        await tick(60_000);
+        expect(target.querySelector('h1')?.textContent).toBe("Payment received, but we couldn't confirm your AI credits yet. You don't need to pay again. Check Settings → Billing for your balance, and contact support if the credits don't appear.");
+        const before = reads.length;
+        expect(reads.every(read => read.signal?.aborted)).toBe(true);
+        await tick(60_000);
+        expect(reads).toHaveLength(before);
+        topup = () => topupReceipt('credited');
+        await checkAgain();
+        expect(text()).toContain('1,000 AI credits added. Your balance is now 1,234 credits.');
+        expect(reads.slice(before).map(read => read.procedure)).toEqual(['billing.topupStatus', 'billing.summary']);
+        expect(target.querySelector('button')).toBeNull();
+    });
+
+    it('summary read failure after credited preserves added and stops polling', async () => {
+        topup = () => topupReceipt('credited');
+        summary = () => { throw new Error('offline'); };
+        await render();
+        expect(text()).toBe('1,000 AI credits added. Check your AI credits in Billing.Back to Billing');
+        await tick(60_000);
+        expect(count('billing.topupStatus')).toBe(1);
+        expect(count('billing.summary')).toBe(1);
+        expect(target.querySelector('button')).toBeNull();
+    });
+
+    it.each([null, undefined, '1000', 1.5, Number.MAX_SAFE_INTEGER + 1, 0, -1000, Number.NaN])('unreadable credit amount %s retains confirmed delivery', async credits => {
+        topup = () => topupReceipt('credited', { credits });
+        await render();
+        expect(text()).toBe('Your AI credits were added. Your balance is now 1,234 credits.Back to Billing');
+    });
+
+    it.each([
+        ['0', '0'], ['999999', '0'], ['0001000000', '1'], ['9007199254740993999999', '9,007,199,254,740,993'],
+    ])('balance %s micro is floored and formatted exactly', async (remainingMicro, expected) => {
+        topup = () => topupReceipt('credited');
+        summary = () => ({ ai: { account: { remainingMicro } } });
+        await render();
+        expect(text()).toContain(`Your balance is now ${expected} credits.`);
+    });
+
+    it.each([undefined, null, '', '-1000000', '1.5', '1e6', ' 1000000', '1000000\n', 1000000])('unreadable balance %s keeps added with a Billing fallback', async remainingMicro => {
+        topup = () => topupReceipt('credited');
+        summary = () => ({ ai: { account: { remainingMicro } } });
+        await render();
+        expect(text()).toBe('1,000 AI credits added. Check your AI credits in Billing.Back to Billing');
+    });
+
+    it('a hung balance read cannot undo added at the deadline or with a late response', async () => {
+        const pending = deferred<unknown>();
+        topup = () => topupReceipt('credited');
+        summary = () => pending.promise;
+        await render();
+        expect(text()).toBe('1,000 AI credits added.Back to Billing');
+        await tick(60_000);
+        expect(reads.at(-1)?.signal?.aborted).toBe(true);
+        expect(text()).toBe('1,000 AI credits added. Check your AI credits in Billing.Back to Billing');
+        await act(async () => { pending.resolve({ ai: { account: { remainingMicro: '2000000' } } }); await settle(); });
+        expect(text()).toBe('1,000 AI credits added. Check your AI credits in Billing.Back to Billing');
+        expect(target.querySelector('button')).toBeNull();
+    });
+
+    it('a classified top-up never falls back to plan reads after a later refusal', async () => {
+        await render();
+        topup = () => refusal();
+        await tick(2000);
+        expect(text()).toContain('Payment received. Adding your AI credits…');
+        expect(text()).toContain('We could not check for updates right now. We’ll keep checking.');
+        await tick(58_000);
+        expect(text()).toContain("we couldn't confirm your AI credits yet");
+        expect(count('billing.summary')).toBe(0);
+    });
+
+    it('unmount aborts classification and ignores a late credited response', async () => {
+        const pending = deferred<unknown>();
+        topup = () => pending.promise;
+        await render();
+        const signal = reads[0].signal;
+        await act(async () => { root!.unmount(); root = null; await settle(); });
+        expect(signal?.aborted).toBe(true);
+        expect(vi.getTimerCount()).toBe(0);
+        await act(async () => { pending.resolve(topupReceipt('credited')); await settle(); });
+        expect(count('billing.summary')).toBe(0);
+    });
+});
+
+describe('Checkout return server classification', () => {
+    it('Check again resets top-up classification before a subscription refusal', async () => {
+        topup = () => topupReceipt();
+        await render();
+        await tick(60_000);
+        topup = () => refusal();
+        status = () => completed('paid');
+        summary = () => matching;
+        const before = reads.length;
+        await checkAgain();
+        expect(text()).toBe('Your plan is active.Back to Billing');
+        expect(reads.slice(before).map(read => read.procedure)).toEqual(['billing.topupStatus', 'billing.checkoutStatus', 'billing.summary']);
+    });
+
+    it.each([[404, 'NOT_FOUND'], [400, 'BAD_REQUEST']])('HTTP %s unknown_checkout runs the unchanged subscription flow once classified', async (httpStatus, code) => {
+        topup = () => refusal(httpStatus as number, code as string);
+        status = () => completed('paid');
+        await render();
+        expect(text()).toBe('Payment received. Waiting for your plan to update.Back to Billing');
+        expect(reads.map(read => read.procedure)).toEqual(['billing.topupStatus', 'billing.checkoutStatus', 'billing.summary']);
+        await tick(2000);
+        expect(count('billing.topupStatus')).toBe(1);
+        expect(count('billing.checkoutStatus')).toBe(2);
+        expect(count('billing.summary')).toBe(2);
+        summary = () => matching;
+        await tick(2000);
+        expect(text()).toBe('Your plan is active.Back to Billing');
+        expect(count('billing.topupStatus')).toBe(1);
+    });
+
+    it.each([
+        ['network error', () => { throw new Error('offline'); }],
+        ['server error', () => refusal(503, 'NOT_FOUND')],
+        ['non-JSON body', () => new Response('not json', { status: 200 })],
+        ['malformed success', () => ({ status: 'complete', sku: 'standard_monthly_v3' })],
+        ['missing payment status', () => ({ status: 'complete', fulfillment: 'credited' })],
+        ['unknown fulfillment', () => topupReceipt('unknown')],
+        ['wrong refusal message', () => refusal(404, 'NOT_FOUND', 'other_error')],
+        ['wrong refusal code', () => refusal(404, 'BAD_REQUEST')],
+        ['unauthorized', () => refusal(401, 'UNAUTHORIZED')],
+        ['HTTP 200 error', () => refusal(200, 'NOT_FOUND')],
+    ])('%s leaves classification unknown until the next poll succeeds', async (_label, failure) => {
+        topup = failure as () => unknown;
+        await render();
+        expect(text()).toBe('We could not check for updates right now. We’ll keep checking.Back to Billing');
+        expect(count('billing.checkoutStatus')).toBe(0);
+        expect(count('billing.summary')).toBe(0);
+        topup = () => topupReceipt('processing');
+        await tick(2000);
+        expect(text()).toBe('Payment received. Adding your AI credits…Back to Billing');
+        expect(count('billing.topupStatus')).toBe(2);
+        topup = () => topupReceipt('credited');
+        await tick(2000);
+        expect(text()).toBe('1,000 AI credits added. Check your AI credits in Billing.Back to Billing');
+        expect(count('billing.topupStatus')).toBe(3);
+        expect(count('billing.checkoutStatus')).toBe(0);
     });
 });

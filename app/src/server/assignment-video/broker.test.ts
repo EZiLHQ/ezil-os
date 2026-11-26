@@ -93,6 +93,24 @@ describe('assignment media broker',()=>{
             answer = wrong;
             await expect(recordingAction(identity,request,d)).rejects.toMatchObject({code:'media_unavailable',status:503});
         }
+        // After an ordinary upgrade pause the deadline is more than an hour from the original start. A reload repeats
+        // the call and Universe answers that same clock: accepted, again and again, only as the complete revised
+        // clock. The same window from three bare fields, or without a revision that allows it, is no clock.
+        // Started 40 minutes ago, paused for 15 in all: 35 minutes are left, 75 minutes after the start.
+        const resumed = {startedAt:time(clock-2400000),deadlineAt:time(clock-2400000+hour+900000),serverNow:time(clock),
+            pausedAt:null,pauseReason:null,remainingMs:2100000,revision:2};
+        answer = resumed;
+        await expect(recordingAction(identity,request,d)).resolves.toEqual(resumed);
+        await expect(recordingAction(identity,request,d)).resolves.toEqual(resumed);
+        const heldNow = {...resumed,pausedAt:time(clock-1000),pauseReason:'system_upgrade',revision:3};
+        answer = heldNow;
+        await expect(recordingAction(identity,request,d)).resolves.toEqual(heldNow);
+        for (const wrong of [{startedAt:resumed.startedAt,deadlineAt:resumed.deadlineAt,serverNow:resumed.serverNow},
+            {...resumed,revision:0},{...resumed,revision:undefined},{...resumed,remainingMs:null},
+            {...heldNow,pauseReason:null},{...heldNow,pausedAt:time(clock+60000)}]) {
+            answer = wrong;
+            await expect(recordingAction(identity,request,d)).rejects.toMatchObject({code:'media_unavailable',status:503});
+        }
         // Before this phase's first frame is confirmed nothing is sent.
         remoteState = {...remoteState,status:'awaiting_frame',phaseReady:false,startedAt:null,deadlineAt:null,
             authorizationExpiresAt:time(clock+60000)};

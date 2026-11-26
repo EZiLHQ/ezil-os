@@ -103,7 +103,7 @@ export function pickFreeSlot(takenSlots: readonly number[]): number | null {
  * Filter for every LIVE computer belonging to `userId`. The `deleted_at IS
  * NULL` half is what makes a soft-deleted computer disappear from `list`,
  * stop counting toward the cap in `create`, and become unaddressable by
- * `get` / `rename` / `touch` / `delete` and the desktop provider router.
+ * `get` / `rename` / `delete` and the desktop provider router.
  */
 export function liveComputersOf(userId: string): SQL | undefined {
     return and(eq(computers.userId, userId), isNull(computers.deletedAt));

@@ -141,8 +141,10 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         }
         if (stopped || disposed) throw failure('recording_unavailable');
         const start = Date.parse(data.startedAt), end = Date.parse(data.deadlineAt), now = Date.parse(data.serverNow);
-        if (!Number.isFinite(start) || !Number.isFinite(end) || !Number.isFinite(now) || end <= start || end - start > HOUR
-            || start > now + 1500) throw failure('media_unavailable');
+        // Longer than the hour only as a revised clock: one the server paused and gave time back to.
+        const revised = Number.isSafeInteger(data.revision) && data.revision > 0;
+        if (!Number.isFinite(start) || !Number.isFinite(end) || !Number.isFinite(now) || end <= start
+            || (!revised && end - start > HOUR) || start > now + 1500) throw failure('media_unavailable');
         return data;
     }
     async function preflight() {

@@ -123,9 +123,9 @@ const topupStatus = result => {
         credits: Number.isSafeInteger(data?.credits) && data.credits > 0 ? data.credits : null,
     };
 };
-const TOPUP_REVIEW_COPY = "Payment received, but your credits couldn't be added automatically. You don't need to pay again. Contact support if they don't appear soon.";
+export const TOPUP_REVIEW_COPY = "Payment received, but your credits couldn't be added automatically. You don't need to pay again. Contact support if they don't appear soon.";
 // Paid, not credited by the deadline: the webhook may have parked it before any receipt, so promise nothing.
-const TOPUP_TIMEOUT_COPY = "Payment received, but we couldn't confirm your AI credits yet. You don't need to pay again. Check Settings → Billing for your balance, and contact support if the credits don't appear.";
+export const TOPUP_TIMEOUT_COPY = "Payment received, but we couldn't confirm your AI credits yet. You don't need to pay again. Check Settings → Billing for your balance, and contact support if the credits don't appear.";
 
 // Stripe.js v3 mounts these Financial Connections, Link and embedded checkout
 // modal frames in body portals, and so does a card's 3-D Secure / OTP challenge.
@@ -152,7 +152,7 @@ export function isStripeModalFrame (iframe) {
  * it in the viewer's zone with what is charged and when, and only on Continue opens `billing.createCheckout({ sku,
  * trial: { trialEndsAt } })` with that same end. Payment then runs exactly as the Standard checkout does ($0 today).
  */
-export function openUpgradeSheet ({ container, sku, offer, pack, sizes, summary, trpc, onDone, onClose, onCancel, userId = null, loadStripe = defaultLoadStripe, now = Date.now, trial = false, coupon = null, timeZone }) {
+export function openUpgradeSheet ({ container, sku, offer, pack, sizes, summary, trpc, onDone, onClose, onCancel, onUnconfirmed, userId = null, loadStripe = defaultLoadStripe, now = Date.now, trial = false, coupon = null, timeZone }) {
     container = container?.get?.(0) ?? container;
     const doc = container.ownerDocument;
     const win = doc.defaultView;
@@ -165,6 +165,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, summary,
     let polling = false;
     let confirming = false;
     let sessionCompleted = false;
+    let sessionExpired = false;
     let paymentStatus = null;
     let confirmationCopy = null;
     let finished = false;
@@ -190,6 +191,11 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, summary,
         dispose: () => {
             // Closed before Stripe finished the session: say so in Billing, without claiming nothing was paid.
             if ( pack && ! finished && ! sessionCompleted ) { try { onCancel?.(); } catch { /* Closing must still tear down. */ } }
+            // A local timeout is not a terminal answer: Billing keeps watching after this sheet closes.
+            if ( pack && session?.sessionId && ! sessionExpired && ! ['credited', 'review'].includes(fulfillment) ) {
+                try { onUnconfirmed?.({ sessionId: session.sessionId, paid: sessionCompleted && paymentStatus === 'paid' }); }
+                catch { /* Closing must still tear down. */ }
+            }
             closed = true;
             clearTimers();
             controller.abort();
@@ -421,10 +427,10 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, summary,
         finished = true;
         clearTimers();
         mount.hidden = true;
-        const credits = creditedCredits ?? pack?.aiCredits;
+        // Only the count the server confirmed (`topupStatus.credits`); the quoted pack is never shown as delivered.
         // A free month is named only when the summary reports it live; otherwise the plan is ordinary Standard.
         const freeMonth = trialMode && ['trialing', 'ending'].includes(summary?.plan?.trial?.state);
-        show(pack ? `${Number(credits).toLocaleString('en-US')} AI credits added` : freeMonth ? `Your free month of ${name} has started` : `You're on ${name}`, 'Done', returnToBilling);
+        show(pack ? creditedCredits !== null ? `${creditedCredits.toLocaleString('en-US')} AI credits added` : 'AI credits added' : freeMonth ? `Your free month of ${name} has started` : `You're on ${name}`, 'Done', returnToBilling);
         state.dataset.role = 'upgrade-success';
         state.querySelector('button').dataset.action = 'done';
         const icon = doc.createElement('span');
@@ -446,6 +452,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, summary,
             const result = topupStatus(await trpc.query('billing.topupStatus', { sessionId: session.sessionId }));
             if ( closed || finished ) return;
             if ( result.status === 'expired' ) {
+                sessionExpired = true;
                 finished = true;
                 clearTimers();
                 show('This checkout expired before payment, so you were not charged. Close this and try again.');
@@ -521,6 +528,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, summary,
         try {
             const { status } = checkoutStatus(await trpc.query('billing.checkoutStatus', { sessionId: session.sessionId }));
             if ( closed || polling || finished ) return;
+            if ( pack && status === 'expired' ) sessionExpired = true;
             if ( status === 'complete' ) { startPolling(true); return; }
         } catch { /* A failed check is retried on the next tick. */ }
         if ( ! closed && ! polling && ! finished ) watchTimer = later(watchSession, WATCH_INTERVAL_MS);
