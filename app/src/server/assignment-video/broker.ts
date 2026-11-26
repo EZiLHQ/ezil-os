@@ -129,9 +129,15 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
             // for the capture this process holds, after its first frame was confirmed, inside its media window.
             if (lease.phase !== input.captureSessionId || !lease.seedConfirmed || lease.deadline <= clock())
                 return refuse('recording_phase_changed', 409);
-            const result = editorReadyClock.safeParse(await openControl('editor-ready', input.repoOpenProof, {
+            const answer = await openControl('editor-ready', input.repoOpenProof, {
                 captureSessionId:input.captureSessionId,
-            }));
+            });
+            // Repeated after a reload, Universe answers the same clock again. One it paused and extended (a revised
+            // window, longer than the hour) is production's complete clock and is returned as it is; the bare work
+            // clock is bounded by the hour. Either way the window is Universe's own answer, never this caller's.
+            const full = clockState.safeParse(answer);
+            if (full.success && full.data.startedAt !== null) return full.data;
+            const result = editorReadyClock.safeParse(answer);
             if (!result.success) return refuse('media_unavailable', 503);
             return result.data;
         }
