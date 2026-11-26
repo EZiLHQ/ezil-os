@@ -5,6 +5,24 @@ import React, { useEffect, useState } from 'react';
 const checking = 'Checking your payment…';
 const unconfirmed = 'Payment confirmation is pending. Your plan updates after payment is confirmed.';
 type View = { sessionId: string; message: string; canCheckAgain: boolean };
+type TopupRead = {
+    status: 'pending' | 'complete' | 'expired';
+    paymentStatus: 'paid' | 'unpaid' | 'no_payment_required' | null;
+    fulfillment: 'awaiting_payment' | 'processing' | 'credited' | 'review';
+    credits?: unknown;
+};
+
+function isTopupRead(value: unknown): value is TopupRead {
+    if (!value || typeof value !== 'object') return false;
+    const read = value as Record<string, unknown>;
+    return typeof read.status === 'string' && ['pending', 'complete', 'expired'].includes(read.status)
+        && (read.paymentStatus === null || typeof read.paymentStatus === 'string'
+            && ['paid', 'unpaid', 'no_payment_required'].includes(read.paymentStatus))
+        && typeof read.fulfillment === 'string' && ['awaiting_payment', 'processing', 'credited', 'review'].includes(read.fulfillment);
+}
+
+const balanceUnavailable = ' Check your AI credits in Billing.';
+const topupDeadline = "Payment received, but we couldn't confirm your AI credits yet. You don't need to pay again. Check Settings → Billing for your balance, and contact support if the credits don't appear.";
 
 type Trial = { state?: unknown; endsAt?: unknown; firstChargeAt?: unknown; amountCents?: unknown };
 type SummaryRead = { enabled?: unknown; plan?: { sku?: unknown; status?: unknown; trial?: unknown }; computer?: { standing?: unknown } } | null | undefined;
@@ -67,15 +85,23 @@ function CheckoutStatusForSession({ sessionId }: { sessionId: string }) {
         const controller = new AbortController();
         let stopped = false;
         let lastMessage = unconfirmed;
+        let kind: 'unknown' | 'topup' | 'subscription' = 'unknown';
+        let topupPaid = false;
+        let creditsAdded: string | null = null;
         // A free-month checkout whose plan a summary has not confirmed yet: neutral from then on, never "starting"
         // for a return link opened long after (the summary is the authority).
         let confirming = false;
         let pollTimer: ReturnType<typeof setTimeout> | undefined;
         const deadline = setTimeout(() => {
+            if (creditsAdded) {
+                finish(creditsAdded + balanceUnavailable);
+                return;
+            }
             stopped = true;
             controller.abort();
             clearTimeout(pollTimer);
-            setView({ sessionId, message: `${lastMessage} Check Settings → Billing for updates.`, canCheckAgain: true });
+            setView({ sessionId, message: kind === 'topup' && topupPaid ? topupDeadline
+                : `${lastMessage} Check Settings → Billing for updates.`, canCheckAgain: true });
         }, 60_000);
         function finish(message: string) {
             stopped = true;
@@ -84,21 +110,73 @@ function CheckoutStatusForSession({ sessionId }: { sessionId: string }) {
             controller.abort();
             setView({ sessionId, message, canCheckAgain: false });
         }
-        async function query(procedure: 'checkoutStatus' | 'summary') {
-            const input = procedure === 'checkoutStatus'
+        async function query(procedure: 'checkoutStatus' | 'topupStatus' | 'summary') {
+            const input = procedure !== 'summary'
                 ? `?input=${encodeURIComponent(JSON.stringify({ json: { sessionId } }))}` : '';
             // Same-origin cookies preserve the existing authenticated caller.
             // checkoutStatus validates ownership before returning its SKU.
             const response = await fetch(`/api/trpc/billing.${procedure}${input}`, {
                 signal: controller.signal, cache: 'no-store', credentials: 'same-origin',
             });
-            if (!response.ok) throw new Error('Could not check billing.');
+            if (!response.ok) {
+                if (procedure === 'topupStatus' && kind === 'unknown' && [400, 404].includes(response.status)) {
+                    const body = await response.json();
+                    const error = body?.error?.json ?? body?.error;
+                    if (error?.message === 'unknown_checkout' && (response.status === 404 && error?.data?.code === 'NOT_FOUND'
+                        || response.status === 400 && error?.data?.code === 'BAD_REQUEST')) return null;
+                }
+                throw new Error('Could not check billing.');
+            }
             const body = await response.json();
             if (body?.error || !body?.result?.data?.json) throw new Error('Could not check billing.');
             return body.result.data.json;
         }
+        async function showTopup(topup: TopupRead) {
+            if (topup.paymentStatus === 'paid') topupPaid = true;
+            if (topup.status === 'expired') {
+                finish('This checkout expired before payment, so you were not charged. Return to Billing to try again.');
+                return;
+            }
+            if (topup.status !== 'complete') lastMessage = unconfirmed;
+            else if (topup.paymentStatus !== 'paid') {
+                lastMessage = 'Your payment is processing. Bank payments can take a few days. Your AI credits update after payment is confirmed.';
+            } else if (topup.fulfillment === 'review') {
+                finish("Payment received, but your credits couldn't be added automatically. You don't need to pay again. Contact support if they don't appear soon.");
+                return;
+            } else if (topup.fulfillment === 'credited') {
+                creditsAdded = typeof topup.credits === 'number' && Number.isSafeInteger(topup.credits)
+                    ? `${topup.credits.toLocaleString('en-US')} AI credits added.` : 'Your AI credits were added.';
+                setView({ sessionId, message: creditsAdded, canCheckAgain: false });
+                let balance = balanceUnavailable;
+                try {
+                    const summary = await query('summary');
+                    const micro = summary?.ai?.account?.remainingMicro;
+                    if (typeof micro === 'string' && micro.length > 0 && !/\D/.test(micro)) {
+                        balance = ` Your balance is now ${(BigInt(micro) / BigInt(1_000_000)).toLocaleString('en-US')} credits.`;
+                    }
+                } catch {
+                    // Delivery is already confirmed; an unavailable balance must not undo it.
+                }
+                if (!stopped) finish(creditsAdded + balance);
+                return;
+            } else lastMessage = 'Payment received. Adding your AI credits…';
+            setView({ sessionId, message: lastMessage, canCheckAgain: false });
+        }
         async function poll() {
             try {
+                if (kind !== 'subscription') {
+                    const topup = await query('topupStatus');
+                    if (stopped) return;
+                    // Only the server's explicit refusal selects the existing plan flow for this attempt.
+                    if (kind === 'unknown' && topup === null) kind = 'subscription';
+                    else {
+                        if (!isTopupRead(topup)) throw new Error('Could not check billing.');
+                        kind = 'topup';
+                        await showTopup(topup);
+                        if (!stopped) pollTimer = setTimeout(poll, 2000);
+                        return;
+                    }
+                }
                 const checkout = await query('checkoutStatus');
                 if (stopped) return;
                 const status = typeof checkout === 'string' ? checkout : checkout?.status;
@@ -139,7 +217,7 @@ function CheckoutStatusForSession({ sessionId }: { sessionId: string }) {
                 }
             } catch {
                 // Keep the last known receipt state without implying activation.
-                if (!stopped) setView({ sessionId, message: `${lastMessage} We could not check for updates right now. We’ll keep checking.`, canCheckAgain: false });
+                if (!stopped) setView({ sessionId, message: `${kind === 'unknown' ? '' : `${lastMessage} `}We could not check for updates right now. We’ll keep checking.`, canCheckAgain: false });
             }
             if (!stopped) pollTimer = setTimeout(poll, 2000);
         }
