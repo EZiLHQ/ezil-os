@@ -218,6 +218,9 @@ function run(opts: { search?: string; pathname?: string; framed?: boolean; navig
   const listeners: Record<string, Array<(ev: unknown) => void>> = {};
   const navListeners: Array<(ev: unknown) => void> = [];
   const documentAttributes = new Map<string, string>();
+  // The workbench the script looks for: absent until a test mounts it (`dom.editor`) and marks it started (`dom.marks`).
+  const dom: { editor: { isConnected: boolean; querySelector: (selector: string) => unknown } | null; marks: string[]; queries: string[] } = { editor: null, marks: [], queries: [] };
+  const intervals: Array<{ fn: () => void; ms: number; cleared?: boolean }> = [];
   const parent = { postMessage: (m: Record<string, unknown>, o: string) => posted.push({ m: structuredClone(m), o }) };
   const g: Record<string, unknown> = {
     URLSearchParams, URL, crypto, btoa, Uint8Array, Map, String, JSON,
@@ -226,8 +229,11 @@ function run(opts: { search?: string; pathname?: string; framed?: boolean; navig
         setAttribute: (key: string, value: string) => documentAttributes.set(key, value),
         getAttribute: (key: string) => documentAttributes.get(key) ?? null,
       },
-      querySelector: () => null,
+      querySelector: (selector: string) => { dom.queries.push(selector); return selector === '.monaco-workbench .part.editor .editor-group-container' ? dom.editor : null; },
     },
+    performance: { getEntriesByName: (name: string, type: string) => type === 'mark' && dom.marks.includes(name) ? [{ name }] : [] },
+    setInterval: (fn: () => void, ms: number) => intervals.push({ fn, ms }),
+    clearInterval: (id: number) => { const t = intervals[id - 1]; if (t) t.cleared = true; },
     MutationObserver: class {
       observe() {}
       disconnect() {}
@@ -251,7 +257,9 @@ function run(opts: { search?: string; pathname?: string; framed?: boolean; navig
   };
   const fire = () => { for (const t of timers.splice(0)) if (!t.cleared) t.fn(); };
   const unload = () => (listeners.beforeunload ?? []).forEach((fn) => fn({}));
-  return { posted, replaced, timers, message, navigate, fire, unload, parent, navListeners, documentAttributes };
+  const tick = () => { for (const t of [...intervals]) if (!t.cleared) t.fn(); };
+  const pagehide = () => (listeners.pagehide ?? []).forEach((fn) => fn({}));
+  return { posted, replaced, timers, message, navigate, fire, unload, parent, navListeners, documentAttributes, dom, intervals, tick, pagehide };
 }
 const NONCE = 'BBBBBBBBBBBBBBBBBBBBBB';
 
@@ -481,5 +489,85 @@ describe('AWS code port (handleAwsBrowserHost)', () => {
     const redirect = await call(CODE_PREVIEW_PORT, '/', new Response(null, { status: 302, headers: { location: './?folder=/workspace' } }));
     expect(redirect.status).toBe(302);
     expect(redirect.headers.get('location')).toBe('./?folder=/workspace');
+  });
+});
+
+describe('workbench readiness (asked only by a hello for this mint, answered only once the editor really started)', () => {
+  const MINT = 'AAAAAAAAAAAAAAAAAAAAAA';
+  const hello = { type: 'ezil.code.hello', v: 1, nonce: NONCE, mint: MINT, workbenchReady: true };
+  const mounted = { isConnected: true, querySelector: (selector: string) => selector === '.title' ? {} : null };
+  const workbench = (b: ReturnType<typeof run>) => b.posted.filter(({ m }) => m.type === 'ezil.code.workbench');
+  for (const [realm, origins, origin] of [['production', codeShellOriginsFor(undefined), PROD_SHELL], ['staging', [SHELL], SHELL]] as const) {
+    it(`${realm}: the folder echo is immediate, the workbench report waits for the mounted editor group and code-server's own start mark`, () => {
+      const b = run({ origins: [...origins], origin });
+      b.posted.length = 0;
+      b.message(hello);
+      // The address is answered at once, as for any hello; it proves no editor.
+      expect(b.posted).toEqual([{ m: { type: 'ezil.code.folder', v: 1, nonce: NONCE, mint: MINT, kind: 'folder', path: '/workspace/a', base: '/' }, o: origin }]);
+      expect(b.intervals.filter((t) => !t.cleared).map((t) => t.ms)).toEqual([125]);
+      b.tick();
+      expect(workbench(b)).toEqual([]);
+      // An editor group in the DOM is not enough without the start mark, and the mark is not enough without the group.
+      b.dom.editor = mounted; b.tick();
+      expect(workbench(b)).toEqual([]);
+      b.dom.editor = null; b.dom.marks = ['code/didStartWorkbench']; b.tick();
+      expect(workbench(b)).toEqual([]);
+      b.dom.editor = { ...mounted, isConnected: false }; b.tick();
+      b.dom.editor = { isConnected: true, querySelector: () => null }; b.tick();
+      expect(workbench(b)).toEqual([]);
+      b.dom.editor = mounted; b.tick();
+      expect(workbench(b)).toEqual([{ m: { type: 'ezil.code.workbench', v: 1, nonce: NONCE, mint: MINT, kind: 'folder', path: '/workspace/a' }, o: origin }]);
+      // Once per hello: the observation stopped itself, and the same nonce asks nothing again.
+      expect(b.intervals.every((t) => t.cleared)).toBe(true);
+      b.tick(); b.message(hello); b.tick();
+      expect(workbench(b)).toHaveLength(1);
+      // A new hello (a new nonce) is answered again, at once, because the workbench is already there.
+      b.message({ ...hello, nonce: 'CCCCCCCCCCCCCCCCCCCCCC' });
+      expect(workbench(b).map(({ m }) => m.nonce)).toEqual([NONCE, 'CCCCCCCCCCCCCCCCCCCCCC']);
+    });
+  }
+  it('is never started by a hello that did not ask, names another mint, comes from elsewhere, or reaches a document that is not a plain folder', () => {
+    const ready = (b: ReturnType<typeof run>) => { b.dom.editor = mounted; b.dom.marks = ['code/didStartWorkbench']; };
+    const prod = () => run({ origins: codeShellOriginsFor(undefined), origin: PROD_SHELL });
+    for (const [name, send] of [
+      ['no workbenchReady', (b: ReturnType<typeof run>) => b.message({ ...hello, workbenchReady: undefined })],
+      ['workbenchReady not exactly true', (b: ReturnType<typeof run>) => b.message({ ...hello, workbenchReady: 1 })],
+      ['another mint', (b: ReturnType<typeof run>) => b.message({ ...hello, mint: NONCE })],
+      ['no mint', (b: ReturnType<typeof run>) => b.message({ ...hello, mint: undefined })],
+      ['the staging app', (b: ReturnType<typeof run>) => b.message(hello, { origin: SHELL })],
+      ['the former host', (b: ReturnType<typeof run>) => b.message(hello, { origin: 'https://os.ezil.org' })],
+      ['another window', (b: ReturnType<typeof run>) => b.message(hello, { source: { postMessage() {} } })],
+    ] as const) {
+      const b = prod(); ready(b); b.posted.length = 0;
+      send(b); b.tick();
+      expect(workbench(b), name).toEqual([]);
+      expect(b.intervals, name).toHaveLength(0);
+    }
+    // A document the person navigated to (no mint in its address) and a workspace file are never this mint's editor.
+    for (const search of ['?folder=/workspace/a', '?workspace=/workspace/a.code-workspace&ezil_mint=' + MINT, '?ezil_mint=' + MINT]) {
+      const b = run({ origins: codeShellOriginsFor(undefined), origin: PROD_SHELL, search }); ready(b); b.posted.length = 0;
+      b.message(hello); b.tick();
+      expect(workbench(b), search).toEqual([]);
+      expect(b.intervals, search).toHaveLength(0);
+    }
+  });
+  it('stops observing when the document goes away, and gives up on its own after eighty seconds', () => {
+    const b = run({ origins: codeShellOriginsFor(undefined), origin: PROD_SHELL });
+    b.message(hello);
+    expect(b.timers.filter((t) => !t.cleared).map((t) => t.ms)).toContain(80000);
+    b.pagehide();
+    expect(b.intervals.every((t) => t.cleared)).toBe(true);
+    b.dom.editor = mounted; b.dom.marks = ['code/didStartWorkbench']; b.tick();
+    expect(workbench(b)).toEqual([]);
+    const late = run({ origins: codeShellOriginsFor(undefined), origin: PROD_SHELL });
+    late.message(hello);
+    late.fire();
+    late.dom.editor = mounted; late.dom.marks = ['code/didStartWorkbench']; late.tick();
+    expect(workbench(late)).toEqual([]);
+  });
+  it('production carries no click cues: the script is the bridge and the workbench observer, and nothing keyed to an app origin', () => {
+    const script = codeFolderBridgeScript(codeShellOriginsFor(undefined));
+    expect(script).toContain('ezil.code.workbench');
+    for (const absent of ['ezil.code.click', 'assignment-click', 'click-cue', 'os-staging']) expect(script).not.toContain(absent);
   });
 });
