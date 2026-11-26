@@ -1,3 +1,7 @@
+# Initial Azure implementation handoff (historical)
+
+This report describes the first worker checkpoint only. The coordinator subsequently added synthetic database/counterpart tests, current read-only IAM evidence, sweep wiring and start recovery. Use `OS-EDITOR-RECEIPT.md` for final qualification and gates.
+
 Completed bounded application source parity from `308447f7` onto `9bcc67af`. No commit, deployment, remote/provider/DB access, credential-file reads, or additional workers. Defaults remain off.
 
 Implemented:

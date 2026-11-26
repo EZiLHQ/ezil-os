@@ -332,6 +332,12 @@ describe.skipIf(!URL_)('model choice through the MCP: real Gateway evidence per 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         type Tool = { handler: (args: Record<string, unknown>, ctx: unknown) => Promise<{ structuredContent?: Record<string, any>; isError?: boolean; content: { text: string }[] }> };
         await fresh();
+        // Each local connector fixture has its own exact Auth0 subject grant. The hosted counterpart
+        // intentionally rejects the older broad Supabase fixture; never relax its real policy.
+        for (const [who, person] of Object.entries(people)) {
+            await client`UPDATE auth.users SET raw_app_meta_data = jsonb_build_object('auth0_sub', ${`auth0|synthetic-mcp-${who}`}::text)
+                WHERE id = ${person.user}::uuid`;
+        }
         const realFetch = globalThis.fetch;
         // The MCP calls OS with the global fetch; route exactly that origin to the real tRPC route, and let everything else through.
         vi.stubGlobal('fetch', async (input: URL | string | Request, init?: RequestInit) => {
@@ -340,13 +346,20 @@ describe.skipIf(!URL_)('model choice through the MCP: real Gateway evidence per 
             return request.method === 'GET' ? trpcGet(request) : trpcPost(request);
         });
         const ctxFor = (who: Who) => ({
-            props: { issuer: `${SUPABASE}/auth/v1`, sub: people[who].user, email: `${who}@example.com`, name: who, provider: 'email' },
+            props: { issuer: 'https://id.ezil.work/', sub: `auth0|synthetic-mcp-${who}`, email: `${who}@example.com`, name: who, provider: 'ezil_id' },
             scopes: ['ezil:account', 'ezil:computers:read', 'ezil:computers:start', 'ezil:sessions:read', 'ezil:sessions:write'], clientId: CLIENT,
             env: { SESSION_TOOLS: 'enabled', OS_ORIGIN: OS, PUBLIC_ORIGIN: MCP, SUPABASE_URL: SUPABASE, DELEGATION_CLIENT_IDS: CLIENT,
+                SESSION_CANARY_SUBJECT: `auth0|synthetic-mcp-${who}`, EZIL_ID_CLIENT_ID: 'synthetic-client', EZIL_ID_CLIENT_SECRET: 'synthetic-only',
                 DELEGATION_KID: 'mcp-test', DELEGATION_PRIVATE_JWK: JSON.stringify(privateJwk) },
         });
         const call = (tool: Tool, who: Who, args: Record<string, unknown>) => tool.handler(args, ctxFor(who));
         try {
+            const wrongOwner = ctxFor('alice');
+            wrongOwner.env.SESSION_CANARY_SUBJECT = 'auth0|synthetic-mcp-bob';
+            expect((await mcp.listModels.handler({ computerId: people.alice.computer }, wrongOwner)).isError).toBe(true);
+            const missingScope = ctxFor('alice');
+            missingScope.scopes = ['ezil:account'];
+            expect((await mcp.listModels.handler({ computerId: people.alice.computer }, missingScope)).isError).toBe(true);
             answers[people.alice.aiToken] = v1([row(QWEN, 'available'), row(KIMI, 'unavailable')]);
             answers[people.bob.aiToken] = v1([row(KIMI, 'available')]);
             const a = await editor('alice');

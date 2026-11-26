@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
-import { additiveSQL, applySQL, catalogSQL, hash, snapshotHash } from '../.github/scripts/production-migrations.mjs';
+import { additiveSQL, applySQL, catalogSQL, hash, snapshotHash, planSQL } from '../.github/scripts/production-migrations.mjs';
 
 const ids = ['0035_editor_agent_sessions', '0036_editor_control_operations', '0037_editor_protocol_2', '0039_named_computer_creation'];
 const read = name => readFile(new URL(`../app/drizzle/${name}.sql`, import.meta.url), 'utf8');
@@ -73,6 +73,10 @@ for (const populated of [false, true]) test(`editor batch on ${populated ? 'old 
     assert.deepEqual(await preserved(db), before);
     assert.deepEqual(await rows(db, 'SELECT * FROM ezil_ci.journal ORDER BY ordinal'), journal);
     assert.deepEqual(journal.map(x => x.id), ids);
+    const oldManifest = { ...loaded.manifest, migrations: [] };
+    await assert.rejects(db.exec(planSQL(oldManifest)), /migration|journal/i);
+    await db.exec('ROLLBACK;');
+    assert.deepEqual(await rows(db, 'SELECT * FROM ezil_ci.journal ORDER BY ordinal'), journal);
     assert.equal((await rows(db, "SELECT to_regclass('public.ezil_operator_entitlements') AS override"))[0].override, null);
     for (const name of tables) {
         const [access] = await rows(db, `SELECT relrowsecurity AS rls, has_table_privilege('anon',oid,'SELECT,INSERT,UPDATE,DELETE') AS anon,
