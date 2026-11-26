@@ -111,6 +111,7 @@ function invoice (kind = 'subscription', created = '2026-10-14T12:00:00Z', statu
 }
 let summary = v2(), history = [];
 let getSummary = () => reply(summary), getHistory = () => reply(history), getUsage = () => failure('unavailable');
+let getTopupStatus = () => reply({ status: 'complete', paymentStatus: 'paid', fulfillment: 'processing' });
 let mutation = () => reply({ url: 'https://billing.example.test/session' });
 // The read-only availability check (billing.trialOffer). `availableOffer` answers available+eligible for the asked offer.
 const OFFER_FINGERPRINT = 'a'.repeat(64);
@@ -124,6 +125,7 @@ window.fetch = async (url, options = {}) => {
     if ( call.url.includes('/api/trpc/billing.summary') ) return getSummary();
     if ( call.url.includes('/api/trpc/billing.history') ) return getHistory();
     if ( call.url.includes('/api/trpc/billing.usage') ) return getUsage();
+    if ( call.url.includes('/api/trpc/billing.topupStatus') ) return getTopupStatus(call);
     if ( call.url.includes('/api/trpc/billing.trialOffer') ) return getTrialOffer(call);
     if ( call.url.includes('/api/trpc/billing.') ) return mutation(call);
     if ( call.url.includes('/api/trpc/computer.list') ) return reply([]);
@@ -131,7 +133,7 @@ window.fetch = async (url, options = {}) => {
 };
 const bundled = await build({
     stdin: {
-        contents: "import './shell/ezil/boot.js'; import * as billing from './shell/ezil/ui/Settings/tabs/billing.js'; import * as format from './shell/ezil/ui/Settings/billing-format.js'; import * as computersTab from './shell/ezil/ui/Settings/tabs/computers.js'; import { parseBillingDeepLink } from './shell/ezil/ui/Settings/upgrade-sheet.js'; import { settingsAliasSearch, parseAppLink } from './shell/ezil/app-link.js'; window.linkApi = { parseBillingDeepLink, settingsAliasSearch, parseAppLink }; window.billing = billing; window.billingFormat = format; window.computersTab = computersTab;",
+        contents: "import './shell/ezil/boot.js'; import * as billing from './shell/ezil/ui/Settings/tabs/billing.js'; import * as format from './shell/ezil/ui/Settings/billing-format.js'; import * as computersTab from './shell/ezil/ui/Settings/tabs/computers.js'; import { parseBillingDeepLink, TOPUP_REVIEW_COPY, TOPUP_TIMEOUT_COPY } from './shell/ezil/ui/Settings/upgrade-sheet.js'; import { settingsAliasSearch, parseAppLink } from './shell/ezil/app-link.js'; window.linkApi = { parseBillingDeepLink, settingsAliasSearch, parseAppLink }; window.topupCopy = { TOPUP_REVIEW_COPY, TOPUP_TIMEOUT_COPY }; window.billing = billing; window.billingFormat = format; window.computersTab = computersTab;",
         resolveDir: path.resolve(here, '../../../..'),
     },
     bundle: true, write: false, format: 'iife', target: 'es2022',
@@ -152,6 +154,25 @@ const opener = kind => options => {
 };
 window.billing.setUpgradeSheetOpener(opener('checkout'));
 window.billing.setBillingSheetOpeners(Object.fromEntries(['upgrade', 'downgrade', 'cancel', 'overage', 'topup'].map(kind => [kind, opener(kind)])));
+let topupTime = 0, topupTimerID = 0;
+const topupTimers = new Map();
+window.billing.setTopupWatchClock({
+    later: (fn, ms) => { const id = ++topupTimerID; topupTimers.set(id, { at: topupTime + ms, fn }); return id; },
+    cancel: id => topupTimers.delete(id), now: () => topupTime,
+});
+async function advanceTopup (ms) {
+    const end = topupTime + ms;
+    for (;;) {
+        const next = [...topupTimers].sort((a, b) => a[1].at - b[1].at)[0];
+        if ( ! next || next[1].at > end ) break;
+        topupTime = next[1].at;
+        topupTimers.delete(next[0]);
+        next[1].fn();
+        await settle();
+    }
+    topupTime = end;
+    await settle();
+}
 window.ezil.boot();
 window.$.fx.off = true;
 const payload = { user: { id: 'test-user', name: 'Test user' }, features: { billing: true }, desktopState: {} };
@@ -1445,6 +1466,180 @@ try {
     has('[data-role="ai-topup"]', false);
     assert.doesNotMatch(text(), /Unavailable|Not available/);
     pass('AI credit row: whole numbers, above-grant split, server states, top-up disclosure, checkout gating, Add AI credits primary and EZiL ID');
+
+    {
+        const pendingCopy = 'Payment received. Your AI credits are being added. This page updates when they arrive.';
+        const status = () => q('[data-role="billing-action-status"]').textContent;
+        const processing = { status: 'complete', paymentStatus: 'paid', fulfillment: 'processing' };
+        const credited = { ...processing, fulfillment: 'credited', credits: 2500 };
+        summary = summaryV3('premium'); summary.actions.topup = true; summary.catalog.packs = packs;
+        summary.ai.account = { userId: 'test-user', remainingMicro: '0', totalMicro: '0', labelled: false, grants: [] };
+        await open();
+        const handoff = async (paid = true, reload = false) => {
+            click(q('#ai-credits [data-action="topup"]'));
+            const dialog = sheets.at(-1); dialog.handle.close(); dialog.checkout({ pack: quote });
+            assert.equal(sheets.at(-1).kind, 'checkout');
+            if ( reload ) sheets.at(-1).onDone();
+            if ( ! paid ) sheets.at(-1).onCancel();
+            sheets.at(-1).onUnconfirmed({ sessionId: 'cs_pending', paid });
+            await closeSheet();
+        };
+        getTopupStatus = () => reply(processing);
+        await handoff(true, true);
+        assert.equal(status(), pendingCopy, 'Back to Billing reload retains the handoff status');
+        contains('#ai-credits', '0 credits left');
+        const before = count(), checks = count('topupStatus');
+        await advanceTopup(2999); assert.equal(count('topupStatus'), checks);
+        await advanceTopup(1); assert.equal(count('topupStatus'), checks + 1);
+        assert.deepEqual(calls.find(call => call.url.includes('/billing.topupStatus')).input, { sessionId: 'cs_pending' });
+        assert.equal(count(), before, 'processing never reloads the balance');
+        summary.ai.account.remainingMicro = summary.ai.account.totalMicro = '2500000000';
+        getTopupStatus = () => reply(credited);
+        await advanceTopup(4999); assert.equal(count(), before);
+        await advanceTopup(1);
+        assert.equal(count(), before + 1, 'credited reloads the summary exactly once');
+        contains('#ai-credits', '2,500 credits left');
+        assert.equal(status(), '2,500 AI credits added.', 'server credits and success survive the new pane');
+        assert.equal(topupTimers.size, 0);
+        await advanceTopup(30000); assert.equal(count(), before + 1);
+        pass('top-up watch: paid processing → credited reloads the balance once and retains the added-credit status');
+        // Credited while the person has another dialog open (seeing no credits, they pressed Add credits again): the
+        // open dialog blocks the read, so its close makes it. No balance is left stale behind a dismissed dialog.
+        summary.ai.account.remainingMicro = summary.ai.account.totalMicro = '0';
+        getTopupStatus = () => reply(processing);
+        await handoff(true, true);
+        contains('#ai-credits', '0 credits left');
+        click(q('#ai-credits [data-action="topup"]'));
+        assert.equal(sheets.at(-1).kind, 'topup', 'a second Add credits dialog is open');
+        const held = count();
+        summary.ai.account.remainingMicro = summary.ai.account.totalMicro = '2500000000';
+        getTopupStatus = () => reply(credited);
+        await advanceTopup(3000);
+        assert.equal(count(), held, 'an open dialog still blocks the read');
+        contains('#ai-credits', '0 credits left');
+        await closeSheet();
+        assert.equal(count(), held + 1, 'closing that dialog reads the credited balance once');
+        contains('#ai-credits', '2,500 credits left');
+        assert.equal(topupTimers.size, 0);
+        pass('top-up watch: credited behind an open dialog re-reads the balance when that dialog closes');
+
+        const times = [];
+        getTopupStatus = () => {
+            times.push(topupTime);
+            if ( times.length === 1 ) return failure('temporary');
+            if ( times.length === 2 ) throw new Error('offline');
+            return reply(processing);
+        };
+        await handoff();
+        const started = topupTime;
+        for ( const delay of [3000, 5000, 8000, 13000, 21000, 30000, 30000] ) {
+            await advanceTopup(delay);
+            assert.equal(status(), pendingCopy, 'transient failures never imply payment failed');
+        }
+        assert.deepEqual(times.map(at => at - started), [3000, 8000, 16000, 29000, 50000, 80000, 110000]);
+        const beforeReview = count();
+        getTopupStatus = () => reply({ ...processing, fulfillment: 'review' });
+        window.dispatchEvent(new window.Event('focus')); await settle();
+        assert.equal(times.length, 7);
+        assert.equal(status(), window.topupCopy.TOPUP_REVIEW_COPY, 'focus checks a watch even on a fresh pane');
+        assert.equal(count(), beforeReview);
+        assert.equal(topupTimers.size, 0);
+        pass('top-up watch: backoff survives failed reads; focus checks immediately and review uses shared copy');
+
+        let finishRead;
+        getTopupStatus = () => new Promise(resolve => { finishRead = resolve; });
+        await handoff();
+        const beforeTimeout = count();
+        await advanceTopup(599999);
+        assert.equal(status(), pendingCopy);
+        await advanceTopup(1);
+        assert.equal(status(), window.topupCopy.TOPUP_TIMEOUT_COPY);
+        assert.equal(topupTimers.size, 0, 'a stalled read cannot extend the paid deadline');
+        finishRead(reply(credited)); await settle();
+        assert.equal(count(), beforeTimeout, 'late credit after the bound cannot revive a stopped watch');
+        assert.equal(status(), window.topupCopy.TOPUP_TIMEOUT_COPY);
+        pass('top-up watch: paid deadline uses shared timeout copy even with a hung read');
+
+        getTopupStatus = () => reply({ status: 'open', paymentStatus: 'unpaid', fulfillment: 'awaiting_payment' });
+        await handoff(false);
+        const cancelCopy = status(), beforeUnpaid = count();
+        assert.match(cancelCopy, /Checkout closed before payment finished/);
+        await advanceTopup(59999); assert.equal(status(), cancelCopy);
+        await advanceTopup(1);
+        assert.equal(topupTimers.size, 0);
+        const unpaidChecks = count('topupStatus');
+        await advanceTopup(60000);
+        assert.equal(count('topupStatus'), unpaidChecks);
+        assert.equal(count(), beforeUnpaid);
+        assert.equal(status(), cancelCopy);
+        await handoff(false);
+        await advanceTopup(3000);
+        getTopupStatus = () => reply(processing);
+        await advanceTopup(5000);
+        assert.equal(status(), pendingCopy, 'a complete paid reply starts the paid bound');
+        await advanceTopup(599999); assert.equal(status(), pendingCopy);
+        await advanceTopup(1); assert.equal(status(), window.topupCopy.TOPUP_TIMEOUT_COPY);
+        assert.equal(count(), beforeUnpaid);
+        pass('top-up watch: unpaid stops silently at 60 seconds; newly confirmed payment gets ten minutes');
+
+        getTopupStatus = () => reply({ status: 'expired', paymentStatus: 'unpaid', fulfillment: 'awaiting_payment' });
+        await handoff(false); await advanceTopup(3000); assert.equal(status(), cancelCopy);
+        await handoff(); await advanceTopup(3000); assert.equal(status(), '');
+        await handoff(); sheets.at(-1).onCancel(); await advanceTopup(3000);
+        assert.equal(status(), cancelCopy, 'expiry clears only status owned by this watch');
+        getTopupStatus = () => reply({ ...credited, credits: 2.5 });
+        await handoff(); await advanceTopup(3000);
+        assert.equal(status(), 'AI credits added.', 'an unusable server count is never replaced by the quoted pack');
+        pass('top-up watch: expiry respects status ownership and credited never shows an unconfirmed count');
+
+        getTopupStatus = () => reply(processing);
+        await handoff();
+        const beforeFocus = count(), oldSummary = copy(summary);
+        let finishSummary;
+        getSummary = () => new Promise(resolve => { finishSummary = resolve; });
+        now += 6 * 60 * 1000;
+        window.dispatchEvent(new window.Event('focus')); await settle();
+        assert.equal(count(), beforeFocus + 1, 'focus still reloads a pane older than five minutes');
+        summary.ai.account.remainingMicro = summary.ai.account.totalMicro = '3000000000';
+        getTopupStatus = () => reply(credited);
+        window.dispatchEvent(new window.Event('focus')); await settle();
+        assert.equal(count(), beforeFocus + 1, 'credit waits for the in-flight summary');
+        getSummary = () => reply(summary);
+        finishSummary(reply(oldSummary)); await settle();
+        assert.equal(count(), beforeFocus + 2, 'credit re-reads after the older summary finishes');
+        contains('#ai-credits', '3,000 credits left');
+        assert.equal(status(), '2,500 AI credits added.');
+        await handoff();
+        click(q('[data-tab="account"]')); await settle();
+        const inactiveReads = count();
+        await advanceTopup(3000);
+        assert.equal(count(), inactiveReads, 'an inactive Billing tab waits until activation to reload');
+        click(q('[data-tab="billing"]')); await settle();
+        assert.equal(count(), inactiveReads + 1);
+        assert.equal(status(), '2,500 AI credits added.', 'reactivation does not claim delivered credits are still pending');
+        pass('top-up watch: credit during an older summary forces a fresh balance; inactive Billing reloads on activation');
+
+        let finishOld, finishClosed;
+        getTopupStatus = () => new Promise(resolve => { finishOld = resolve; });
+        await handoff(); await advanceTopup(3000);
+        const beforeReplacement = count();
+        await handoff();
+        finishOld(reply(credited)); await settle();
+        assert.equal(count(), beforeReplacement, 'a replaced watch cannot reload Billing');
+        assert.equal(status(), pendingCopy);
+        getTopupStatus = () => new Promise(resolve => { finishClosed = resolve; });
+        await advanceTopup(3000);
+        const settings = q('.window[data-app="settings"]');
+        await window.$(settings).close(); await settle();
+        const afterClose = settings.innerHTML, closedChecks = count('topupStatus');
+        assert.equal(topupTimers.size, 0);
+        finishClosed(reply(credited)); await advanceTopup(600000);
+        window.dispatchEvent(new window.Event('focus')); await settle();
+        assert.equal(count('topupStatus'), closedChecks, 'closed Settings never polls again');
+        assert.equal(count(), beforeReplacement);
+        assert.equal(settings.innerHTML, afterClose, 'late answers never touch the removed window');
+        pass('top-up watch: replacement ignores old replies and Settings removal stops polling and DOM writes');
+    }
 
     let creditsScrolled = 0;
     window.HTMLElement.prototype.scrollIntoView = function () { if ( this.id === 'ai-credits' ) creditsScrolled++; };
