@@ -27,7 +27,7 @@ const CLIENT = 'https://chatgpt.com/oauth/client.json';
 const CLIENT2 = 'https://claude.ai/oauth/client.json';
 const WORKER_SECRET = 'worker-secret-for-tests-only';
 
-const h = vi.hoisted(() => ({ db: undefined as unknown, cookieUser: null as { id: string } | null, port: undefined as unknown }));
+const h = vi.hoisted(() => ({ db: undefined as unknown, cookieUser: null as { id: string } | null, port: undefined as unknown, observeAdmittedStart: vi.fn() }));
 
 vi.mock('server-only', () => ({}));
 vi.mock('@/env', () => ({ env: {} }));
@@ -35,7 +35,7 @@ vi.mock('@/server/db', () => ({ get db() { return h.db; } }));
 vi.mock('@/utils/supabase/server', () => ({
     createClient: async () => ({ auth: { getUser: async () => ({ data: { user: h.cookieUser }, error: null }) } }),
 }));
-vi.mock('@/server/computer-start/port', () => ({ startPort: () => h.port }));
+vi.mock('@/server/computer-start/port', () => ({ startPort: () => h.port, observeAdmittedStart: h.observeAdmittedStart }));
 
 const URL_ = process.env.DELEGATION_TEST_DATABASE_URL;
 const compact = (id: string) => id.replace(/-/g, '').toLowerCase().slice(0, 16);
@@ -181,6 +181,7 @@ describe.skipIf(!URL_)('EZiL MCP session controls on Postgres', () => {
     beforeEach(() => {
         for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
         resetPort();
+        h.observeAdmittedStart.mockReset().mockResolvedValue({ state: 'starting' });
         // The gate and the control wrapper audit every call; tests that read those lines spy again.
         vi.spyOn(console, 'info').mockImplementation(() => {});
     });
@@ -313,6 +314,30 @@ describe.skipIf(!URL_)('EZiL MCP session controls on Postgres', () => {
             expect(row).toMatchObject({ status: 'failed', reason: 'start_failed' });
         });
 
+        it.each(['running', 'failed'] as const)('polls an admitted AWS start to %s through the router without another boot', async status => {
+            port.instanceType = port.pinnedInstanceType = 'm6i.large';
+            port.pinnedKind = 'aws-ec2';
+            port.boot = { state: 'starting' };
+            const key = randomUUID();
+            const accepted = await data<Start>(await start({ computerId: ids.a1, idempotencyKey: key }));
+            expect(accepted).toMatchObject({ status: 'starting', reason: null });
+            expect((await controlRows(client`id = ${accepted.id}::uuid`))[0]).toMatchObject({ reason: 'aws_wake_dispatched:m6i.large' });
+            calls.length = 0;
+            h.observeAdmittedStart.mockResolvedValue(status === 'running' ? { state: status } : { state: status, reason: 'placement_unconfirmed' });
+            expect(await data(await read('agentSession.control', { kind: 'start', idempotencyKey: key }, { sub: bob })))
+                .toEqual({ found: false });
+            expect(await data(await read('agentSession.control', { kind: 'start', idempotencyKey: key }, { client_id: CLIENT2 })))
+                .toEqual({ found: false });
+            expect(h.observeAdmittedStart).not.toHaveBeenCalled();
+            expect(await data(await read('agentSession.control', { kind: 'start', idempotencyKey: key })))
+                .toMatchObject({ found: true, row: { id: accepted.id, status, reason: status === 'running' ? null : 'placement_unconfirmed' } });
+            expect(h.observeAdmittedStart).toHaveBeenCalledExactlyOnceWith(h.db, {
+                userId: alice, computerId: ids.a1, admittedRoute: { kind: 'aws-ec2', instanceType: 'm6i.large', moving: false },
+            });
+            expect(await data<Start>(await start({ computerId: ids.a1, idempotencyKey: key }))).toMatchObject({ id: accepted.id, status });
+            expect(calls).toEqual([]);
+        });
+
         it('a failure before the boot is recorded as failed (nothing started); a throw during it stays starting and is never rerun', async () => {
             vi.spyOn(console, 'error').mockImplementation(() => {});
             port.routeThrows = true;
@@ -323,7 +348,7 @@ describe.skipIf(!URL_)('EZiL MCP session controls on Postgres', () => {
             resetPort();
             port.bootThrows = true;
             const key = randomUUID();
-            expect((await start({ computerId: ids.a1, idempotencyKey: key })).status).toBe(500);
+            expect((await start({ computerId: ids.a1, idempotencyKey: key })).status).toBe(200);
             // Unknown whether it started: the row says so (starting), and a retry shows it without booting again.
             expect((await controlRows(client`idempotency_key = ${key}::uuid`))[0]).toMatchObject({ status: 'starting' });
             calls.length = 0;
@@ -331,7 +356,7 @@ describe.skipIf(!URL_)('EZiL MCP session controls on Postgres', () => {
             const reconciled = await data<Start>(await start({ computerId: ids.a1, idempotencyKey: key }));
             expect(reconciled).toMatchObject({ status: 'starting' });
             expect(await data(await read('agentSession.control', { kind: 'start', idempotencyKey: key })))
-                .toEqual({ found: true, row: reconciled });
+                .toMatchObject({ found: true, row: { id: reconciled.id, status: 'starting', reason: null } });
             expect(calls).toEqual([]);
         });
 
@@ -407,8 +432,8 @@ describe.skipIf(!URL_)('EZiL MCP session controls on Postgres', () => {
                 expect(receipt).toMatchObject({ status: 'starting', reason: null });
                 const stored = (await controlRows(client`id = ${receipt.id}::uuid`))[0];
                 expect(stored).toMatchObject({ status: 'starting', reason: marker });
-                expect(await data(await lookup(key))).toEqual({ found: true, row: receipt });
-                expect(await data(await start({ computerId: ids.a1, idempotencyKey: key }))).toEqual(receipt);
+                expect(await data(await lookup(key))).toMatchObject({ found: true, row: { id: receipt.id, status: 'starting', reason: null } });
+                expect(await data(await start({ computerId: ids.a1, idempotencyKey: key }))).toMatchObject({ id: receipt.id, status: 'starting', reason: null });
                 release();
                 await expect.poll(async () => (await data<{ row: Start }>(await lookup(key))).row.status).toBe('running');
                 expect(calls.filter(call => call === 'boot')).toHaveLength(1);
@@ -440,12 +465,11 @@ describe.skipIf(!URL_)('EZiL MCP session controls on Postgres', () => {
             const unadmitted = await seed(ids.a2, 'starting', null, 330);
             const fresh = await seed(ids.a1, 'starting', marker, 0);
             const freshBefore = await controlRows(client`id = ${fresh.id}::uuid`);
-            const unadmittedBefore = await controlRows(client`id = ${unadmitted.id}::uuid`);
             await restartAndObserve(async () => ({ state: 'starting' }));
             expect(await data(await lookup(waiting.key))).toMatchObject({ row: { id: waiting.id, status: 'starting', reason: null } });
             expect(await data(await lookup(timedOut.key))).toMatchObject({ row: { status: 'failed', reason: 'readiness_unconfirmed' } });
             expect(await controlRows(client`id = ${fresh.id}::uuid`)).toEqual(freshBefore);
-            expect(await controlRows(client`id = ${unadmitted.id}::uuid`)).toEqual(unadmittedBefore);
+            expect(await controlRows(client`id = ${unadmitted.id}::uuid`)).toMatchObject([{ status: 'failed', reason: 'readiness_unconfirmed' }]);
         });
 
         it('hands an expired claim to a fresh observer and ignores the original process when it returns', async () => {

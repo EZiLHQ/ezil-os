@@ -88,12 +88,15 @@ const sleep = (n: number) => new Promise<void>((resolve) => setTimeout(resolve, 
 
 /** Internal marker for an admitted Cloudflare start that the readiness observer may observe. */
 export const CLOUDFLARE_WAKE_DISPATCHED = 'cloudflare_wake_dispatched';
+/** AWS admission also retains the rated instance type; this is receipt metadata, never a credential. */
+export const AWS_WAKE_DISPATCHED = 'aws_wake_dispatched:';
 
 export function startControlView(row: Record<string, unknown>): StartRow {
     const status = START_STATUSES.find(candidate => candidate === row.status);
     if (!status) throw new Error('Invalid stored computer start status');
     return { id: String(row.id), computerId: String(row.computer_id), status, updatedAt: iso(row.updated_at),
-        reason: typeof row.reason === 'string' && row.reason !== CLOUDFLARE_WAKE_DISPATCHED ? row.reason : null };
+        reason: typeof row.reason === 'string' && row.reason !== CLOUDFLARE_WAKE_DISPATCHED
+            && !row.reason.startsWith(AWS_WAKE_DISPATCHED) ? row.reason : null };
 }
 
 // ── Shared rows (also used by computer.start) ────────────────────────────────

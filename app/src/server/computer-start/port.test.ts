@@ -15,8 +15,10 @@ const h = vi.hoisted(() => ({
     migration: vi.fn(),
     config: { isConfigured: true } as { isConfigured: boolean },
     enforcement: true,
+    services: true,
 }));
 
+vi.mock('@/server/api/editor-delegation', () => ({ editorControlsEnabled: () => h.services }));
 vi.mock('server-only', () => ({}));
 vi.mock('@/server/agent-session/control-store', () => ({ ownsComputer: h.ownsComputer }));
 vi.mock('@/server/api/routers/compute-dispatch', () => ({ routeComputer: h.routeComputer, cloudflareMigrationAnswer: h.migration }));
@@ -27,14 +29,14 @@ vi.mock('@/server/lib/cloudflare-guacamole-provider', () => ({ newCorrelationId:
 vi.mock('@/server/lib/compute/aws-preview', () => ({ prepareAwsPoolSession: h.prepareAwsPoolSession }));
 vi.mock('@/server/lib/compute/stop-policy', () => ({ stopComputerForPolicy: h.stopComputerForPolicy }));
 
-import { observeCloudflareStart, startPort } from './port';
+import { observeAdmittedStart, observeCloudflareStart, startPort } from './port';
 
 const COMPUTER = { userId: '11111111-1111-4111-8111-111111111111', computerId: '22222222-2222-4222-8222-222222222222' };
 const db = {};
 const ensure = vi.fn();
 const status = vi.fn();
 const cloudflare = { kind: 'cloudflare', provider: { ensure, status } };
-const aws = (extra: Record<string, unknown> = {}) => ({ kind: 'aws-ec2', instanceType: 'm6i.large', provider: { ensure }, ...extra });
+const aws = (extra: Record<string, unknown> = {}) => ({ kind: 'aws-ec2', instanceType: 'm6i.large', provider: { ensure, status }, ...extra });
 
 beforeEach(() => {
     vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
@@ -42,6 +44,7 @@ beforeEach(() => {
     for (const mock of [h.routeComputer, h.gateComputerStart, h.ready, h.stopComputerForPolicy, h.prepareAwsPoolSession, h.migration, ensure, status]) mock.mockReset();
     h.config = { isConfigured: true };
     h.enforcement = true;
+    h.services = true;
     h.ownsComputer.mockReset().mockResolvedValue(true);
     h.migration.mockReturnValue(null);
     h.gateComputerStart.mockResolvedValue({ allowed: true });
@@ -49,6 +52,100 @@ beforeEach(() => {
 });
 
 afterEach(() => vi.unstubAllEnvs());
+
+describe('observeAdmittedStart (AWS)', () => {
+    const admitted = { ...COMPUTER, admittedRoute: { kind: 'aws-ec2' as const, instanceType: 'm6i.large', moving: false } };
+    const observe = () => observeAdmittedStart(db, admitted);
+    beforeEach(() => {
+        vi.stubEnv('EZIL_AWS_COMPUTERS_ENABLED', '1');
+        vi.stubEnv('EZIL_AWS_KILL_SWITCH', '0');
+        h.routeComputer.mockResolvedValue(aws());
+        status.mockResolvedValue({ ok: true, state: 'running', placementState: 'RUNNING' });
+    });
+    afterEach(() => {
+        expect(ensure).not.toHaveBeenCalled();
+        expect(h.gateComputerStart).not.toHaveBeenCalled();
+        expect(h.prepareAwsPoolSession).not.toHaveBeenCalled();
+        expect(h.ready).not.toHaveBeenCalled(); // AWS status, never the CF meter, owns AWS accounting.
+        expect(h.stopComputerForPolicy).not.toHaveBeenCalled();
+        expect(h.routeComputer.mock.calls.every(([, , opts]) => opts.pinCloudflare === false)).toBe(true);
+    });
+
+    it('publishes only the existing provider status confirmation of a running session', async () => {
+        expect(await observe()).toEqual({ state: 'running' });
+        expect(status).toHaveBeenCalledExactlyOnceWith({ correlationId: 'corr-1' }, COMPUTER);
+    });
+
+    it.each([
+        { ok: true },
+        { ok: true, state: 'starting', placementState: 'MOUNTING' },
+        { ok: true, state: 'running' },
+        { ok: false, state: 'running', placementState: 'RUNNING' },
+        { ok: true, state: 'running', placementState: 'RUNNING', computeLaunching: true },
+        { ok: false, error: 'aws_disabled' },
+    ])('keeps incomplete or ambiguous evidence pending: %j', async answer => {
+        status.mockResolvedValue(answer);
+        expect(await observe()).toEqual({ state: 'starting' });
+    });
+
+    it.each([
+        [{ ok: false, state: 'error', error: 'placement_unconfirmed' }, 'placement_unconfirmed'],
+        [{ ok: true, state: 'stopped' }, 'computer_stopped'],
+        [{ ok: true, state: 'stopping' }, 'computer_stopping'],
+    ])('retains an explicit provider failure: %j', async (answer, reason) => {
+        status.mockResolvedValue(answer);
+        expect(await observe()).toEqual({ state: 'failed', reason });
+    });
+
+    it.each([cloudflare, aws({ instanceType: 'm6i.xlarge' }), aws({ reverse: 'moving' }), aws({ reverse: 'blocked' })])(
+        'rejects a changed route before status: %j', async target => {
+            h.routeComputer.mockResolvedValue(target);
+            expect(await observe()).toEqual({ state: 'failed', reason: 'route_changed' });
+            expect(status).not.toHaveBeenCalled();
+        });
+
+    it('rejects a provider change during status', async () => {
+        h.routeComputer.mockResolvedValueOnce(aws()).mockResolvedValue(cloudflare);
+        expect(await observe()).toEqual({ state: 'failed', reason: 'route_changed' });
+        expect(status).toHaveBeenCalledTimes(1);
+    });
+
+    it('checks ownership before status and again before accepting its result', async () => {
+        h.ownsComputer.mockResolvedValue(false);
+        expect(await observe()).toEqual({ state: 'failed', reason: 'computer_unavailable' });
+        expect(status).not.toHaveBeenCalled();
+        h.ownsComputer.mockResolvedValueOnce(true).mockResolvedValue(false);
+        expect(await observe()).toEqual({ state: 'failed', reason: 'computer_unavailable' });
+        expect(status).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['services', 'placement', 'aws', 'kill'])('does not contact a provider while %s is disabled', async gate => {
+        if (gate === 'services') h.services = false;
+        if (gate === 'placement') {
+            vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '0');
+            vi.stubEnv('EZIL_AWS_COMPUTERS_ENABLED', '0'); // AWS enabled implies placement reads in the supported config.
+        }
+        if (gate === 'aws') vi.stubEnv('EZIL_AWS_COMPUTERS_ENABLED', '0');
+        if (gate === 'kill') vi.stubEnv('EZIL_AWS_KILL_SWITCH', '1');
+        expect(await observe()).toEqual({ state: 'starting' });
+        expect(h.routeComputer).not.toHaveBeenCalled();
+        expect(status).not.toHaveBeenCalled();
+    });
+
+    it('rechecks kill and service gates after status', async () => {
+        status.mockImplementation(async () => {
+            vi.stubEnv('EZIL_AWS_KILL_SWITCH', '1');
+            return { ok: true, state: 'running', placementState: 'RUNNING' };
+        });
+        expect(await observe()).toEqual({ state: 'starting' });
+        vi.stubEnv('EZIL_AWS_KILL_SWITCH', '0');
+        status.mockImplementation(async () => {
+            h.services = false;
+            return { ok: true, state: 'running', placementState: 'RUNNING' };
+        });
+        expect(await observe()).toEqual({ state: 'starting' });
+    });
+});
 
 describe('startPort', () => {
     it('refuses when placement reads are disabled before provider, pin, billing or ensure', async () => {
@@ -100,6 +197,20 @@ describe('startPort', () => {
             const route = await port.route(true);
             return port.boot(route);
         };
+
+        it('confirms the original ready answer against the live route without applying the Cloudflare meter', async () => {
+            vi.stubEnv('EZIL_AWS_COMPUTERS_ENABLED', '1');
+            vi.stubEnv('EZIL_AWS_KILL_SWITCH', '0');
+            h.routeComputer.mockResolvedValue(aws());
+            const port = startPort(db, COMPUTER);
+            await port.route(true);
+            expect(await port.recordReady!()).toEqual({ state: 'running' });
+            h.routeComputer.mockResolvedValue(cloudflare);
+            expect(await port.recordReady!()).toEqual({ state: 'failed', reason: 'route_changed' });
+            expect(h.ready).not.toHaveBeenCalled();
+            expect(h.gateComputerStart).not.toHaveBeenCalled();
+            expect(ensure).not.toHaveBeenCalled();
+        });
 
         it('ready is running, with the computer id as the session and no screen or folder', async () => {
             ensure.mockResolvedValue({ ok: true });

@@ -6,6 +6,7 @@
  * `running` means the provider answered ready (and the meter was told), not that a browser frame was confirmed.
  * A delegated start carries no browser cookie. The owner's configured editor bridge handles its own authorization.
  */
+import { editorControlsEnabled } from '@/server/api/editor-delegation';
 import { ownsComputer } from '@/server/agent-session/control-store';
 import type { SqlExecutor } from '@/server/agent-session/store';
 import { getBillingDeps } from '@/server/billing/deps';
@@ -15,12 +16,13 @@ import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observatio
 import { cloudflareMigrationAnswer, routeComputer, type RoutedComputer } from '@/server/api/routers/compute-dispatch';
 import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 import { prepareAwsPoolSession } from '@/server/lib/compute/aws-preview';
-import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
+import { isAwsComputersEnabled, isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
+import type { AwsComputeStatus } from '@/server/lib/compute/aws-ec2';
 import type { PlacementDb } from '@/server/lib/compute/placement';
 import type { ComputerRef, EnsureOptions } from '@/server/lib/compute/provider';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 
-import type { BootOutcome, StartPort, StartRoute } from './start';
+import type { AdmittedStartComputer, BootOutcome, StartPort, StartRoute } from './start';
 
 type Db = Parameters<typeof routeComputer>[0];
 
@@ -77,7 +79,14 @@ export function startPort(db: Db, computer: ComputerRef): StartPort {
             }
             return result.guacamoleUrl || result.appPreviewUrl || result.codePreviewUrl ? { state: 'running' } : { state: 'starting' };
         },
-        recordReady: () => recordCloudflareReady(db, computer),
+        async recordReady() {
+            const admitted = describe(current());
+            if (!observationEnabled(admitted)) return { state: 'starting' };
+            if (!await ownsComputer(db as SqlExecutor, computer.userId, computer.computerId)) return { state: 'failed', reason: 'computer_unavailable' };
+            if (!routeMatches(await routeComputer(db, computer, { pinCloudflare: false }), admitted)) return { state: 'failed', reason: 'route_changed' };
+            if (!observationEnabled(admitted)) return { state: 'starting' };
+            return admitted.kind === 'cloudflare' ? recordCloudflareReady(db, computer) : { state: 'running' };
+        },
     };
 }
 
@@ -102,11 +111,50 @@ async function recordCloudflareReady(db: Db, computer: ComputerRef): Promise<Boo
     return { state: 'running' };
 }
 
-/** Reconcile an admitted start without a second ensure, placement write or allowance decision. */
-export async function observeCloudflareStart(db: Db, computer: ComputerRef): Promise<BootOutcome> {
-    if (!isPlacementReadEnabled()) return { state: 'starting' };
+function observationEnabled(route: StartRoute): boolean {
+    return editorControlsEnabled(process.env) && isPlacementReadEnabled()
+        && (route.kind !== 'aws-ec2' || (isAwsComputersEnabled()
+            && (process.env.EZIL_AWS_KILL_SWITCH === undefined || process.env.EZIL_AWS_KILL_SWITCH === '0')));
+}
+
+function routeMatches(target: RoutedComputer, admitted: StartRoute): boolean {
+    return target.kind === admitted.kind
+        && (target.kind !== 'aws-ec2' || (!target.reverse && target.instanceType === admitted.instanceType));
+}
+
+/** Reconcile the admitted route using its normal status path, never ensure or a new allowance decision.
+ * AWS status owns lifecycle reconciliation, session-limit enforcement and AWS metering. It must never receive
+ * the Cloudflare ready meter. A boolean `ok` alone is not evidence that an AWS session is running.
+ */
+export async function observeAdmittedStart(db: Db, admitted: AdmittedStartComputer): Promise<BootOutcome> {
+    const computer: ComputerRef = { userId: admitted.userId, computerId: admitted.computerId };
+    const enabled = () => observationEnabled(admitted.admittedRoute);
+    if (!enabled()) return { state: 'starting' };
+    if (!await ownsComputer(db as SqlExecutor, computer.userId, computer.computerId)) return { state: 'failed', reason: 'computer_unavailable' };
+    const matches = (target: RoutedComputer) => routeMatches(target, admitted.admittedRoute);
     const target = await routeComputer(db, computer, { pinCloudflare: false });
-    if (target.kind !== 'cloudflare') return { state: 'failed', reason: 'route_changed' };
+    if (!matches(target)) return { state: 'failed', reason: 'route_changed' };
+    if (!enabled()) return { state: 'starting' };
     const status = await target.provider.status({ correlationId: newCorrelationId() }, computer);
-    return status.ok && status.guacamoleRunning === true ? recordCloudflareReady(db, computer) : { state: 'starting' };
+    if (!enabled()) return { state: 'starting' };
+    if (!await ownsComputer(db as SqlExecutor, computer.userId, computer.computerId)) return { state: 'failed', reason: 'computer_unavailable' };
+    // Status may spend seconds reconciling. Never publish readiness for a replacement route or a move.
+    if (!matches(await routeComputer(db, computer, { pinCloudflare: false }))) return { state: 'failed', reason: 'route_changed' };
+    if (!enabled()) return { state: 'starting' };
+    if (target.kind === 'cloudflare') {
+        if (cloudflareMigrationAnswer(status)) return { state: 'failed', reason: 'computer_migrating' };
+        return status.ok && 'guacamoleRunning' in status && status.guacamoleRunning === true
+            ? recordCloudflareReady(db, computer) : { state: 'starting' };
+    }
+    const aws = status as AwsComputeStatus;
+    if (aws.ok && aws.state === 'running' && aws.placementState === 'RUNNING' && !aws.computeLaunching) return { state: 'running' };
+    if (aws.state === 'error') return { state: 'failed', reason: aws.error ?? 'computer_unavailable' };
+    if (aws.state === 'stopped' || aws.state === 'stopping') return { state: 'failed', reason: `computer_${aws.state}` };
+    // Disabled/unconfigured providers and ambiguous status responses cannot prove readiness; the receipt expires.
+    return { state: 'starting' };
+}
+
+/** Compatibility for callers that only observe admitted Cloudflare wakes. */
+export async function observeCloudflareStart(db: Db, computer: ComputerRef): Promise<BootOutcome> {
+    return observeAdmittedStart(db, { ...computer, admittedRoute: { kind: 'cloudflare', instanceType: null, moving: false } });
 }

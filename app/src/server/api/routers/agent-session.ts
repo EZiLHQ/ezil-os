@@ -97,11 +97,11 @@ export const agentSessionRouter = createTRPCRouter({
         .query(({ ctx, input }) => run(async () => {
             const caller = { userId: ctx.user.id, clientId: clientOf(ctx) };
             if (input.kind === 'start') {
-                const [{ reconcileColdStart }, { observeCloudflareStart }] = await Promise.all([
+                const [{ reconcileColdStart }, { observeAdmittedStart }] = await Promise.all([
                     import('@/server/computer-start/start'), import('@/server/computer-start/port'),
                 ]);
                 await reconcileColdStart(ctx.db as unknown as SessionDb, caller, input.idempotencyKey,
-                    computer => observeCloudflareStart(ctx.db, computer));
+                    computer => observeAdmittedStart(ctx.db, computer));
             }
             return getControl(ctx.db, caller, input);
         })),

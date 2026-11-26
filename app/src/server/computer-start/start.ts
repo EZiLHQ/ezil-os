@@ -15,7 +15,7 @@
  *
  * The heavy collaborators (routing, billing gate, providers, meter) are a `StartPort` so this order can be proven on
  * its own; `./port.ts` wires the real ones. A failure BEFORE the boot is recorded `failed` (nothing started). A throw
- * DURING the boot leaves an admitted CF row available for recovery. The existing minute sweep observes readiness
+ * DURING the boot leaves an admitted row available for recovery. The existing minute sweep observes readiness
  * without waking the computer again. A retry with the same key always reads the same operation.
  */
 import { createHash, randomUUID } from 'node:crypto';
@@ -25,10 +25,11 @@ import { sql } from 'drizzle-orm';
 import { after } from 'next/server';
 
 import {
-    CLOUDFLARE_WAKE_DISPATCHED, insertControl, ownsComputer, PROCEDURE_OF, pruneControlSometimes, replayControl, startControlView,
+    AWS_WAKE_DISPATCHED, CLOUDFLARE_WAKE_DISPATCHED, insertControl, ownsComputer, PROCEDURE_OF, pruneControlSometimes, replayControl, startControlView,
     type ControlCaller, type StartRow, type StartStatus,
 } from '@/server/agent-session/control-store';
 import { SessionStoreError, type SessionDb, type SqlExecutor } from '@/server/agent-session/store';
+import { editorControlsEnabled } from '@/server/api/editor-delegation';
 
 export interface StartRoute {
     kind: 'cloudflare' | 'aws-ec2';
@@ -47,7 +48,7 @@ export interface StartPort {
     gate(route: StartRoute): Promise<GateOutcome>;
     /** Ensure the computer is running, and meter it when it is ready. Never returns a URL. */
     boot(route: StartRoute): Promise<BootOutcome>;
-    /** Meter the original CF wake only after the durable operation's observation claim is acquired. */
+    /** Confirm the admitted route is still current; meter CF only, under the operation's observation claim. */
     recordReady?(): Promise<BootOutcome>;
 }
 
@@ -108,87 +109,122 @@ export async function startComputer(db: SessionDb, port: StartPort, caller: Cont
         console.error('[computer.start] refused before boot', { computerId: input.computerId, error: error instanceof Error ? error.name : 'error' });
         return await finish(db, id, 'failed', 'start_error');
     }
-    if (pinned.kind === 'cloudflare') {
-        // The accepted row precedes the single provider dispatch. If this process disappears, the sweep only
-        // observes the admitted computer. A same-key retry never initiates another wake.
-        const accepted = await finish(db, id, 'starting', CLOUDFLARE_WAKE_DISPATCHED);
-        const completion = port.boot(pinned).then(outcome => settleCloudflareStart(db, id, () =>
-            outcome.state === 'running' && port.recordReady ? port.recordReady() : Promise.resolve(outcome)));
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        try {
-            const early = await Promise.race([
-                completion,
-                new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 2_000); }),
-            ]);
-            if (early) return early;
-            // Next ties the same in-flight call to this request's lifetime. The persisted row and scheduled
-            // non-waking observer are sufficient when the connection closes or the process is replaced.
-            const tracked = completion.catch(() => {});
-            try { after(tracked); } catch { /* A direct tRPC caller has no Next request context. */ }
-            return accepted;
-        } finally {
-            clearTimeout(timer);
-        }
+    // Persist the admission BEFORE the single dispatch. A crash or ambiguous throw can only be observed,
+    // never redispatched. Retain the rated route in the receipt so a later provider/size change cannot pass.
+    const marker = pinned.kind === 'cloudflare' ? CLOUDFLARE_WAKE_DISPATCHED : AWS_WAKE_DISPATCHED + (pinned.instanceType ?? '');
+    const admitted = await db.execute(sql`/* start:admit */
+        UPDATE public.ezil_control_operations op SET reason = ${marker}, updated_at = clock_timestamp()
+        WHERE op.id = ${id}::uuid AND op.status = 'starting' AND op.reason IS NULL
+            AND EXISTS (SELECT 1 FROM public.ezil_computers c WHERE c.id = op.computer_id
+                AND c.user_id = op.user_id AND c.deleted_at IS NULL)
+        RETURNING id, computer_id, status, updated_at, reason`);
+    if (admitted.length !== 1) return finish(db, id, 'failed', 'computer_unavailable');
+    const accepted = startControlView(admitted[0]!);
+    const completion = Promise.resolve().then(() => port.boot(pinned))
+        // A rejected boot does not prove that dispatch failed. Keep its admission for bounded observation.
+        .catch((): BootOutcome => ({ state: 'starting' }))
+        .then(outcome => settleAdmittedStart(db, id, () =>
+            outcome.state === 'running' && port.recordReady
+                ? port.recordReady() : Promise.resolve(outcome)));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        const early = await Promise.race([
+            completion,
+            new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 2_000); }),
+        ]);
+        if (early) return early;
+        // Track the same call, not a new boot. Recovery works after this process has gone away.
+        const tracked = completion.catch(() => {});
+        try { after(tracked); } catch { /* A direct tRPC caller has no Next request context. */ }
+        return accepted;
+    } finally {
+        clearTimeout(timer);
     }
-    const booted = await port.boot(pinned);
-    if (booted.state === 'running') return finish(db, id, 'running', null);
-    if (booted.state === 'starting') return finish(db, id, 'starting', null);
-    return finish(db, id, 'failed', codeOf(booted.reason, 'start_failed'));
 }
 
-type Computer = { userId: string; computerId: string };
-type ObserveStart = (computer: Computer) => Promise<BootOutcome>;
+export type AdmittedStartComputer = {
+    userId: string;
+    computerId: string;
+    /** Derived only from the durable admission, never from a caller's requested route. */
+    admittedRoute: StartRoute;
+};
+type ObserveStart = (computer: AdmittedStartComputer) => Promise<BootOutcome>;
+
+// A NULL legacy receipt proves no admission. It may expire, but must never reach a provider observer.
+const observable = sql`(op.reason = ${CLOUDFLARE_WAKE_DISPATCHED} OR starts_with(op.reason, ${AWS_WAKE_DISPATCHED})
+    OR (op.reason IS NULL AND op.created_at < clock_timestamp() - interval '5 minutes'))`;
 
 /** A caller polling its own start can recover readiness without dispatching a second wake or adding a cron. */
 export async function reconcileColdStart(db: SessionDb, caller: ControlCaller, key: string, observe: ObserveStart): Promise<void> {
+    if (!editorControlsEnabled(process.env)) return;
     const rows = await db.execute(sql`/* start:caller-observation */
         SELECT op.id FROM public.ezil_control_operations op JOIN public.ezil_computers c
             ON c.id = op.computer_id AND c.user_id = op.user_id AND c.deleted_at IS NULL
         WHERE op.user_id = ${caller.userId}::uuid AND op.client_id = ${caller.clientId}
             AND op.idempotency_key = ${key}::uuid AND op.proc = ${PROCEDURE_OF.start} AND op.kind = 'start'
-            AND op.status = 'starting' AND op.reason = ${CLOUDFLARE_WAKE_DISPATCHED}
+            AND op.status = 'starting' AND ${observable}
             AND (op.not_before IS NULL OR op.not_before <= clock_timestamp()) LIMIT 1`);
-    if (rows.length === 1) await settleCloudflareStart(db, String(rows[0]!.id), observe, true);
+    if (rows.length === 1) await settleAdmittedStart(db, String(rows[0]!.id), observe);
 }
 
 /** Fence the ready-time observation with the control row's existing attempt fields. No connection is held
  * across a Worker or billing call. A replaced process relinquishes the claim when its bounded lease expires. */
-async function settleCloudflareStart(db: SessionDb, id: string, observe: ObserveStart, recovering = false): Promise<StartRow> {
+async function settleAdmittedStart(db: SessionDb, id: string, observe: ObserveStart): Promise<StartRow> {
     const attempt = randomUUID();
     const rows = await db.execute(sql`/* start:claim-observation */
         UPDATE public.ezil_control_operations op SET attempt_id = ${attempt}::uuid, not_before = clock_timestamp() + interval '60 seconds'
-        WHERE op.id = ${id}::uuid AND op.kind = 'start' AND op.status = 'starting' AND op.reason = ${CLOUDFLARE_WAKE_DISPATCHED}
+        WHERE op.id = ${id}::uuid AND op.kind = 'start' AND op.status = 'starting' AND ${observable}
             AND (op.not_before IS NULL OR op.not_before <= clock_timestamp())
             AND EXISTS (SELECT 1 FROM public.ezil_computers c WHERE c.id = op.computer_id
                 AND c.user_id = op.user_id AND c.deleted_at IS NULL)
-        RETURNING user_id, computer_id, created_at < clock_timestamp() - interval '5 minutes' AS past_deadline`);
+        RETURNING user_id, computer_id, reason, created_at < clock_timestamp() - interval '5 minutes' AS past_deadline`);
     if (rows.length !== 1) return readStart(db, id);
     const row = rows[0]!;
-    const outcome: BootOutcome = recovering && row.past_deadline
-        ? { state: 'failed', reason: 'readiness_unconfirmed' }
-        : await observe({ userId: String(row.user_id), computerId: String(row.computer_id) });
-    const reason = outcome.state === 'starting' ? CLOUDFLARE_WAKE_DISPATCHED
+    const marker = String(row.reason);
+    const admittedRoute: StartRoute = marker === CLOUDFLARE_WAKE_DISPATCHED
+        ? { kind: 'cloudflare', instanceType: null, moving: false }
+        : { kind: 'aws-ec2', instanceType: marker.slice(AWS_WAKE_DISPATCHED.length) || null, moving: false };
+    let outcome: BootOutcome;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        outcome = row.past_deadline ? { state: 'failed', reason: 'readiness_unconfirmed' }
+            : await Promise.race([
+                observe({ userId: String(row.user_id), computerId: String(row.computer_id), admittedRoute }),
+                new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('observation timeout')), 5_000); }),
+            ]);
+    } catch {
+        // Leave the claim until its lease expires. A late answer cannot publish readiness, and a later poll
+        // can retry status (never boot) or close the receipt at its original five-minute deadline.
+        return readStart(db, id);
+    } finally {
+        clearTimeout(timer);
+    }
+    const reason = outcome.state === 'starting' ? marker
         : outcome.state === 'failed' ? codeOf(outcome.reason, 'start_failed') : null;
     const saved = await db.execute(sql`/* start:finish-observation */
-        UPDATE public.ezil_control_operations op SET status = ${outcome.state}, reason = ${reason}, updated_at = clock_timestamp(),
+        UPDATE public.ezil_control_operations op SET
+            status = CASE WHEN created_at < clock_timestamp() - interval '5 minutes' THEN 'failed' ELSE ${outcome.state} END,
+            reason = CASE WHEN created_at < clock_timestamp() - interval '5 minutes' THEN 'readiness_unconfirmed' ELSE ${reason} END,
+            updated_at = clock_timestamp(),
             attempt_id = NULL, not_before = NULL
-        WHERE op.id = ${id}::uuid AND op.status = 'starting' AND op.attempt_id = ${attempt}::uuid
+        WHERE op.id = ${id}::uuid AND op.status = 'starting' AND op.attempt_id = ${attempt}::uuid AND op.not_before > clock_timestamp()
             AND EXISTS (SELECT 1 FROM public.ezil_computers c WHERE c.id = op.computer_id AND c.user_id = op.user_id AND c.deleted_at IS NULL)
         RETURNING id, computer_id, status, updated_at, reason`);
     return saved.length === 1 ? startControlView(saved[0]!) : readStart(db, id);
 }
 
-/** Existing minute sweep: inspect only explicit CF wake admissions. Never re-dispatch a start, including after a crash. */
+/** Existing minute sweep: inspect explicit wake admissions and expire unconfirmed legacy receipts. Never re-dispatch a start, including after a crash. */
 export async function reconcileColdStarts(db: SessionDb, observe: ObserveStart): Promise<void> {
+    if (!editorControlsEnabled(process.env)) return;
     const due = await db.execute(sql`/* start:due */
         SELECT op.id FROM public.ezil_control_operations op JOIN public.ezil_computers c
             ON c.id = op.computer_id AND c.user_id = op.user_id AND c.deleted_at IS NULL
         WHERE op.proc = ${PROCEDURE_OF.start} AND op.kind = 'start' AND op.status = 'starting'
-            AND op.reason = ${CLOUDFLARE_WAKE_DISPATCHED} AND (op.not_before IS NULL OR op.not_before <= clock_timestamp())
+            AND ${observable} AND (op.not_before IS NULL OR op.not_before <= clock_timestamp())
             AND op.updated_at <= clock_timestamp() - interval '15 seconds'
         ORDER BY op.updated_at, op.id LIMIT 8`);
     await Promise.all(Array.from(due, async row => {
-        try { await settleCloudflareStart(db, String(row.id), observe, true); }
+        try { await settleAdmittedStart(db, String(row.id), observe); }
         catch { console.warn('[computer.start] readiness observation unavailable', { operationId: row.id }); }
     }));
 }

@@ -335,7 +335,7 @@ describe.skipIf(!URL_)('model choice through the MCP: real Gateway evidence per 
         // Each local connector fixture has its own exact Auth0 subject grant. The hosted counterpart
         // intentionally rejects the older broad Supabase fixture; never relax its real policy.
         for (const [who, person] of Object.entries(people)) {
-            await client`UPDATE auth.users SET raw_app_meta_data = jsonb_build_object('auth0_sub', ${`auth0|synthetic-mcp-${who}`}::text)
+            await client`UPDATE auth.users SET raw_app_meta_data = jsonb_build_object('auth0_sub', ${`auth0|synthetic-mcp-${person.user}`}::text)
                 WHERE id = ${person.user}::uuid`;
         }
         const realFetch = globalThis.fetch;
@@ -346,10 +346,10 @@ describe.skipIf(!URL_)('model choice through the MCP: real Gateway evidence per 
             return request.method === 'GET' ? trpcGet(request) : trpcPost(request);
         });
         const ctxFor = (who: Who) => ({
-            props: { issuer: 'https://id.ezil.work/', sub: `auth0|synthetic-mcp-${who}`, email: `${who}@example.com`, name: who, provider: 'ezil_id' },
+            props: { issuer: 'https://id.ezil.work/', sub: `auth0|synthetic-mcp-${people[who].user}`, email: `${who}@example.com`, name: who, provider: 'ezil_id' },
             scopes: ['ezil:account', 'ezil:computers:read', 'ezil:computers:start', 'ezil:sessions:read', 'ezil:sessions:write'], clientId: CLIENT,
             env: { SESSION_TOOLS: 'enabled', OS_ORIGIN: OS, PUBLIC_ORIGIN: MCP, SUPABASE_URL: SUPABASE, DELEGATION_CLIENT_IDS: CLIENT,
-                SESSION_CANARY_SUBJECT: `auth0|synthetic-mcp-${who}`, EZIL_ID_CLIENT_ID: 'synthetic-client', EZIL_ID_CLIENT_SECRET: 'synthetic-only',
+                SESSION_CANARY_SUBJECT: `auth0|synthetic-mcp-${people[who].user}`, EZIL_ID_CLIENT_ID: 'synthetic-client', EZIL_ID_CLIENT_SECRET: 'synthetic-only',
                 DELEGATION_KID: 'mcp-test', DELEGATION_PRIVATE_JWK: JSON.stringify(privateJwk) },
         });
         const call = (tool: Tool, who: Who, args: Record<string, unknown>) => tool.handler(args, ctxFor(who));
