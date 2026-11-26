@@ -113,8 +113,34 @@ describe('embedded workspace return: the same EZiL ID, kept for the work window,
         expect(login.origin+login.pathname).toBe(origin+'/auth/auth0/login');
         expect([...login.searchParams.keys()]).toEqual(['returnUrl']);
         expect(login.searchParams.get('returnUrl')).toBe(owned);
-        expect(response.headers.get('set-cookie')).toBeNull();
+        expect(response.headers.get('set-cookie')).toBe(cookie+'='+id+'; Path=/; Max-Age=120; HttpOnly; Secure; SameSite=Lax');
         expect(mocks.identity).not.toHaveBeenCalled();
+        // The sign-in came back with a session and its EZiL ID: the workspace, with no second trip.
+        mocks.context.mockResolvedValue({user:{id:'signed-in'},delegation:null});
+        const back=await get(owned,cookie+'='+id);
+        expect(back.headers.get('location')).toBe(workspace);
+        expect(back.headers.get('set-cookie')).toContain(cookie+'=; Path=/; Max-Age=0');
+    });
+    it('🔴 a sign-in that came back without an OS session stops at the lock screen; Continue there is one more try',async()=>{
+        mocks.context.mockResolvedValue({user:null,delegation:null});
+        const repeat=await get(owned,cookie+'='+id);
+        const stop=where(repeat);
+        expect(stop.origin+stop.pathname).toBe(origin+'/login');
+        expect(stop.searchParams.get('error')).toBe('auth_callback_failed');
+        expect(stop.searchParams.get('returnUrl')).toBe(owned);
+        expect(repeat.headers.get('set-cookie')).toContain(cookie+'=; Path=/; Max-Age=0');
+        // The marker is spent, so the person's own Continue gets exactly one automatic trip again, then the same stop.
+        const retry=await get(owned);
+        expect(where(retry).pathname).toBe('/auth/auth0/login');
+        expect(retry.headers.get('set-cookie')).toContain(cookie+'='+id+';');
+        expect(where(await get(owned,cookie+'='+id)).pathname).toBe('/login');
+        expect(mocks.identity).not.toHaveBeenCalled();
+    });
+    it('🔴 a fresh sign-in that kept no EZiL ID is not followed by a silent refresh',async()=>{
+        mocks.identity.mockRejectedValue(new Error('IDENTITY_REFRESH_REQUIRED'));
+        const response=where(await get(owned,cookie+'='+id));
+        expect(response.origin+response.pathname).toBe(origin+'/login');
+        expect(response.searchParams.has('prompt')).toBe(false);
     });
     it('🔴 an OS session without its retained EZiL ID is refreshed silently, once, instead of bouncing back to Universe',async()=>{
         mocks.identity.mockRejectedValue(new Error('IDENTITY_REFRESH_REQUIRED'));
