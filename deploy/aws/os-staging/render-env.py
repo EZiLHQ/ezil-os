@@ -96,6 +96,13 @@ NATIVE_SWITCHES = ("EZIL_NATIVE_SESSIONS", "EZIL_NATIVE_AUTH_INTENTS",
 # unsafe pin as "not configured" and anything but the exact gate value "enabled" as off, so the
 # renderer refuses what the receiver would silently ignore. Off unless the gate is "enabled".
 DELEGATION_GATE = "EZIL_DELEGATED_COMPUTER_READS"
+EDITOR_SWITCHES = ("EZIL_DELEGATED_EDITOR_SESSIONS", "EZIL_EDITOR_BRIDGE", "EZIL_EDITOR_BRIDGE_CONTROLS")
+ONBOARDING_GATE = "EZIL_DELEGATED_ONBOARDING"
+MCP_BOOTSTRAP_CLIENT = "EZIL_MCP_IDENTITY_BOOTSTRAP_AUTH0_CLIENT_ID"
+EDITOR_PRODUCER_PINS = ("EZIL_EDITOR_WORKER_ORIGIN", "EZIL_EDITOR_WORKER_PROTOCOL")
+OS_PUBLIC_ORIGIN = "EZIL_OS_PUBLIC_ORIGIN"
+PREVIEW_TOKEN_V2 = "EZIL_PREVIEW_TOKEN_V2"
+PRODUCTION_EDITOR = frozenset((*EDITOR_SWITCHES, ONBOARDING_GATE, MCP_BOOTSTRAP_CLIENT, *EDITOR_PRODUCER_PINS, OS_PUBLIC_ORIGIN, PREVIEW_TOKEN_V2))
 DELEGATION_PINS = ("EZIL_DELEGATION_ISSUER", "EZIL_DELEGATION_AUDIENCE",
                    "EZIL_DELEGATION_PUBLIC_JWKS", "EZIL_DELEGATION_CLIENT_IDS")
 # Caddy serves exactly these two names for production OS; the audience is the origin the MCP signs.
@@ -122,7 +129,7 @@ def validate(values, environment="staging"):
         raise RenderError("Expected a JSON object")
     allowed = REQUIRED | OPTIONAL
     if environment == "production":
-        allowed |= PRODUCTION_NATIVE | PRODUCTION_BROWSER | PRODUCTION_ASSIGNMENT
+        allowed |= PRODUCTION_NATIVE | PRODUCTION_BROWSER | PRODUCTION_ASSIGNMENT | PRODUCTION_EDITOR
     if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):
         raise RenderError("Unknown key refused")
     if REQUIRED - values.keys():
@@ -139,6 +146,7 @@ def validate(values, environment="staging"):
     validate_delegation(values, environment)
     if environment == "production":
         validate_production(values)
+        validate_production_editor(values)
         return validate_production_assignment(values)
     elif any(marker in value for value in values.values() for marker in PRODUCTION_MARKERS):
         raise RenderError("Staging refuses production API or database values")
@@ -221,6 +229,42 @@ def validate_delegation(values, environment):
     if not clients or any(len(client) > 512 or client == "*" for client in clients):
         raise RenderError("Delegation client IDs must be explicit, non-empty and not a wildcard")
     delegation_jwks(values["EZIL_DELEGATION_PUBLIC_JWKS"])
+
+
+def validate_production_editor(values):
+    """Opt-in production candidate only; never synthesize gates or reuse staging pins."""
+    switches = tuple(values.get(name) for name in EDITOR_SWITCHES)
+    onboarding = values.get(ONBOARDING_GATE)
+    if any(value not in (None, "enabled", "disabled") for value in (*switches, onboarding)):
+        raise RenderError("Editor and onboarding switches must be exactly enabled or disabled")
+    enabled_editor = "enabled" in switches
+    if OS_PUBLIC_ORIGIN in values and values[OS_PUBLIC_ORIGIN] != "https://os.ezil.work":
+        raise RenderError("Production OS public origin must be canonical")
+    producer = tuple(values.get(name) for name in EDITOR_PRODUCER_PINS)
+    if producer != (None, None) and producer != ("https://api-desktop.ezil.org", "2"):
+        raise RenderError("Editor producer pins require the canonical production Worker and protocol 2")
+    preview = values.get(PREVIEW_TOKEN_V2)
+    if preview not in (None, "0", "1"):
+        raise RenderError("Preview token v2 must be exactly 0 or 1")
+    if enabled_editor and switches[:2] != ("enabled", "enabled"):
+        raise RenderError("Editor requires both session and bridge base switches")
+    if enabled_editor or onboarding == "enabled":
+        if (values.get(DELEGATION_GATE) != "enabled"
+            or any(pin not in values for pin in DELEGATION_PINS)
+            or values.get("EZIL_DELEGATION_ISSUER") != "https://connect.ezil.work"
+            or values.get("EZIL_DELEGATION_AUDIENCE") != "https://os.ezil.work"):
+            raise RenderError("Production editor/onboarding requires canonical Connect and OS delegation pins")
+    if (enabled_editor or preview == "1") and (
+        values.get("CLOUDFLARE_GUACAMOLE_WORKER_URL") != "https://api-desktop.ezil.org"
+        or not values.get("CLOUDFLARE_GUACAMOLE_HMAC_SECRET")
+        or producer != ("https://api-desktop.ezil.org", "2")
+    ):
+        raise RenderError("Production editor requires the canonical authenticated producer Worker")
+    if (enabled_editor or onboarding == "enabled") and values.get(OS_PUBLIC_ORIGIN) != "https://os.ezil.work":
+        raise RenderError("Production editor/onboarding requires canonical OS public origin")
+    client = values.get(MCP_BOOTSTRAP_CLIENT)
+    if client is not None and (onboarding != "enabled" or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", client)):
+        raise RenderError("MCP bootstrap requires onboarding and one legitimate upstream Auth0 client ID")
 
 
 def validate_production_browser(values):

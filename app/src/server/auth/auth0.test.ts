@@ -5,7 +5,7 @@ vi.mock('server-only', () => ({}));
 const jar = vi.hoisted(() => ({ set: vi.fn() }));
 vi.mock('next/headers', () => ({ cookies: async () => jar }));
 
-import { AUTH0_COOKIE, AUTH0_ISSUER, auth0Enabled, buildAuthorizeUrl, exchangeCode, readTransaction, verifyIdToken, verifyProjectIdToken } from './auth0';
+import { AUTH0_COOKIE, AUTH0_ISSUER, auth0Enabled, buildAuthorizeUrl, exchangeCode, readTransaction, verifyIdToken, verifyIdTokenForAudience, verifyProjectIdToken } from './auth0';
 
 const secret = 'test-client-secret-do-not-log';
 const clientId = 'test-client';
@@ -143,6 +143,23 @@ describe('ID token verification', () => {
     it('allows sixty seconds of clock skew and a valid audience array', async () => {
         await expect(verifyIdToken(await token({ exp: now - 30, iat: now - 300, aud: [clientId, 'api'], azp: clientId }), { nonce: 'nonce' })).resolves.toMatchObject({ sub: 'auth0|one' });
         await expect(verifyIdToken(await token({ iat: now + 30 }), { nonce: 'nonce' })).resolves.toMatchObject({ sub: 'auth0|one' });
+    });
+    it('verifies MCP consent against its own audience without changing browser token policy', async () => {
+        const proof = await token({ aud: 'mcp-client' });
+        await expect(verifyIdTokenForAudience(proof, { nonce: 'nonce', clientId: 'mcp-client', maxAgeSeconds: 600 }))
+            .resolves.toMatchObject({ sub: 'auth0|one' });
+        await expect(verifyIdToken(proof, { nonce: 'nonce' })).rejects.toThrow('invalid_id_token');
+    });
+    it.each([
+        { exp: now - 1, iat: now - 300 },
+        { iat: now - 601 },
+        { aud: ['mcp-client', 'api'], azp: 'mcp-client' },
+        { gty: 'client-credentials' },
+        { nonce: 'another-consent' },
+    ])('refuses stale, ambiguous or noninteractive MCP consent %j', async claims => {
+        await expect(verifyIdTokenForAudience(await token({ aud: 'mcp-client', ...claims }), {
+            nonce: 'nonce', clientId: 'mcp-client', maxAgeSeconds: 600,
+        })).rejects.toThrow('invalid_id_token');
     });
     it('rejects forged signatures and malformed tokens', async () => {
         const jwt = await token();

@@ -146,7 +146,12 @@ async function signingKeys(refresh = false): Promise<SigningKey[]> {
 export interface Auth0Identity { sub: string; email: string }
 
 export async function verifyIdToken(idToken: string, { nonce }: { nonce: string }): Promise<Auth0Identity> {
-    const { clientId } = config();
+    return verifyIdTokenForAudience(idToken, { nonce, clientId: config().clientId });
+}
+
+export async function verifyIdTokenForAudience(idToken: string, { nonce, clientId, maxAgeSeconds }: {
+    nonce: string; clientId: string; maxAgeSeconds?: number;
+}): Promise<Auth0Identity> {
     try {
         const parts = idToken.split('.');
         if (parts.length !== 3 || !parts.every(p => /^[\w-]+$/.test(p))) throw new Error();
@@ -163,9 +168,11 @@ export async function verifyIdToken(idToken: string, { nonce }: { nonce: string 
         const now = Date.now() / 1000;
         const audience = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
         const failed = claims.iss !== AUTH0_ISSUER ? 'iss'
-            : !audience.includes(clientId) || (audience.length > 1 && claims.azp !== clientId) || (claims.azp !== undefined && claims.azp !== clientId) ? 'aud'
-            : typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || claims.exp <= now - 60 ? 'exp'
-            : typeof claims.iat !== 'number' || !Number.isFinite(claims.iat) || claims.iat > now + 60 || claims.iat >= claims.exp ? 'iat'
+            : !audience.includes(clientId) || (audience.length > 1 && (maxAgeSeconds !== undefined || claims.azp !== clientId))
+                || (claims.azp !== undefined && claims.azp !== clientId) ? 'aud'
+            : typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || claims.exp <= now - (maxAgeSeconds === undefined ? 60 : 0) ? 'exp'
+            : typeof claims.iat !== 'number' || !Number.isFinite(claims.iat) || claims.iat > now + 60 || claims.iat >= claims.exp
+                || (maxAgeSeconds !== undefined && (claims.iat < now - maxAgeSeconds || claims.gty === 'client-credentials')) ? 'iat'
             : typeof claims.nonce !== 'string' || !constantTimeEqual(claims.nonce, nonce) ? 'nonce'
             : typeof claims.sub !== 'string' || !claims.sub.trim() ? 'sub'
             : typeof claims.email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(claims.email) ? 'email'

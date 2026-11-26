@@ -130,6 +130,31 @@
       "path": "app/drizzle/0033_native_grant_outbox.sql",
       "sha256": "8e2f6e97726d647903b284bd35856f8829ee3661d48d75e55c1645aa3226ad1e",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0034_assignment_migration_clock.sql",
+      "sha256": "20d13abe691864be55aa7ee7732a3f5da723f3586c1741770c5d5c2a743accd1",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0035_editor_agent_sessions.sql",
+      "sha256": "1ae73e8865f488b2736608a88dd0767aebd04dfe49c43db69751db78dc8cc80d",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0036_editor_control_operations.sql",
+      "sha256": "0ab5ff43439b281ea6ff8eaa56efb7b166e0cdcb6e283029c2a216baf7c8da59",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0037_editor_protocol_2.sql",
+      "sha256": "134e14daa769de62f5ac25298569fd7b5e0a26697cf7e98963c650cd28f08c16",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0039_named_computer_creation.sql",
+      "sha256": "5203f0603cda73801f16784ecbf745a32772bce700f00c8cf708caaad78299aa",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

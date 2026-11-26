@@ -29,6 +29,8 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
+import type { SessionDb } from '@/server/agent-session/store';
+import { startComputer } from '@/server/computer-start/start';
 import { computers } from '@/server/db/schema';
 import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
@@ -39,6 +41,7 @@ import { readComputerProgress } from '@/server/lib/compute/progress';
 import { readSystemInfo } from '@/server/lib/compute/system-info';
 import { restartWholeComputer, routeComputer, startReverseMove, switchComputerConfiguration } from './compute-dispatch';
 import { computerCreateError } from './computer-errors';
+import { createNamedComputer } from './named-computer';
 import {
     createComputerInLowestFreeSlot,
     getOrCreateDefaultComputer,
@@ -48,6 +51,9 @@ import {
     pickFreeSlot,
     softDeleteComputer,
 } from './computer-store';
+import { clientOf, controlCall } from '../control-call';
+import { editorControlsEnabled } from '../editor-delegation';
+import { NAMED_COMPUTER_PROCEDURE, requireOnboardingCaller } from '../onboarding-delegation';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /**
@@ -155,6 +161,14 @@ export const computerRouter = createTRPCRouter({
             return outcome.computer;
         }),
 
+    /** Explicit delegated creation only. The normal start route applies its own allowance checks. */
+    createNamed: protectedProcedure
+        .input(z.object({ name: z.string().trim().min(1).max(200), idempotencyKey: z.string().uuid() }).strict())
+        .mutation(({ ctx, input }) => {
+            const caller = requireOnboardingCaller(ctx, NAMED_COMPUTER_PROCEDURE);
+            return createNamedComputer(ctx.db, { ...input, userId: ctx.user.id, clientId: caller.clientId });
+        }),
+
     /**
      * Return the caller's LOWEST-slot live computer, creating one only if
      * they have none. This is how the EZiL OS shell (`/os`) boots: a user
@@ -259,6 +273,23 @@ export const computerRouter = createTRPCRouter({
             return switchComputerConfiguration(ctx.db as unknown as PlacementDb, { userId: ctx.user.id, computerId: input.computerId },
                 { size: input.size, requestId: input.requestId });
         }),
+
+    /**
+     * Start (not open) one of the person's computers, for the EZiL MCP (`ezil:computers:start`): a normal start with a
+     * durable idempotent row, the allowance checked before anything boots, and no plan, size or billing change.
+     * It never returns a desktop or preview URL (`../../computer-start/start.ts`).
+     */
+    start: protectedProcedure
+        .input(z.object({ computerId: z.string().uuid(), idempotencyKey: z.string().uuid() }).strict())
+        .mutation(({ ctx, input }) => controlCall(ctx, 'computer.start', input.idempotencyKey, async () => {
+            if (!editorControlsEnabled(process.env)) {
+                throw new TRPCError({ code: 'UNAUTHORIZED' });
+            }
+            // Loaded on use: the port pulls in billing and the providers, which validate the server env at import.
+            const { startPort } = await import('@/server/computer-start/port');
+            return startComputer(ctx.db as unknown as SessionDb, startPort(ctx.db, { userId: ctx.user.id, computerId: input.computerId }),
+                { userId: ctx.user.id, clientId: clientOf(ctx) }, input);
+        })),
 
     /**
      * Round 3: restart the WHOLE computer (a confirmed stop, then a server-initiated open on the
