@@ -276,4 +276,3 @@ describe('embedded workspace return: one structured decision line, correlated wi
         expect(lines).toEqual([]);
     });
 });
-
