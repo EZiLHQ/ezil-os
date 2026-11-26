@@ -286,7 +286,9 @@ it.each(['pool-provision', 'pool-retire'] as const)('authenticates and echoes th
         // String "false", null and missing are malformed probes, never verified absence or paid demand.
         for (const malformed of ['false', null, undefined]) {
             operatorTablePresent = malformed;
-            expect((await POST(request(JSON.stringify(a)))).status).toBe(503);
+            const denied = await POST(request(JSON.stringify(a)));
+            expect(denied.status).toBe(403);
+            expect(await denied.json()).toEqual({ authorized: false });
         }
         operatorTablePresent = false;
         // No eligible active subscriber: the same exact durable provision is refused.
