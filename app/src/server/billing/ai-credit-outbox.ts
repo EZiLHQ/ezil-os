@@ -40,7 +40,17 @@ export const AI_NEEDS_EZIL_ID_PARK_MS = 24 * 3_600_000;
  */
 export interface AiCreditReceipt { entitlementId: string; credits: number; expiresAt: string; deliveredAt: string | null; failed?: true }
 /** One user's one grant event: exact user, exact event key, grants only. */
-export interface AiCreditClaimScope { userId: string; eventKey: string; kind: 'ai_grant' }
+export interface AiCreditClaimScope {
+    userId: string; eventKey: string; kind: 'ai_grant';
+    /**
+     * A paid top-up's scope: claim the row only while it is the ONLY receipt of its entitlement and of its payment,
+     * decided inside the claim itself under the entitlement's root lock (`billing:ai_root:<root>`, the lock every
+     * reversal is written under). A refund or dispute reversal committed before the claim therefore yields no claim
+     * and no send; one still being written holds the lock, so the claim is not taken either. Absent (the sweep, the
+     * Free starter): the claim is exactly as before.
+     */
+    soleReceipt?: true;
+}
 export interface AiCreditOutboxStore {
     /** `scope` (sign-in starter delivery) restricts the one atomic SKIP LOCKED claim to that row; absent, the oldest due row of anyone (the sweep). */
     claim(now: number, scope?: AiCreditClaimScope): Promise<AiCreditOutboxRow | null>;
