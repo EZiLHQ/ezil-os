@@ -1,12 +1,13 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
-    headers:vi.fn(), stage:vi.fn(), context: vi.fn(), get: vi.fn(), defaultComputer: vi.fn(), provider: vi.fn(), payload: vi.fn(), redirect: vi.fn(), notFound: vi.fn(),
+    headers:vi.fn(), stage:vi.fn(), identity:vi.fn(), context: vi.fn(), get: vi.fn(), defaultComputer: vi.fn(), provider: vi.fn(), payload: vi.fn(), redirect: vi.fn(), notFound: vi.fn(),
 }));
 // The page reads `env` at import for the per-user shell feature flags (round-3 feedback port); keep the test env-free.
 vi.mock('@/env', () => ({ env: {} }));
 vi.mock('next/headers', () => ({ headers: mocks.headers }));
 vi.mock('@/server/git/assignment-enrollment',()=>({assignmentEnrollmentEnabled:mocks.stage}));
+vi.mock('@/server/auth/retained-identity',()=>({retainedIdentity:mocks.identity}));
 vi.mock('next/navigation', () => ({ redirect: mocks.redirect, notFound: mocks.notFound }));
 vi.mock('@/server/api/trpc', () => ({ createTRPCContext: mocks.context }));
 vi.mock('@/server/api/root', () => ({ appRouter: { createCaller: () => ({ computer: { get: mocks.get, getOrCreateDefault: mocks.defaultComputer }, cloudflareGuacamole: { isConfigured: mocks.provider } }) } }));
@@ -24,6 +25,7 @@ beforeEach(() => {
     vi.clearAllMocks();
     mocks.headers.mockResolvedValue(new Headers());
     mocks.stage.mockReturnValue(true);
+    mocks.identity.mockResolvedValue({subject:'auth0|owner'});
     mocks.context.mockResolvedValue({ user: { id: 'owner' } });
     mocks.get.mockResolvedValue({ id, name: 'Chosen computer' });
     mocks.defaultComputer.mockResolvedValue({ computer: { id: 'default' }, created: false });
@@ -32,6 +34,33 @@ beforeEach(() => {
     mocks.notFound.mockImplementation(() => { throw Error('NEXT_NOT_FOUND'); });
 });
 describe('OS entry URL', () => {
+    it('🔴 a signed-in framed Code assignment whose retained EZiL ID is refused gets the silent sign-in document, not the shell',async()=>{
+        const repo='https://github.ezil.work/default/u-0123456789abcdef-a-'+id+'.git', NOTICE='Continue to EZiL OS sign-in from your Universe assignment tab';
+        const open=(query:Record<string,string>,appId='code')=>AppPage({params:Promise.resolve({appId}),searchParams:Promise.resolve(query)});
+        mocks.headers.mockResolvedValue(new Headers({'sec-fetch-dest':'iframe'}));
+        mocks.identity.mockRejectedValue(new Error('IDENTITY_REFRESH_REQUIRED'));
+        const html=renderToStaticMarkup(await open({assignment:id,repo}));
+        expect(html).toContain(NOTICE);
+        expect(html).not.toContain('/os/bundle.min.js');
+        expect(mocks.identity).toHaveBeenCalledExactlyOnceWith('owner');
+        expect(mocks.defaultComputer).not.toHaveBeenCalled();
+        // Kept: the shell, exactly as before.
+        mocks.identity.mockResolvedValue({subject:'auth0|owner'});
+        expect(renderToStaticMarkup(await open({assignment:id,repo}))).toContain('/os/bundle.min.js');
+        // Every other entry never asks for the identity at all: a top-level tab, another app, a non-canonical or
+        // unassigned repository, a disabled stage, and a delegated caller all keep the shell.
+        mocks.identity.mockClear();mocks.identity.mockRejectedValue(new Error('IDENTITY_REFRESH_REQUIRED'));
+        const shell=async(query:Record<string,string>,appId?:string)=>expect(renderToStaticMarkup(await open(query,appId))).toContain('/os/bundle.min.js');
+        await shell({assignment:id,repo},'desktop');
+        await shell({repo});
+        await shell({assignment:id,repo:'https://github.com/example/other.git'});
+        await shell({assignment:id,repo,attempt:id});
+        mocks.stage.mockReturnValue(false);await shell({assignment:id,repo});mocks.stage.mockReturnValue(true);
+        mocks.context.mockResolvedValue({user:{id:'owner'},delegation:{status:'accepted'}});await shell({assignment:id,repo});
+        mocks.context.mockResolvedValue({user:{id:'owner'}});
+        mocks.headers.mockResolvedValue(new Headers({'sec-fetch-dest':'document'}));await shell({assignment:id,repo});
+        expect(mocks.identity).not.toHaveBeenCalled();
+    });
     it('keeps an unauthenticated embedded Code assignment off the identity-provider frame path',async()=>{
         mocks.context.mockResolvedValue({user:null});
         mocks.headers.mockResolvedValue(new Headers({'sec-fetch-dest':'iframe'}));

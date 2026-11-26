@@ -6,6 +6,7 @@ import {
 } from '@/server/auth/auth0';
 import { bridgeAuth0Identity, refuseSilentAccountSwitch } from '@/server/auth/bridge';
 import { retainProjectIdentity } from '@/server/auth/retained-identity';
+import { isWorkAuthCallback, settleWorkAuth } from '@/server/auth/work-auth';
 import { embeddedWorkReturn, workAccountNotice } from '@/utils/assignment-work-auth';
 import { Routes, safeReturnUrl } from '@/utils/constants';
 import { ownedPublicOrigin } from '@/utils/forwarded';
@@ -21,7 +22,13 @@ async function hasOsSession(): Promise<boolean> {
     }
 }
 
-export async function GET(request: NextRequest) {
+export async function GET(request: NextRequest): Promise<NextResponse> {
+    // The hidden child of an embedded assignment frame: its own transaction and an inert answer. It never reaches the
+    // redirects below, so no sign-in page, here or at id.ezil.work, can open inside a frame through this callback.
+    if (isWorkAuthCallback(request)) {
+        const answer = await settleWorkAuth(request);
+        return new NextResponse(answer.body, { status: answer.status, headers: answer.headers });
+    }
     let destination: string;
     // Set only once the signed transaction has been read: a failure after that (cancelled, unverified email, conflict)
     // goes back to the sign-in page still headed for the same page; a failure before it keeps nothing, because then
