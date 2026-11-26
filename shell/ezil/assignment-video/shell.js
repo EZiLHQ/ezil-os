@@ -172,6 +172,43 @@ function embedMessage(cause) {
     if(/^capacity_/.test(cause))return 'No computer is available to start right now. '+EMBED_AGAIN;
     return EMBED_AGAIN;
 }
+/** A parent that has not asked by now is told so; until then the Code window's own loader is the only surface. */
+const SILENT_PARENT_MS=20000;
+/** The media window's bound before any pause: the hour, or 64 minutes for a preparation window Universe manages. */
+const WINDOW_MS=3600000;
+const MEDIA_WINDOW_MS=3840000;
+const isoTime=value=>typeof value==='string' && value.length<=40 && Number.isFinite(Date.parse(value)) ? value : null;
+const REFUSALS={
+    identity:[...identityCodes,'UNAUTHORIZED','unauthorized'],
+    checkout:['assigned_checkout_unverified','assignment_open_unavailable','assignment_open_required','repo_open_failed','sandbox_starting','assignment_aws_unverified','workspace_disconnected'],
+    phase:['recording_phase_changed','recording_in_use','recording_closed','recording_changed','recording_unavailable','seed_not_confirmed','assignment_not_ready','workspace_locked','cancelled',
+        'assignment_paused','assignment_clock_changed','recording_state_changed'],
+    media:['media_unavailable','upload_failed','upload_unconfirmed','invalid_segment','invalid_upload_target'],
+    timeout:['timeout','workspace_timeout'],
+    protocol:['invalid_request','invalid_assignment','assignment_mismatch','editor_ready_failed'],
+};
+/** A coarse class for a refusal: the only thing a diagnostic says about why. */
+export function refusalClass(error) {
+    const cause=error?.code||error?.message;
+    if(error?.name==='TimeoutError')return 'timeout';
+    return Object.keys(REFUSALS).find(kind=>REFUSALS[kind].includes(cause))??'other';
+}
+/**
+ * Console-only diagnostics for one attempt, as `assignment.workspace.<event> stage=<tag>[ refusal=<class>]`. The tag is
+ * the first 16 hex of SHA-256(`ezil.assignment.stage.v1\0` + attempt id), which the server logs too. A line names no
+ * person, account, repository, session, challenge or capture. Without Web Crypto nothing is written; nothing waits on it.
+ */
+export function stageDiagnostics(attemptId, {subtle=globalThis.crypto?.subtle, log=globalThis.console}={}) {
+    let tag;
+    try{
+        tag=subtle.digest('SHA-256',new TextEncoder().encode('ezil.assignment.stage.v1\0'+attemptId))
+            .then(bytes=>Array.from(new Uint8Array(bytes).subarray(0,8),n=>n.toString(16).padStart(2,'0')).join(''),()=>null);
+    }catch{return ()=>{};}
+    return (event,error)=>{
+        const refusal=error===undefined?'':' refusal='+refusalClass(error);
+        void tag.then(value=>{if(value)try{log.info('assignment.workspace.'+event+' stage='+value+refusal);}catch{/* diagnostics never matter */}});
+    };
+}
 
 /**
  * The assignment framed by its own Universe workspace page, which records ITS tab (`ezil.assignment.work/v2`). Only the
@@ -185,37 +222,52 @@ function embedMessage(cause) {
  *
  * PORT (the Universe `assignment-work-capture.js` vocabulary): parent `request {id, method}` for `begin | upload |
  * status | unlock | end`, plus `pulse | lock | cancel`; child `ready` (bound, eligible, computer-checked and the server's
- * clock not paused: sharing may start), `reply {id, ok, value | code}`, `pause {reason, effectiveAt}` and `reopen`. The
+ * clock not paused: `begin` may start), `reply {id, ok, value | code}`, `pause {reason, effectiveAt}` and `reopen`. The
  * parent owns consent, the browser picker and the encoder, and sends only frame bytes. This document keeps the sealed
  * repository proof, the recording transport and every Universe answer; replies carry only the fields the parent reads.
  *
+ * Two additive port events (an older parent ignores both): `capture-ready` once, as soon as the exact parent's bind is
+ * accepted for a signed-in owner (the parent may offer its picker while this document still verifies; `ready` is still
+ * what allows `begin`), and `editor-usable {captureSessionId[, deadlineAt, serverNow]}` when the assigned editor is on
+ * screen on the verified checkout. `deadlineAt` and `serverNow` there are the assignment's own clock as `editor-ready`
+ * answered it; the media window stays in `upload`, `status` and `unlock`.
+ *
  * THREE TIMES, never mixed:
  *  - encoder time is the parent's: each part's `startMs`/`endMs`, relative to the media window's start;
- *  - the media window (`startedAt`, `deadlineAt`, `serverNow` in the seed's reply and in `unlock`) is the recording's own
- *    and bounds the footage only;
- *  - the assignment's clock is the server's (`clock`, and the `editor-ready` answer returned as `unlock`'s `clock`).
- *    Nothing here starts, restarts or extends it. Its start, once reported (Universe's preflight window for an attempt
- *    its workspace page started, a `clock` report or `editor-ready`), is the original: a later answer naming another
- *    start is ignored, and an `editor-ready` that names one never opens the editor.
+ *  - the media window (`startedAt`, `deadlineAt`, `serverNow` in the seed's reply, in `status` and in `unlock`) is the
+ *    recording's own and bounds the footage only. Before any pause it is at most the hour, or 64 minutes when
+ *    Universe's signed preflight says it manages a preparation window (`editorReadySupported`); its cutoff may then
+ *    move, always from the seed's own start;
+ *  - the assignment's clock is the server's (`clock`, and the `editor-ready` answer returned as `unlock`'s `clock` and
+ *    in `editor-usable`). Nothing here starts, restarts or extends it. Its start, once reported (Universe's preflight
+ *    window for an attempt its workspace page started, a `clock` report or `editor-ready`), is the original: a later
+ *    answer naming another start is ignored, and an `editor-ready` that names one never opens the editor.
  *
  * The server gate is production's own: `prepare` seals the checkout, `begin` binds that receipt to the parent's capture
  * session, the seed must be confirmed phase-ready, the `open` mint re-checks the same session, receipt, unlock and
  * deadline and commits `editor-ready`, and the editor is shown only after Code reports the verified folder AND
- * `editor-ready` answers here. Window `ready` = the editor is open on the verified folder.
+ * `editor-ready` answers here. Under a managed preparation that call starts the work hour, so it waits for the
+ * editor's mounted workbench, not only the folder its address names. Window `ready` = the editor is open on the
+ * verified folder.
+ *
+ * SCREEN: while the workspace prepares this gate draws nothing. The Code window's own loader is the one surface from
+ * launch to editor (`park(true,true)`), with the editor frame parked and inert under it. The gate's panel is for a
+ * state the person must act on (sign in, unavailable, another computer, sharing or time paused, closed), or a parent
+ * that never answers.
  *
  * PAUSE / RE-SHARE: a server pause (`clock`) covers the editor, ends the live capture phase at the pause's own time
  * (`pause {reason:'paused', effectiveAt}`; the parent seals and ends it, or the heartbeat watch does) and refuses a new
  * `begin` (`assignment_paused`) until the clock runs again, when the port says `ready` once more. The port, the
  * eligibility and the clock outlive every share: stopping, a pause or a failure never needs a new document.
  */
-function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body, park, prepare, computerInfo, win, host, clockLiveMs, clockIdleMs,
+function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body, park, prepare, computerInfo, wake, transport, win, host, clockLiveMs, clockIdleMs,
     watchMs=EMBED_WATCH_MS, silentMs=EMBED_SILENT_MS}) {
     const owner=actor(), ui=buildGate(body), name=repo.split('/').at(-1).slice(0,-4);
     // The server's clock for this assignment. Universe draws it; here it only gates capture and the editor.
     const countdown=createCountdown();
     let state='preparing', locked=true, armed=false, eligible=false, closing=false, closePromise, port=null, challenge=null;
-    let active=null, clockStart, pulseAt=0, watch, drained, clockTimer, over=false, held=false;
-    const inflight=new Set();
+    let active=null, clockStart, pulseAt=0, watch, drained, clockTimer, over=false, held=false, managed=false, woken=false, silent;
+    const inflight=new Set(), note=stageDiagnostics(attemptId);
     const owned=()=>Boolean(owner) && actor()===owner;
     const isHere=()=>!closing && current===gate && owned();
     const terminal=()=>state==='unavailable' || state==='authentication_required';
@@ -223,7 +275,10 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
     const check=item=>{if(!live(item))throw failure('recording_phase_changed');};
     const send=(type,fields={})=>{try{port?.postMessage({protocol:WORK_PROTOCOL,attemptId,type,...fields});}catch{/* closed by the parent */}};
     const reply=respondToWorkDiscover(attemptId,win,()=>state,arm);
-    function lock(title,message){locked=true;park(true);ui.clear();ui.set(title,message);}
+    function cover(loading){locked=true;park(true,loading);ui.clear();}
+    function lock(title,message){cover(false);ui.set(title,message);}
+    // Preparing: the Code window's own loader stays the one surface; this gate draws nothing over it.
+    function prep(){cover(true);ui.reveal();}
     function setState(next,announce=true){if(state===next)return;state=next;if(announce)reply.push();}
     // `announce`: false only inside a discover, whose own reply follows and carries the new state.
     function settle(next,title,message,announce=true){
@@ -239,6 +294,8 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
     }
     function arm(latest){
         if(closing)return;
+        clearTimeout(silent);
+        if(challenge!==latest)note('discover.accepted');
         challenge=latest;
         if(!owned()){if(state!=='authentication_required')settle('authentication_required','Sign in to EZiL OS',EMBED_SIGN_IN,false);return;}
         if(!armed){armed=true;void eligibility();}
@@ -282,7 +339,7 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
         if(port)send('ready');
     }
     async function eligibility(){
-        lock('Preparing assignment','Verifying the assigned repository and OS session…');
+        prep();
         try{
             const result=await retry(()=>checkAssignmentVideoEligibility(attemptId,{repositoryUrl:repo}),['media_unavailable','recording_unavailable'],2,isHere);
             if(!isHere())return;
@@ -305,18 +362,23 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
                 }
             }
             eligible=true;
+            // Only Universe's own signed answer says it manages this attempt's preparation window: the media bound
+            // widens and the work hour starts at `editor-ready`. An older Universe keeps today's release.
+            managed=result.editorReadySupported===true;
+            // The ordinary wake of this person's own computer, once, so a cold start overlaps the brief and the picker.
+            // It opens no editor and no checkout; every compute and billing rule is the wake's own.
+            if(!woken){woken=true;try{wake?.();}catch{/* the checkout's own wake still runs */}}
             if(held)lock(...EMBED_HELD);
-            else{
-                lock('Share this assignment tab from Universe','Your editor opens after Universe confirms the recording.');
-                if(port)send('ready');
-            }
-        }catch(error){if(!closing && current===gate)failed(error);}
+            else{prep();if(port)send('ready');}
+        }catch(error){if(!closing && current===gate){note('prepare.refused',error);failed(error);}}
     }
     function onWindow(event){
         const data=event.data;
         if(event.source!==win.parent || event.origin!==host || data?.protocol!==WORK_PROTOCOL || data.type!=='bind' || data.attemptId!==attemptId
             || !challenge || data.challenge!==challenge || event.ports?.length!==1 || port || terminal() || !isHere())return;
         port=event.ports[0];port.onmessage=onPort;port.start?.();
+        note('bind.accepted');
+        send('capture-ready');
         if(eligible && !held)send('ready');
     }
     // The parent's sharing stopped, the server paused or this document lost it: the editor locks at once; the phase is then ended.
@@ -356,7 +418,7 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
         // A paused assignment starts no phase: the broker would refuse it, and the checkout must not be re-sealed for it.
         if(held || countdown.state()==='paused')throw failure('assignment_paused');
         const item=active={id:d.captureSessionId,expected:0,ctl:new AbortController(),startedAt:Date.now(),stage:'prepare'};
-        startIdleWatch();scheduleClock();lock('Preparing assignment','Verifying the assigned repository…');
+        startIdleWatch();scheduleClock();prep();note('prepare.start');
         try{
             const result=await retry(()=>prepare(attemptId,{signal:item.ctl.signal}),['sandbox_starting','media_unavailable','assignment_open_unavailable'],3,
                 ()=>live(item) && !item.ctl.signal.aborted);
@@ -366,7 +428,7 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
                 || !meta?.id || typeof meta.workspaceFolder!=='string' || meta.checkoutFolder!==meta.workspaceFolder+'/'+name)
                 throw failure('assigned_checkout_unverified');
             item.meta=meta;item.proof=sealed.proof;item.stage='begin';
-            item.transport=createAssignmentVideoTransport({attemptId,repoOpenProof:item.proof,captureSessionId:item.id,consentVersion:4,
+            item.transport=(transport??createAssignmentVideoTransport)({attemptId,repoOpenProof:item.proof,captureSessionId:item.id,consentVersion:4,
                 onClock:report=>syncMedia(item,report),paused:()=>countdown.state()==='paused',
                 // The timeline is the real wall clock: time the server gave back after a pause lets a clip end past the first hour.
                 maxEndMs:()=>{
@@ -385,9 +447,10 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
             if(item.grant.captureSessionId!==item.id || item.grant.status!=='awaiting_frame' || !Number.isSafeInteger(item.grant.nextSequence))
                 throw failure('recording_phase_changed');
             item.expected=item.grant.nextSequence;item.stage='seed';
-            ui.set('Checking recording','Saving the first frame before opening your editor…');
+            note('prepare.ready');
             return {captureSessionId:item.id,status:item.grant.status,nextSequence:item.grant.nextSequence};
         }catch(error){
+            note('prepare.refused',error);
             if(identityCodes.includes(error?.code))failed(error);
             else{
                 await end(item,'connection_lost',item.expected).catch(()=>{});
@@ -429,8 +492,10 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
             if(!ack.phaseReady || ack.captureSessionId!==item.id || ack.nextSequence!==task.sequence+1 || !ack.firstFrameAt)throw failure('seed_not_confirmed');
             const startAt=Date.parse(ack.startedAt), deadline=Date.parse(ack.deadlineAt), serverNow=Date.parse(ack.serverNow);
             const offset=Number.isFinite(serverNow)?serverNow-receivedAt:0;
-            // Confirm bounds remaining time; trusted pauses can make the elapsed media window longer than an hour.
-            if(!Number.isFinite(startAt) || !Number.isFinite(deadline) || deadline<=receivedAt+offset || deadline<=startAt)throw failure('recording_closed');
+            // Confirm bounds remaining time; trusted pauses (a revised window) can make the elapsed media window longer
+            // than its first bound.
+            if(!Number.isFinite(startAt) || !Number.isFinite(deadline) || deadline<=receivedAt+offset || deadline<=startAt
+                || (!(ack.revision>0) && deadline-startAt>(managed?MEDIA_WINDOW_MS:WINDOW_MS)))throw failure('recording_closed');
             item.seed=ack;item.accepted=true;item.expected=Math.max(item.expected,ack.nextSequence);item.stage='record';
             return {ack,serverNow,receivedAt};
         })();
@@ -453,7 +518,20 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
         const s=await item.transport.status();
         // The parent cuts its last clip here: Universe's stop, or the server's pause, whichever came first.
         const cutoffs=[Date.parse(s.stopRequestedAt),countdown.serverPausedAt()].filter(Number.isFinite);
-        return {captureSessionId:s.captureSessionId,status:s.status,stopRequestedAt:cutoffs.length?new Date(Math.min(...cutoffs)).toISOString():null};
+        return {captureSessionId:s.captureSessionId,status:s.status,stopRequestedAt:cutoffs.length?new Date(Math.min(...cutoffs)).toISOString():null,
+            ...(mediaClock(item,s)??{})};
+    }
+    /**
+     * The media window as the broker last stated it, relayed only when it is this capture's, starts exactly where the
+     * confirmed seed did, and ends inside its bound: the hour, 64 minutes under a managed preparation (its cutoff may
+     * then move), or whatever a revised window (the server gave paused time back) names. Never the assignment's clock.
+     */
+    function mediaClock(item,s){
+        const start=Date.parse(item.seed?.startedAt), deadline=Date.parse(isoTime(s?.deadlineAt)??'');
+        if(!item.seed || s?.captureSessionId!==item.id || s.startedAt!==item.seed.startedAt || !Number.isFinite(deadline) || deadline<=start
+            || (!(s.revision>0) && deadline-start>(managed?MEDIA_WINDOW_MS:WINDOW_MS)))return null;
+        const serverNow=isoTime(s.serverNow);
+        return {deadlineAt:s.deadlineAt,...(serverNow?{serverNow}:{})};
     }
     async function unlock(d){
         const item=active;
@@ -464,19 +542,26 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
         try{
             await retry(async()=>{
                 const s=await item.transport.status();
+                // A managed preparation lets the broker move the media cutoff inside its bound; the start never moves.
                 if(s.phaseReady!==true || s.workspaceUnlocked!==true || s.captureSessionId!==item.id || s.startedAt!==item.seed.startedAt
-                    || s.deadlineAt!==item.seed.deadlineAt || !s.firstFrameAt)throw failure('seed_not_confirmed');
+                    || (managed ? !mediaClock(item,s) : s.deadlineAt!==item.seed.deadlineAt) || !s.firstFrameAt)throw failure('seed_not_confirmed');
             },['seed_not_confirmed','media_unavailable'],3,()=>live(item));
             check(item);
             item.stage='open';item.allowMint=true;
-            ui.set('Opening assigned editor','Recording is active. Checking your workspace…');
             const editor=new Promise((resolve,reject)=>{item.editor={resolve,reject};});
             const timer=setTimeout(()=>item.editor?.reject(failure('assigned_checkout_unverified')),80000);
             let clock;
             try{open();clock=await editor;}finally{clearTimeout(timer);item.editor=null;}
             check(item);
+            // The seed's start stays the media anchor. Under a managed preparation the work clock has just started and
+            // the broker may have moved the media cutoff, so its latest valid statement for this capture is preferred.
+            let media=null;
+            if(managed){
+                media=mediaClock(item,await Promise.race([item.transport.status(),new Promise(resolve=>setTimeout(resolve,4000))]).catch(()=>null));
+                check(item);
+            }
             // `startedAt`/`deadlineAt`: the media window (encoder). `clock`: the assignment's own, exactly as `editor-ready` answered.
-            return {status:'ready',captureSessionId:item.id,startedAt:item.seed.startedAt,deadlineAt:item.seed.deadlineAt,clock};
+            return {status:'ready',captureSessionId:item.id,startedAt:item.seed.startedAt,...(media??{deadlineAt:item.seed.deadlineAt}),clock};
         }catch(error){
             if(identityCodes.includes(error?.code))failed(error);
             else if(active===item && !item.ending){item.allowMint=false;lock(held?EMBED_HELD[0]:EMBED_PAUSED[0],held?EMBED_HELD[1]:embedMessage(error?.code));}
@@ -542,37 +627,50 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
         inflight.add(task);void task.finally(()=>inflight.delete(task));
     }
     // The same folder rule as the OS tab: the editor must show the verified workspace or its checkout, and nothing else.
-    function confirm(frame,frameUrl,actualRoot){
+    // `workbench`: this report is the editor's mounted workbench (`../apps/code-folder.js` `onWorkbench`), not the
+    // folder echo read from the document's address. Under the acknowledged release only that one goes on: the echo
+    // still refuses a wrong folder at once, but an editor document whose workbench never starts stays parked, tells
+    // Universe nothing and fails `unlock` on its own timer. Without the flag the echo releases as before.
+    function confirm(frame,frameUrl,actualRoot,workbench=false){
         const item=active;
         if(!item?.allowMint || !item.editor || !live(item) || !frame.isConnected)return;
         const url=new URL(frameUrl), folders=[item.meta.workspaceFolder,item.meta.checkoutFolder];
         if(!folders.includes(actualRoot) || !folders.includes(url.searchParams.get('folder'))){item.editor.reject(failure('assigned_checkout_unverified'));return;}
+        if(workbench!==managed)return;
         void editorReady(item,frame);
     }
     /**
-     * The real Code folder was validated. Before the editor is shown, Universe is told (`editor-ready`, signed with this
-     * phase's repository-open proof): its answer is the assignment's clock, and the browser sends no time. An answer
-     * that names a start other than the original one never opens the editor; neither does a paused clock.
+     * The real Code folder was validated (under a managed preparation: its workbench is mounted). Before the editor is
+     * shown, Universe is told (`editor-ready`, signed with this phase's repository-open proof): its answer is the
+     * assignment's clock, and the browser sends no time. An answer that names a start other than the original one never
+     * opens the editor; neither does a paused clock. Then, in this order: the editor is shown, the port hears
+     * `editor-usable`, `unlock` is answered and the window state becomes `ready`.
      */
     async function editorReady(item,frame){
-        if(item.readying)return;
-        item.readying=true;
-        const here=()=>live(item) && Boolean(item.editor) && item.allowMint && frame.isConnected;
-        ui.set('Checking your editor','Confirming your editor with Universe before it opens…');
+        const pending=item.editor;
+        if(item.readying===pending)return;
+        item.readying=pending;
+        const here=()=>live(item) && item.editor===pending && item.allowMint && frame.isConnected;
         try{
             const clock=await retry(()=>item.transport.editorReady(),EDITOR_READY_TRANSIENT,EDITOR_READY_TRIES,here);
             if(!here())return;
+            note('editor_ready.reported');
             if(typeof clock.startedAt!=='string' || !originalStart(clock))throw failure('assignment_clock_changed');
             applyClock(clock);
             if(!here())return;
             if(held || countdown.state()==='paused')throw failure('assignment_paused');
-            locked=false;park(false);ui.reveal();
-            item.editor.resolve({startedAt:clock.startedAt,deadlineAt:isoOrNull(clock.deadlineAt),serverNow:isoOrNull(clock.serverNow),
+            locked=false;park(false,false);ui.reveal();
+            note('editor.usable');
+            const deadlineAt=isoTime(clock.deadlineAt), serverNow=isoTime(clock.serverNow);
+            send('editor-usable',{captureSessionId:item.id,...(deadlineAt?{deadlineAt}:{}),...(serverNow?{serverNow}:{})});
+            pending.resolve({startedAt:clock.startedAt,deadlineAt:isoOrNull(clock.deadlineAt),serverNow:isoOrNull(clock.serverNow),
                 pausedAt:null,remainingMs:Number.isFinite(clock.remainingMs)?clock.remainingMs:null,revision:clock.revision});
             setState('ready');
         }catch(error){
-            if(here())item.editor.reject(error?.code?error:failure('editor_ready_failed'));
-        }finally{item.readying=false;}
+            if(!here())return;
+            note('editor_ready.refused',error);
+            pending.reject(error?.code?error:failure('editor_ready_failed'));
+        }finally{if(item.readying===pending)item.readying=null;}
     }
     /** Code's open-phase mint failed (`apps/code.js`): end the wait for the editor now, with the real cause. */
     function failOpen(res){
@@ -581,7 +679,7 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
     }
     function close(){
         if(closePromise)return closePromise;
-        closing=true;reply.dispose();clearInterval(watch);clearTimeout(clockTimer);
+        closing=true;reply.dispose();clearInterval(watch);clearTimeout(clockTimer);clearTimeout(silent);
         win.removeEventListener('message',onWindow);win.removeEventListener('pagehide',pageHide);
         const item=active;
         if(item && !item.shareEnded)suspend(item,false);else lock(...EMBED_PAUSED);
@@ -602,27 +700,46 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
         return closePromise;
     }
     function pageHide(){if(active?.grant)active.transport.checkpointOnExit('connection_lost');void close();}
-    const gate={repo,locked:()=>locked,confirm,close,fail:failOpen,
+    // `requiresWorkbench`: Universe signed a managed preparation, so the Code window asks its editor for the mounted
+    // workbench and reports it through `confirm(…, true)`. Only this gate has it; without the flag nothing is asked.
+    const gate={repo,locked:()=>locked,confirm,close,fail:failOpen,requiresWorkbench:()=>managed,
         access:()=>active?.allowMint && live(active) ? {attemptId,phase:'open',repoOpenProof:active.proof,captureSessionId:active.id} : null};
     current=gate;
-    lock('Open this assignment from Universe','Waiting for your Universe assignment page…');
+    prep();
+    // Said only once the parent has really been silent, never as the first screen of a page that is about to answer.
+    silent=setTimeout(()=>{if(!closing && !challenge && current===gate)lock('Open this assignment from Universe','Waiting for your Universe assignment page…');},SILENT_PARENT_MS);
+    silent?.unref?.();
     win.addEventListener('message',onWindow);win.addEventListener('pagehide',pageHide,{once:true});
     return gate;
 }
 
-export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare, computerInfo, settleMs=STOP_SETTLE_MS,
+/** The page's assignment entry: the address while it names one, else the address this document was loaded with. */
+function assignmentEntry(win) {
+    const address=new URL(win.location.href);
+    return address.searchParams.has('repo')||address.searchParams.has('assignment')?address.href:initialEntry;
+}
+/**
+ * True only for the Code window of an assignment framed by its own paired Universe work page: exactly the case the
+ * embedded gate below takes. That window keeps the ordinary window controls a framed shell otherwise drops.
+ */
+export function embeddedAssignmentWindow(project, win=globalThis.window) {
+    try{return Boolean(win) && assignmentOsOrigin(win.location.origin) && Boolean(assignmentIntent(assignmentEntry(win),project?.repoUrl)) && Boolean(embeddedWorkHost(win));}
+    catch{return false;}
+}
+
+export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare, computerInfo, wake, transport, settleMs=STOP_SETTLE_MS,
     saveCeilingMs=STOP_SAVE_CEILING_MS, frameMs=FRESH_FRAME_MS, clockLiveMs=CLOCK_LIVE_MS, clockIdleMs=CLOCK_IDLE_MS, reconnectMs=RECONNECT_OFFER_MS,
     embedWatchMs=EMBED_WATCH_MS, embedSilentMs=EMBED_SILENT_MS}) {
     const win=globalThis.window, repo=project?.repoUrl;
     if(!win || !assignmentOsOrigin(win.location.origin)){queueMicrotask(open);return null;}
     const address=new URL(win.location.href);
-    const entry=address.searchParams.has('repo')||address.searchParams.has('assignment')?address.href:initialEntry;
+    const entry=assignmentEntry(win);
     const attemptId=assignmentIntent(entry,repo);
     const explicit=address.pathname==='/app/code' && address.searchParams.has('assignment');
     if(!canonical.test(repo) && !explicit){queueMicrotask(open);return null;}
     // Framed by its own paired Universe workspace: a separate gate that waits for that exact parent and never uses the picker.
     const host=attemptId?embeddedWorkHost(win):null;
-    if(host)return openEmbeddedAssignment({attemptId,repo,computerId,actor,open,body,park,prepare,computerInfo,win,host,clockLiveMs,clockIdleMs,
+    if(host)return openEmbeddedAssignment({attemptId,repo,computerId,actor,open,body,park,prepare,computerInfo,wake,transport,win,host,clockLiveMs,clockIdleMs,
         watchMs:embedWatchMs,silentMs:embedSilentMs});
 
     const owner=actor(), ui=buildGate(body);
@@ -1110,6 +1227,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     return gate;
 }
 
-export function confirmAssignmentFolder(project,_receipt,frame,frameUrl,actualRoot){
-    if(current?.repo===project?.repoUrl)current.confirm(frame,frameUrl,actualRoot);
+/** `workbench`: true only for the editor's own mounted-workbench report; the folder echo passes nothing. */
+export function confirmAssignmentFolder(project,_receipt,frame,frameUrl,actualRoot,workbench){
+    if(current?.repo===project?.repoUrl)current.confirm(frame,frameUrl,actualRoot,workbench===true);
 }

@@ -63,7 +63,11 @@ function parentPort(){
         if(d?.type==='reply'){const done=waiting.get(d.id);waiting.delete(d.id);done?.(d);}};
     const post=(type,fields={},transfer=[])=>channel.port1.postMessage({protocol,attemptId:id,type,...fields},transfer);
     const rpc=(method,fields={},transfer=[])=>new Promise(resolve=>{const n=++next;waiting.set(n,resolve);post('request',{id:n,method,...fields},transfer);});
-    return {port:channel.port2,got,post,rpc,types:()=>got.filter(d=>d.type!=='reply').map(d=>d.type),
+    // `types`: the vocabulary an older parent reads. `all` adds the two additive events it ignores (`capture-ready`,
+    // `editor-usable`), in the order they arrived.
+    const additive=['capture-ready','editor-usable'];
+    return {port:channel.port2,got,post,rpc,types:()=>got.filter(d=>d.type!=='reply'&&!additive.includes(d.type)).map(d=>d.type),
+        all:()=>got.filter(d=>d.type!=='reply').map(d=>d.type),events:type=>got.filter(d=>d.type===type),
         close(){channel.port1.close();channel.port2.close();}};
 }
 const eligibleBody=extra=>({status:'eligible',attemptId:id,repositoryUrl:repo,expiresAt:iso(Date.now()+60000),windowStartedAt:null,deadlineAt:null,...extra});
@@ -169,7 +173,9 @@ for(const site of [PROD,STAGE]){
             assert.deepEqual(ready.value,{confirmed:true,phaseReady:true,captureSessionId:session,nextSequence:1,startedAt:iso(server.media.start),
                 deadlineAt:iso(server.media.deadline),serverNow:server.serverNow(),revision:0});
             assert.equal(server.canon.start,null,'a recorded first frame alone never starts the assignment clock');
-            assert.deepEqual((await p.rpc('status',{captureSessionId:session})).value,{captureSessionId:session,status:'recording',stopRequestedAt:null});
+            // `status` relays the media cutoff as the broker last stated it (this capture, the seed's own start).
+            assert.deepEqual((await p.rpc('status',{captureSessionId:session})).value,{captureSessionId:session,status:'recording',stopRequestedAt:null,
+                deadlineAt:iso(server.media.deadline)});
             assert.equal(gate.access(),null);assert.equal(server.count('editor-ready'),0);
             const unlocked=await p.rpc('unlock',{captureSessionId:session});
             // The real Code folder was validated first, then `editor-ready` (this phase, its sealed proof) answered, and only then the editor showed.
@@ -197,6 +203,12 @@ for(const site of [PROD,STAGE]){
             assert.deepEqual([w.assigned,w.opened],[[],[]]);
         }finally{await gate.close();await settle();p.close();}
         assert.deepEqual(p.types(),['ready','reopen']);
+        // The two additive events: the bind was accepted before eligibility answered, and the editor became usable
+        // after `editor-ready`, carrying only this capture and the assignment's own clock.
+        assert.deepEqual(p.all(),['capture-ready','ready','editor-usable','reopen']);
+        assert.deepEqual(p.events('editor-usable'),[{protocol,attemptId:id,type:'editor-usable',captureSessionId:session,
+            deadlineAt:iso(server.canon.deadline),serverNow:p.events('editor-usable')[0].serverNow}]);
+        assert.ok(Number.isFinite(Date.parse(p.events('editor-usable')[0].serverNow)));
     });
 }
 test('a bind is accepted only from the actual paired Universe parent, for the answered challenge, with exactly one port, once',async t=>{
@@ -643,4 +655,129 @@ test('a first frame the broker refused is uploaded again for real, and no segmen
         assert.equal(retried.ok,true,retried.code);assert.equal(retried.value.phaseReady,true);
         assert.equal(server.count('confirm'),2);assert.equal(server.count('put'),2);
     }finally{await gate.close();p.close();}
+});
+
+// ---- A preparation window Universe manages (`editorReadySupported` in its signed preflight) -------------------------
+const MEDIA_WINDOW=3840000;
+function workbenchOpener(state,{folder=workspaceFolder,root=checkoutFolder}={}){
+    const frame={isConnected:true,contentWindow:{postMessage(){}}},url='https://code.example/?folder='+encodeURIComponent(folder)+'&ezil_mint=m';
+    state.echo=()=>confirmAssignmentFolder({repoUrl:repo},null,frame,url,root);
+    state.workbench=()=>confirmAssignmentFolder({repoUrl:repo},null,frame,url,root,true);
+    return ()=>{state.opened++;state.access=state.gate.access();};
+}
+for(const site of [PROD,STAGE]){
+    test(`${site.os}: a managed preparation opens the editor only on its mounted workbench, and the work hour is Universe's editor-ready answer`,async t=>{
+        const server=fakeServer({site,preflight:{editorReadySupported:true}});t.mock.method(globalThis,'fetch',server.handler);
+        server.media.deadline=server.media.start+MEDIA_WINDOW;
+        const w=embeddedWindow({site}),p=parentPort(),state={opened:0,access:null},parks=[],wakes=[];
+        const gate=state.gate=embeddedGate(w,{prepare:async()=>checkout,open:workbenchOpener(state),park:(...args)=>parks.push(args),wake:()=>wakes.push(1)});
+        try{
+            assert.equal(gate.requiresWorkbench(),false,'nothing is asked of the editor before Universe says so');
+            await bound(w,p);
+            assert.equal(gate.requiresWorkbench(),true);
+            assert.deepEqual(wakes,[1],'the ordinary wake is asked once, after the signed eligibility answer');
+            // Preparing draws nothing: the Code window's own loader is the surface.
+            assert.ok(parks.length&&parks.every(args=>args[0]===true&&args[1]===true),JSON.stringify(parks));
+            for(const text of ['Share this assignment tab from Universe','Preparing assignment','Open this assignment from Universe'])assert.equal(w.shown(text),false,text);
+            const grant=await p.rpc('begin',{captureSessionId:session,consentVersion:4});
+            assert.equal(grant.ok,true,grant.code);
+            const seed=seedPart();
+            const first=await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
+            // Sixty-four minutes of media is this attempt's bound, and only because Universe said it manages it.
+            assert.equal(first.ok,true,first.code);
+            assert.equal(Date.parse(first.value.deadlineAt)-Date.parse(first.value.startedAt),MEDIA_WINDOW);
+            const unlocking=p.rpc('unlock',{captureSessionId:session});
+            await until(()=>state.opened===1,'the open mint');
+            // The folder echo names the document but proves no editor: Universe hears nothing, the editor stays parked.
+            state.echo();await settle(60);
+            assert.equal(server.count('editor-ready'),0);assert.equal(gate.locked(),true);assert.deepEqual(p.events('editor-usable'),[]);
+            // The work hour starts at this call. Universe then sets the media cutoff to the end of that hour.
+            server.onEditorReady=()=>{server.canon.start=Date.now();server.canon.deadline=server.canon.start+HOUR;server.canon.revision++;
+                server.media.deadline=server.canon.deadline;return null;};
+            state.workbench();
+            const unlocked=await unlocking;
+            assert.equal(unlocked.ok,true,unlocked.code);
+            assert.deepEqual(server.readyProofs,[[session,proof]]);
+            assert.equal(gate.locked(),false);assert.deepEqual(parks.at(-1),[false,false]);
+            // `unlock`: the media window from the seed's own start to the cutoff the broker now states; `clock`: the work hour.
+            assert.equal(unlocked.value.startedAt,iso(server.media.start));
+            assert.equal(unlocked.value.deadlineAt,iso(server.canon.deadline));
+            assert.equal(unlocked.value.clock.startedAt,iso(server.canon.start));
+            assert.equal(unlocked.value.clock.deadlineAt,iso(server.canon.deadline));
+            assert.deepEqual(p.all(),['capture-ready','ready','editor-usable']);
+            assert.equal(p.events('editor-usable')[0].deadlineAt,iso(server.canon.deadline));
+            // A later status relays the cutoff again; one that names another start, or leaves the bound, relays none.
+            assert.equal((await p.rpc('status',{captureSessionId:session})).value.deadlineAt,iso(server.canon.deadline));
+            // A second workbench report for the same document asks Universe nothing more.
+            state.workbench();await settle(40);
+            assert.equal(server.count('editor-ready'),1);
+        }finally{await gate.close();await settle();p.close();}
+    });
+}
+
+test('a managed preparation whose workbench never mounts keeps the editor parked and fails unlock without telling Universe',async t=>{
+    const server=fakeServer({preflight:{editorReadySupported:true}});t.mock.method(globalThis,'fetch',server.handler);
+    server.media.deadline=server.media.start+MEDIA_WINDOW;
+    const w=embeddedWindow(),p=parentPort(),state={opened:0,access:null};
+    const gate=state.gate=embeddedGate(w,{prepare:async()=>checkout,open:workbenchOpener(state,{root:'/workspace/elsewhere'})});
+    try{
+        await bound(w,p);
+        assert.equal((await p.rpc('begin',{captureSessionId:session,consentVersion:4})).ok,true);
+        const seed=seedPart();
+        assert.equal((await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes])).ok,true);
+        const unlocking=p.rpc('unlock',{captureSessionId:session});
+        await until(()=>state.opened===1,'the open mint');
+        // Even a workbench report cannot open another folder: the checkout rule is checked first.
+        state.workbench();
+        const refused=await unlocking;
+        assert.deepEqual([refused.ok,refused.code],[false,'assigned_checkout_unverified']);
+        assert.equal(server.count('editor-ready'),0);assert.equal(gate.locked(),true);assert.equal(gate.access(),null);
+        assert.deepEqual(p.events('editor-usable'),[]);
+    }finally{await gate.close();await settle();p.close();}
+});
+
+test('the media bound is the hour without the signed flag and 64 minutes with it; a refused work clock never opens the editor',async t=>{
+    for(const [managed,span,ok] of [[false,HOUR+1000,false],[false,HOUR,true],[true,MEDIA_WINDOW+1000,false],[true,MEDIA_WINDOW,true]]){
+        const server=fakeServer({preflight:managed?{editorReadySupported:true}:{}});t.mock.method(globalThis,'fetch',server.handler);
+        server.media.deadline=server.media.start+span;
+        const w=embeddedWindow(),p=parentPort(),state={opened:0,access:null};
+        const gate=state.gate=embeddedGate(w,{prepare:async()=>checkout,open:workbenchOpener(state)});
+        try{
+            await bound(w,p);
+            assert.equal((await p.rpc('begin',{captureSessionId:session,consentVersion:4})).ok,true);
+            const seed=seedPart();
+            const first=await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
+            assert.equal(first.ok,ok,`managed=${managed} span=${span}: ${first.code}`);
+            if(!ok)assert.equal(first.code,'recording_closed');
+            if(!ok||!managed)continue;
+            // Universe refuses the signed call (or answers no clock): parked, `unlock` fails, nothing is announced.
+            server.onEditorReady=()=>Response.json({error:{code:'recording_phase_changed'}},{status:409});
+            const unlocking=p.rpc('unlock',{captureSessionId:session});
+            await until(()=>state.opened===1,'the open mint');
+            state.workbench();
+            const refused=await unlocking;
+            assert.deepEqual([refused.ok,refused.code],[false,'recording_phase_changed']);
+            assert.equal(gate.locked(),true);assert.deepEqual(p.events('editor-usable'),[]);
+        }finally{await gate.close();await settle();p.close();t.mock.restoreAll();}
+    }
+});
+
+test('without the signed flag a workbench report is not what opens the editor: the verified folder and editor-ready do, as before',async t=>{
+    const server=fakeServer();t.mock.method(globalThis,'fetch',server.handler);
+    const w=embeddedWindow(),p=parentPort(),state={opened:0,access:null};
+    const gate=state.gate=embeddedGate(w,{prepare:async()=>checkout,open:workbenchOpener(state)});
+    try{
+        await bound(w,p);
+        assert.equal(gate.requiresWorkbench(),false);
+        assert.equal((await p.rpc('begin',{captureSessionId:session,consentVersion:4})).ok,true);
+        const seed=seedPart();
+        assert.equal((await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes])).ok,true);
+        const unlocking=p.rpc('unlock',{captureSessionId:session});
+        await until(()=>state.opened===1,'the open mint');
+        state.workbench();await settle(60);
+        assert.equal(server.count('editor-ready'),0);assert.equal(gate.locked(),true);
+        state.echo();
+        assert.equal((await unlocking).ok,true);
+        assert.equal(server.count('editor-ready'),1);assert.equal(gate.locked(),false);
+    }finally{await gate.close();await settle();p.close();}
 });

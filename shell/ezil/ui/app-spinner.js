@@ -556,6 +556,21 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         paint({ state: 'done', title: el_title.textContent || label, status: el_status.textContent, bar: 1 });
     }
 
+    /**
+     * No open is in flight yet (something else still decides whether one starts): the title and a sweep, with no clock,
+     * no position and no claim. Any earlier open is concluded, so the next progress paint starts a fresh one.
+     */
+    function waiting () {
+        latestState = null; latestExtra = {};
+        observer?.stop(); observation = null; observedMove = observedMoveAt = undefined; progressChecked = false;
+        endOpen();
+        failureCode = undefined;
+        root.removeAttribute('data-kind'); delete root.dataset.phase;
+        root.classList.remove('ezil-app-spinner-running-long');
+        if (observer) root.dataset.progress = 'pending';
+        paint({ state: 'opening', title: label, status: '', bar: 'indeterminate' });
+    }
+
     /** The caller's client milestones: `url_received`, then `first_frame` (the bar's 100%); null marks a fresh attempt. */
     function stamp (key) {
         // A fresh attempt inside the same open (a re-open) keeps the elapsed clock and the bar.
@@ -564,7 +579,7 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         if (i > client) { client = i; if (latestState) render(latestState, latestExtra); }
     }
 
-    return { el: root, render, stamp, hasComputerProgress: () => observation !== null, computerProgress: () => observation,
+    return { el: root, render, stamp, waiting, hasComputerProgress: () => observation !== null, computerProgress: () => observation,
         // Phase B: the reverse move the last answered poll read (null: none, or not read).
         computerMove: () => observedMove ?? null,
         dispose: () => observer?.stop() };

@@ -6,12 +6,14 @@ import { stageAssignment, productionAssignment } from './authority';
 export const {os:osOrigin, universe:universeOrigin, works:worksOrigin, storage:objectOrigin} = stageAssignment;
 export const issuer = 'https://id.ezil.work/';
 export const hour = 3_600_000;
+export const prepMediaWindow = hour + 240_000;
 export const drain = 90_000;
 // Recording offsets are backed by integers in the evidence ledger.
 const maxElapsed = 2_147_483_647;
-export function validAssignmentWindow(start: number, deadline: number, revision = 0): boolean {
+/** `limit`: the bound before any pause. The hour, or `prepMediaWindow` for the media window of a managed preparation. */
+export function validAssignmentWindow(start: number, deadline: number, revision = 0, limit = hour): boolean {
     const duration = deadline - start;
-    return duration > 0 && duration <= (revision > 0 ? maxElapsed : hour);
+    return duration > 0 && duration <= (revision > 0 ? maxElapsed : limit);
 }
 export const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
 const integer = (min: number, max: number) => z.number().int().min(min).max(max);
@@ -62,6 +64,19 @@ export const clockState = clockDetails.extend({
     return state.revision > 0 && start <= pause && pause < end
         && pause <= Date.parse(state.serverNow) && state.pauseReason !== null;
 });
+/**
+ * The work clock a Universe that manages a preparation window (`editorReadySupported`) answers `editor-ready` with: it
+ * starts at that signed call, or at the end of the preparation window, and never runs longer than the hour. That
+ * Universe may send the full `clockState` instead; the pause and revision fields are then kept as it sent them.
+ */
+export const editorReadyClock = z.object({
+    ...clockDetails.partial().shape,
+    startedAt: moment, deadlineAt: moment, serverNow: moment,
+}).refine(clock => {
+    const start = Date.parse(clock.startedAt);
+    const end = Date.parse(clock.deadlineAt);
+    return end > start && end - start <= hour && start <= Date.parse(clock.serverNow) + 1500;
+});
 export const eligible = z.object({...optionalClock, status: z.literal('eligible'), attemptId: uuid,
     jobId: z.string().regex(/^[1-9][0-9]{0,18}$/), expiresAt: moment, windowStartedAt: moment.nullable(), deadlineAt: moment.nullable(),
     manifestSha256: z.string().regex(/^[a-f0-9]{64}$/), repositoryUrl: z.string().max(260), providerId: z.string().regex(/^[a-z0-9]{1,64}$/), ref: z.literal('refs/heads/main'),
@@ -75,13 +90,20 @@ export const eligible = z.object({...optionalClock, status: z.literal('eligible'
      * otherwise (and from an older Universe); any other value is not a preflight this OS understands.
      */
     startMode: z.literal('workspace').optional(),
+    /**
+     * True only from a Universe that manages this attempt's preparation window: the media window may then run up to
+     * `prepMediaWindow`, and the work clock starts at the signed `editor-ready` call. Absent from an older Universe,
+     * whose editor is released as before.
+     */
+    editorReadySupported: z.boolean().optional(),
 }).refine(state => (state.upgradedWorkspaceId !== undefined) === (state.upgradeOperationId !== undefined));
 const control = {
     ...optionalClock,
     recordingId: uuid, status: z.enum(['awaiting_frame','paused','recording', 'empty', 'partial', 'complete']),
     startedAt: moment.nullable(), deadlineAt: moment.nullable(),
     captureSessionId: uuid.optional(), repositoryOpenReceiptId: uuid.optional(), nextSequence: integer(0,600).optional(),
-    authorizationExpiresAt: moment.nullable().optional(), phaseReady: z.boolean().optional(), workspaceUnlocked: z.boolean().optional(),
+    authorizationExpiresAt: moment.nullable().optional(), editorReadySupported: z.boolean().optional(),
+    phaseReady: z.boolean().optional(), workspaceUnlocked: z.boolean().optional(),
     stopRequestedAt: moment.nullable(), revoked: z.boolean(),
     stopReason: reason.nullable().optional(),
 };

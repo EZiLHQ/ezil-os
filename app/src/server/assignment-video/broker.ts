@@ -4,7 +4,7 @@ import { privateMediaPost } from './private-ingress';
 import { eligibleForActor, readOpen, repoOpenSecret, signRepoOpen } from './repo-open';
 import { createHash } from 'node:crypto';
 import type { RetainedIdentity } from '@/server/auth/retained-identity';
-import { boundedJson, checkedPut, clockState, mediaClockDetails, drain, eligible, issuer, refuse, started, summary, validAssignmentWindow, type Input } from './contract';
+import { boundedJson, checkedPut, clockState, mediaClockDetails, drain, editorReadyClock, eligible, hour, issuer, prepMediaWindow, refuse, started, summary, validAssignmentWindow, type Input } from './contract';
 
 type Identity = Pick<RetainedIdentity, 'token' | 'issuer' | 'subject' | 'sessionId' | 'expiresAt' | 'userId'>;
 type ClockWindow = {startedAt: string | null; deadlineAt: string | null; pausedAt?: string | null; revision?: number};
@@ -20,6 +20,10 @@ type Capability = {
     phase?: string;
     seed?: number;
     seedDeadline?: number;
+    /** The media window's bound: the hour, or `prepMediaWindow` once Universe's begin said it manages a preparation window. */
+    mediaLimit: number;
+    /** This process saw this phase's first frame confirmed (or Universe's begin already called the phase ready). */
+    seedConfirmed: boolean;
 };
 type Dependencies = { fetcher?: typeof fetch; clock?: () => number; leases?: Map<string, Capability>; signal?: AbortSignal };
 const storage = globalThis as typeof globalThis & { ezilAssignmentMediaLeases?: Map<string, Capability> };
@@ -35,12 +39,16 @@ function syncLeaseClock(entry: Capability, report: ClockWindow) {
     const start = Date.parse(report.startedAt), deadline = Date.parse(report.deadlineAt);
     const revision = report.revision ?? 0;
     const pausedAt = report.pausedAt ? Date.parse(report.pausedAt) : undefined;
-    if (revision < entry.revision || !validAssignmentWindow(start, deadline, revision)
+    if (revision < entry.revision || !validAssignmentWindow(start, deadline, revision, entry.mediaLimit)
         || (entry.startedAt !== undefined && entry.startedAt !== start)
         || (pausedAt !== undefined && !(revision > 0 && start <= pausedAt && pausedAt < deadline))) {
         return refuse('recording_state_changed', 409);
     }
-    if (entry.startedAt !== undefined && (deadline < entry.deadline
+    // A Universe that manages the preparation window sets the media cutoff again once the work clock starts (the
+    // signed `editor-ready`, or the end of that window): before any pause it may move either way, always from the
+    // same start and inside `prepMediaWindow`. Every other window only moves later, and only with a newer revision.
+    const movable = entry.mediaLimit === prepMediaWindow && revision === 0 && entry.revision === 0;
+    if (entry.startedAt !== undefined && !movable && (deadline < entry.deadline
         || (revision === entry.revision && (deadline !== entry.deadline || pausedAt !== entry.pausedAt)))) {
         return refuse('recording_state_changed', 409);
     }
@@ -115,6 +123,18 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
         return result.data;
     }
     if (input.action === 'editor-ready') {
+        const lease = leases.get(key);
+        if (lease?.mediaLimit === prepMediaWindow) {
+            // This call starts the work clock of an attempt whose preparation window Universe manages. It is sent only
+            // for the capture this process holds, after its first frame was confirmed, inside its media window.
+            if (lease.phase !== input.captureSessionId || !lease.seedConfirmed || lease.deadline <= clock())
+                return refuse('recording_phase_changed', 409);
+            const result = editorReadyClock.safeParse(await openControl('editor-ready', input.repoOpenProof, {
+                captureSessionId:input.captureSessionId,
+            }));
+            if (!result.success) return refuse('media_unavailable', 503);
+            return result.data;
+        }
         const result = clockState.safeParse(await openControl('editor-ready', input.repoOpenProof, {
             captureSessionId:input.captureSessionId,
         }));
@@ -135,8 +155,9 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
         const t0 = receipt.startedAt ? Date.parse(receipt.startedAt) : NaN;
         const authorityEnd = receipt.deadlineAt ? Date.parse(receipt.deadlineAt) : NaN;
         const deadline = provisional && receipt.authorizationExpiresAt ? Date.parse(receipt.authorizationExpiresAt) : authorityEnd;
+        const mediaLimit = receipt.editorReadySupported === true ? prepMediaWindow : hour;
         const validWindow = Number.isFinite(t0) && Number.isFinite(authorityEnd) && t0 <= clock()+1500
-            && authorityEnd > clock() && validAssignmentWindow(t0, authorityEnd, receipt.revision);
+            && authorityEnd > clock() && validAssignmentWindow(t0, authorityEnd, receipt.revision, mediaLimit);
         if (!uploadToken || receipt.revoked || receipt.pausedAt || receipt.stopRequestedAt !== null || !Number.isFinite(deadline) || deadline <= clock()
             || (requestedPhase && (receipt.captureSessionId !== requestedPhase || receipt.nextSequence === undefined))
             || (provisional ? !['awaiting_frame','recording'].includes(receipt.status) || !receipt.authorizationExpiresAt
@@ -147,7 +168,8 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
         const same = previous?.recording === receipt.recordingId && previous.phase === requestedPhase;
         const entry: Capability = {recording:receipt.recordingId, token:uploadToken, deadline, phase:requestedPhase,
             revision:0, identityExpiresAt:identity.expiresAt, seed:provisional ? receipt.nextSequence : undefined,
-            seedDeadline:provisional ? deadline : undefined,
+            seedDeadline:provisional ? deadline : undefined, mediaLimit,
+            seedConfirmed:receipt.phaseReady === true || (same && previous.seedConfirmed),
             preparedEnds:same ? previous.preparedEnds : new Map()};
         if (validWindow) syncLeaseClock(entry, receipt);
         if (same && previous.startedAt !== undefined) syncLeaseClock({...previous}, receipt);
@@ -180,7 +202,8 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
     if (input.action === 'status') {
         if (entry?.recording === state.recordingId && (state.revision ?? 0) >= entry.revision)
             syncLeaseClock(entry, state);
-        return state;
+        // The broker's own clock when Universe names none, so the shell can place the media cutoff it relays.
+        return {...state, serverNow:state.serverNow ?? new Date(clock()).toISOString()};
     }
     if (!entry || entry.recording !== state.recordingId)
         return refuse('recording_session_refresh_required', 409);
@@ -217,9 +240,10 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
                 || ready.nextSequence !== input.sequence+1 || typeof ready.startedAt !== 'string' || typeof ready.deadlineAt !== 'string'
                 || !Number.isFinite(first) || !Number.isFinite(start) || !Number.isFinite(end) || first < start
                 || !details.success || details.data.pausedAt || first > now + 1500 || end <= now || end <= first
-                || !validAssignmentWindow(start, end, revision))
+                || !validAssignmentWindow(start, end, revision, entry.mediaLimit))
                 return refuse('seed_not_confirmed',503);
             syncLeaseClock(entry, {startedAt:ready.startedAt,deadlineAt:ready.deadlineAt,revision});
+            entry.seedConfirmed = true;
             return {recordingId:state.recordingId,sequence:input.sequence,confirmed:true,phaseReady:true,
                 captureSessionId:entry.phase,nextSequence:ready.nextSequence,firstFrameAt:ready.firstFrameAt,
                 startedAt:ready.startedAt,deadlineAt:ready.deadlineAt,serverNow:new Date(now).toISOString(),
