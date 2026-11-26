@@ -89,9 +89,12 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         if (disposed) throw failure('transport_disposed');
         return checkAssignmentVideoEligibility(attemptId, {fetcher, clock});
     }
-    async function begin() {
+    // `signal` (the embedded gate's phase): a phase stopped during the preflight sends no begin at all. Once the begin
+    // has been sent its answer is always read, because a late grant is what its owner must checkpoint.
+    async function begin({signal} = {}) {
         if (stopped || disposed) throw failure('recording_closed');
         const eligibility = await preflight();
+        if (signal?.aborted) throw failure('cancelled');
         mediaLimit = eligibility.editorReadySupported === true ? prepMediaLimit : hour;
         const data = await control('begin', {consentAccepted:true,consentVersion,repoOpenProof});
         const provisional = captureSessionId && data.status === 'awaiting_frame';
