@@ -242,6 +242,31 @@ export function createAiCreditOutboxStore(db: Database, fundingUrl?: string): Ai
         },
         requeueFailed: input => requeueFailedAiCredits(db, input),
         enrollFor: enrollWithStoredSubject,
+        async topupScope({ paymentIntentId, userId }) {
+            if (!/^pi_[A-Za-z0-9_]+$/.test(paymentIntentId)) return null;
+            // The owner is the stored row's, never the caller's word: `userId` only narrows. Two rows (limit 2) is a
+            // conflict `recordAiTopup` already refuses, so it is no scope here either.
+            const rows = await db.execute<{ userId: string; eventKey: string }>(sql`
+                select receipt.user_id::text as "userId", receipt.event_key as "eventKey" from ezil_billing_outbox receipt
+                where receipt.kind = 'ai_grant' and receipt.payload->>'protocol' = ${AI_CREDIT_PROTOCOL}
+                    and receipt.payload->>'paymentIntentId' = ${paymentIntentId}
+                    and receipt.payload->>'action' = 'grant' and receipt.delivered_at is null
+                    and coalesce(receipt.payload->'delivery'->>'status', 'pending') <> 'failed'
+                    and left(receipt.payload->>'entitlementId', 17) = 'ezil-os:v1:topup:'
+                    and receipt.event_key = (receipt.payload->>'entitlementId') || ':grant'
+                    ${userId === undefined ? sql`` : sql`and receipt.user_id = ${userId}::uuid`}
+                    and exists (select 1 from ezil_billing_grants paid where paid.source_type = 'payment_intent'
+                        and paid.source_id = ${paymentIntentId} and paid.kind = 'topup' and paid.meter = 'ai_usd_micro'
+                        and paid.user_id = receipt.user_id and paid.amount > 0)
+                    and not exists (select 1 from ezil_billing_outbox other where other.id <> receipt.id
+                        and other.payload->>'protocol' = ${AI_CREDIT_PROTOCOL}
+                        and (other.payload->>'entitlementId' = receipt.payload->>'entitlementId'
+                            or other.payload->>'paymentIntentId' = ${paymentIntentId}))
+                limit 2`);
+            const row = rows.length === 1 ? rows[0]! : null;
+            return row && typeof row.userId === 'string' && typeof row.eventKey === 'string'
+                ? { userId: row.userId, eventKey: row.eventKey, kind: 'ai_grant' } : null;
+        },
         async receiptsFor(userId) {
             const rows = await db.execute<{ entitlementId: unknown; credits: unknown; expiresAt: unknown; deliveredAt: unknown; failed: unknown }>(sql`
                 select payload->>'entitlementId' as "entitlementId", payload->'credits' as credits,

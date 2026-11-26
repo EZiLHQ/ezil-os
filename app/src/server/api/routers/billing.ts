@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { checkoutAvailable } from '@/server/billing/config';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP, CUSTOM_TOPUP_SKU, customTopupPack } from '@/server/billing/catalog';
 import { hasAiTopupReceipts, type AiTopupReceiptStore } from '@/server/billing/ai-credits';
+import { deliverPaidTopup } from '@/server/billing/ai-topup-delivery';
 import type { CatalogPack } from '@/server/billing/types';
 import { enqueueFreeAiCredits, readAiAccount, readAiAccountEvidence, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
 import { lookupAiAccount, missingAiAccountView } from '@/server/billing/ai-credit-outbox-store';
@@ -1157,6 +1158,20 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                     console.warn('[billing.topup] receipt unavailable');
                 }
                 if (!receipt || receipt.userId !== ctx.user.id) return { status, paymentStatus, fulfillment: 'processing', credits: null };
+                // The payer's own poll also retries their own paid, still-pending receipt (one bounded, scoped attempt
+                // under the outbox's lease and backoff): delivery does not wait for the minute sweep. The answer below
+                // is always the stored receipt's: an attempt that did not finish it leaves it "processing".
+                const pending = (receipt.payload.delivery as { status?: unknown } | null | undefined)?.status;
+                // `delivered` and `review` (a terminal refusal) both changed the stored receipt: re-read and report it.
+                if (pending !== 'done' && pending !== 'failed'
+                    && ['delivered', 'review'].includes(await deliverPaidTopup(deps, { paymentIntentId: session.paymentIntentId, userId: ctx.user.id }))) {
+                    try {
+                        receipt = await store.aiTopupReceipt(ctx.user.id, session.paymentIntentId) ?? receipt;
+                    } catch {
+                        console.warn('[billing.topup] receipt unavailable');
+                    }
+                    if (receipt.userId !== ctx.user.id) return { status, paymentStatus, fulfillment: 'processing', credits: null };
+                }
                 const delivery = (receipt.payload.delivery as { status?: unknown } | null | undefined)?.status;
                 const credits = receipt.payload.credits;
                 if (delivery === 'done') return { status, paymentStatus, fulfillment: 'credited', credits: Number.isSafeInteger(credits) ? credits as number : null };

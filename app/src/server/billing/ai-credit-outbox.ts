@@ -52,6 +52,14 @@ export interface AiCreditOutboxStore {
      * Must not throw (the drain maps a throw to `unavailable:connect_failed`).
      */
     enrollFor?(userId: string): Promise<AiEnrollForResult>;
+    /**
+     * The claim scope of a paid top-up's own receipt (optional; read-only): the one undelivered `ai_grant` row that
+     * `recordAiTopup` wrote for this payment intent, with its ledger grant, for its stored owner. Null when there is
+     * none, when `userId` is given and is not that owner, when its delivery ended `failed` (an operator's requeue,
+     * not a request, reopens it), or when the payment has any other receipt (a refund or dispute reversal): a
+     * reversed purchase is never delivered ahead of its reversal.
+     */
+    topupScope?(input: { paymentIntentId: string; userId?: string }): Promise<AiCreditClaimScope | null>;
     /** Newest first, at most 200 grant receipts of one user (read-only; splits the balance by bucket). */
     receiptsFor?(userId: string): Promise<AiCreditReceipt[]>;
     /** Operator-only (D5): dry run unless `apply`; see `planAiCreditRequeue`. */
@@ -102,15 +110,24 @@ export function plannedAiCreditEvent(row: AiCreditOutboxRow): Omit<AiGatewayEven
     return { eventId: p.eventId, entitlementId: p.entitlementId, action: p.action, credits: p.credits, expiresAt: p.expiresAt };
 }
 
+export interface AiOutboxDeliveryLine {
+    eventKey: string; status: AiCreditDelivery['status']; attempts: number; reason: string | null; enroll?: AiEnrollForResult | 'deferred';
+}
+function reportAiOutboxDelivery(line: AiOutboxDeliveryLine): void {
+    console.info(JSON.stringify({ event: 'ai-outbox', ...line }));
+}
+
 let warnedDisabled = false;
 /** deadlineMs is an absolute wall-clock deadline shared with the session sweep. */
 export async function drainAiCreditOutbox(deps: {
     config: Pick<BillingConfig, 'fundingUrl' | 'fundingHmacSecret'>;
     aiCredits?: AiCreditOutboxStore; clock?: () => number; fetch?: typeof fetch; log?: AiLogger;
-}, { limit, deadlineMs, scope, requestTimeoutMs = AI_GATEWAY_TIMEOUT_MS }: {
+}, { limit, deadlineMs, scope, requestTimeoutMs = AI_GATEWAY_TIMEOUT_MS, report = reportAiOutboxDelivery }: {
     limit: number; deadlineMs: number;
-    /** Sign-in starter delivery only: claim just this row and never enroll. The sweep passes neither option and keeps the 10 s request. */
+    /** A scoped delivery (the sign-in starter, a paid top-up): claim just this row and never enroll. The sweep passes neither option and keeps the 10 s request. */
     scope?: AiCreditClaimScope; requestTimeoutMs?: number;
+    /** The one line per finished delivery. Default: the sweep's `ai-outbox` line, which names the event key. */
+    report?: (line: AiOutboxDeliveryLine) => void;
 }) {
     const requestMs = aiRequestTimeoutMs(requestTimeoutMs);
     const counts = { claimed: 0, done: 0, failed: 0, retry: 0, skipped: 0 };
@@ -192,8 +209,7 @@ export async function drainAiCreditOutbox(deps: {
         }
         await store.finish(row, result, clock());
         // One structured line per finished delivery (ids and fixed codes only, never payload values).
-        console.info(JSON.stringify({ event: 'ai-outbox', eventKey: row.eventKey, status: result.status,
-            attempts: row.attempts, reason: result.reason, ...(enroll ? { enroll } : {}) }));
+        report({ eventKey: row.eventKey, status: result.status, attempts: row.attempts, reason: result.reason, ...(enroll ? { enroll } : {}) });
         counts[result.status]++;
     }
     return counts;
