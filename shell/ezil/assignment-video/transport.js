@@ -3,6 +3,8 @@ const path = '/api/shell/assignment-video';
 const bucket = 'https://ezil-universe-staging-assignment-media-452630323510-aps1.s3.ap-south-1.amazonaws.com';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const failure = (code) => Object.assign(new Error(code), {code});
+const hour = 3600000;
+const prepMediaLimit = hour + 240000;
 
 async function callControl(attemptId, action, fields, fetcher, repositoryUrl) {
     let response;
@@ -35,6 +37,7 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
     if (!uuid.test(attemptId) || (captureSessionId && !uuid.test(captureSessionId)) || typeof repoOpenProof !== 'string' || !/^[A-Za-z0-9_-]{48,1700}$/.test(repoOpenProof) || !Number.isSafeInteger(consentVersion) || consentVersion < 1)
         throw failure('invalid_assignment');
     let recording, poll, expiry, disposed = false, stopped = false, misses = 0;
+    let mediaLimit = hour;
     function clearTimers() { clearTimeout(poll); clearTimeout(expiry); }
     function stop(reason, effectiveAt = null) {
         if (stopped || disposed) return;
@@ -55,7 +58,26 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
             const cutoff = data.stopRequestedAt ?? (why === 'timeout' ? recording.deadlineAt : null);
             stop(why, typeof cutoff === 'string' && Number.isFinite(Date.parse(cutoff)) ? cutoff : null);
         }
+        if (!stopped && mediaLimit === prepMediaLimit && recording.phaseReady && data.phaseReady)
+            applyDeadline(data);
         return data;
+    }
+    function applyDeadline(data) {
+        const start = Date.parse(data.startedAt);
+        const end = Date.parse(data.deadlineAt);
+        const reportedNow = Date.parse(data.serverNow);
+        const remaining = end - (Number.isFinite(reportedNow) ? reportedNow : clock());
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || end - start > mediaLimit ||
+            (recording.phaseReady && recording.startedAt !== data.startedAt) || remaining > mediaLimit + 1500)
+            throw failure('recording_changed');
+        if (remaining <= 0) {
+            stop('timeout', data.deadlineAt);
+            return;
+        }
+        if (recording.phaseReady && recording.deadlineAt === data.deadlineAt) return;
+        recording = {...recording, phaseReady:true, startedAt:data.startedAt, deadlineAt:data.deadlineAt};
+        clearTimeout(expiry);
+        expiry = setTimeout(() => stop('timeout', recording.deadlineAt), remaining);
     }
     async function watch() {
         if (disposed || stopped) return;
@@ -69,7 +91,8 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
     }
     async function begin() {
         if (stopped || disposed) throw failure('recording_closed');
-        await preflight();
+        const eligibility = await preflight();
+        mediaLimit = eligibility.editorReadySupported === true ? prepMediaLimit : hour;
         const data = await control('begin', {consentAccepted:true,consentVersion,repoOpenProof});
         const provisional = captureSessionId && data.status === 'awaiting_frame';
         const deadline = Date.parse(provisional ? data.authorizationExpiresAt : data.deadlineAt);
@@ -77,7 +100,7 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
             || (recording && recording.recordingId !== data.recordingId)) throw failure('recording_changed');
         recording = data;
         clearTimers();
-        expiry = setTimeout(() => stop(provisional?'unavailable':'timeout', data.deadlineAt), Math.min(3600000, deadline-clock()));
+        expiry = setTimeout(() => stop(provisional?'unavailable':'timeout', data.deadlineAt), Math.min(mediaLimit, deadline-clock()));
         poll = setTimeout(watch, pollMs);
         return data;
     }
@@ -86,7 +109,7 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         const blob = bytes instanceof Blob ? bytes : new Blob([bytes], {type:'video/webm'});
         if (mimeType !== 'video/webm' || !Number.isSafeInteger(sequence) || sequence < 0 || sequence >= 600
             || !Number.isSafeInteger(startMs) || !Number.isSafeInteger(endMs) || endMs <= startMs
-            || startMs < 0 || endMs > 3600000 || endMs-startMs > 60000 || !blob.size || blob.size > 8*1024*1024)
+            || startMs < 0 || endMs > mediaLimit || endMs-startMs > 60000 || !blob.size || blob.size > 8*1024*1024)
             throw failure('invalid_segment');
         const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
         const sha256 = Array.from(new Uint8Array(digest), n => n.toString(16).padStart(2,'0')).join('');
@@ -103,14 +126,23 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         const result = await control('confirm', {sequence});
         if (!result.confirmed || result.recordingId !== recording.recordingId || result.sequence !== sequence)
             throw failure('upload_unconfirmed');
-        if (result.phaseReady && captureSessionId && result.captureSessionId === captureSessionId) {
-            const end=Date.parse(result.deadlineAt),serverNow=Date.parse(result.serverNow);
-            const remaining=end-(Number.isFinite(serverNow)?serverNow:clock());
-            if (!Number.isFinite(end) || remaining<=0 || remaining>3600000+1500) throw failure('recording_changed');
-            recording={...recording,startedAt:result.startedAt,deadlineAt:result.deadlineAt};
-            clearTimeout(expiry); expiry=setTimeout(()=>stop('timeout',recording.deadlineAt),remaining);
-        }
+        if (result.phaseReady && captureSessionId && result.captureSessionId === captureSessionId)
+            applyDeadline(result);
         return result;
+    }
+    async function editorReady() {
+        if (!recording?.phaseReady || !captureSessionId || stopped || disposed || mediaLimit !== prepMediaLimit)
+            throw failure('recording_unavailable');
+        // The broker resolves the authorized session, its checkout receipt and Universe time.
+        const data = await control('editor-ready', {repoOpenProof});
+        if (stopped || disposed) throw failure('recording_unavailable');
+        const start = Date.parse(data.startedAt);
+        const end = Date.parse(data.deadlineAt);
+        const now = Date.parse(data.serverNow);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || !Number.isFinite(now) ||
+            end <= start || end - start > hour || start > now + 1500)
+            throw failure('media_unavailable');
+        return {startedAt:data.startedAt, deadlineAt:data.deadlineAt, serverNow:data.serverNow};
     }
     async function checkpoint(reason) {
         if (!recording || disposed || !captureSessionId) throw failure('recording_unavailable');
@@ -130,5 +162,5 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
             body:JSON.stringify({action:'checkpoint',attemptId,captureSessionId,reason})}).catch(()=>{});
     }
     function dispose() { disposed = true; clearTimers(); recording = null; }
-    return {preflight, begin, status, upload, checkpoint, checkpointOnExit, finalize, dispose};
+    return {preflight, begin, status, upload, editorReady, checkpoint, checkpointOnExit, finalize, dispose};
 }

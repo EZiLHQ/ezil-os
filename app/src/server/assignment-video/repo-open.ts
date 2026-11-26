@@ -84,8 +84,8 @@ export function readOpen(proof: string, actor: Actor, attemptId: string, now: nu
     return refuse('assignment_open_required', 409);
 }
 
-export function signBegin(secret: string, body: string, now: number): Record<string,string> {
+export function signRepoOpen(secret: string, action: 'begin' | 'editor-ready', body: string, now: number): Record<string,string> {
     const time = String(now);
     return {'X-Ezil-Repo-Open-Timestamp':time,
-        'X-Ezil-Repo-Open-Signature':createHmac('sha256',secret).update(time + '.POST /internal/assignment-video/begin.' + body).digest('hex')};
+        'X-Ezil-Repo-Open-Signature':createHmac('sha256',secret).update(time + '.POST /internal/assignment-video/' + action + '.' + body).digest('hex')};
 }

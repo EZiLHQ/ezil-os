@@ -1,7 +1,7 @@
 import { assignmentMarker } from '@/server/git/assignment-bootstrap';
 import { expectedRepositoryURL } from '@/server/git/assignment-enrollment';
-import { makeChallenge, readOpen, sealOpen, signBegin } from './repo-open';
-import { createHash } from 'node:crypto';
+import { makeChallenge, readOpen, sealOpen, signRepoOpen } from './repo-open';
+import { createHash, createHmac } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { recordingAction } from './broker';
 import { checkedPut, creatorUnlinked, drain, hour, issuer, objectOrigin, requestSchema, type Prepare } from './contract';
@@ -48,6 +48,60 @@ vi.mock('server-only',()=>({}));
 beforeEach(()=>{vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET',testSigner);clock=initial+5000;remoteState={...state};calls.length=0;});
 
 describe('assignment media broker',()=>{
+    it('signs the editor-ready phase and receipt without accepting a browser clock',async()=>{
+        const phase = '00000000-0000-4000-8000-000000000008';
+        const request = {action:'editor-ready' as const,attemptId:attempt,captureSessionId:phase,repoOpenProof:witness.proof};
+        const anchor = time(initial);
+        const workClock = {startedAt:time(clock),deadlineAt:time(clock+hour),serverNow:time(clock+20)};
+        remoteState = {...state,captureSessionId:phase,nextSequence:1,phaseReady:true,workspaceUnlocked:true,editorReadySupported:true};
+        const sent: {url:string; init?:RequestInit}[] = [];
+        const d = {...deps(),fetcher:async (url:URL|Request|string,init?:RequestInit)=>{
+            sent.push({url:String(url),init});
+            return Response.json(String(url).endsWith('/editor-ready') ? workClock : {...remoteState, uploadToken:cap});
+        }};
+        await expect(recordingAction(identity,request,d)).rejects.toMatchObject({code:'recording_phase_changed'});
+        expect(sent).toHaveLength(0);
+        await recordingAction(identity,{...begin,captureSessionId:phase,consentVersion:4},d);
+        await expect(recordingAction(identity,request,d)).resolves.toEqual(workClock);
+        expect(sent).toHaveLength(2);
+        const path = '/internal/assignment-video/editor-ready';
+        expect(new URL(sent[1].url).pathname).toBe(path);
+        const exact = sent[1].init?.body as string;
+        expect(JSON.parse(exact)).toEqual({
+            userIdToken:identity.token,attemptId:attempt,osSessionId:identity.sessionId,captureSessionId:phase,
+            repoOpen:readOpen(witness.proof,identity,attempt,clock,testSigner),
+        });
+        const headers = new Headers(sent[1].init?.headers);
+        const stamp = headers.get('X-Ezil-Repo-Open-Timestamp');
+        expect(headers.get('X-Ezil-Repo-Open-Signature')).toBe(createHmac('sha256',testSigner)
+            .update(stamp+'.POST '+path+'.'+exact).digest('hex'));
+        expect(requestSchema.safeParse({...request,startedAt:anchor}).success).toBe(false);
+        expect(requestSchema.safeParse({...request,captureSessionId:undefined}).success).toBe(false);
+        await expect(recordingAction(identity,{...request,repoOpenProof:'x'.repeat(75)},d))
+            .rejects.toMatchObject({code:'assignment_open_required'});
+        expect(sent).toHaveLength(2);
+    });
+    it('updates only a bounded trusted media cutoff while retaining its original anchor',async()=>{
+        const phase = '00000000-0000-4000-8000-000000000008';
+        remoteState = {...state,captureSessionId:phase,nextSequence:1,phaseReady:true,workspaceUnlocked:true,
+            editorReadySupported:true,deadlineAt:time(initial+hour+240000)};
+        const d = deps();
+        await recordingAction(identity,{...begin,captureSessionId:phase,consentVersion:4},d);
+        const status = {action:'status' as const,attemptId:attempt,captureSessionId:phase};
+        remoteState.deadlineAt = time(initial+hour+60000);
+        await expect(recordingAction(identity,status,d)).resolves.toMatchObject({deadlineAt:remoteState.deadlineAt,startedAt:state.startedAt});
+        remoteState.deadlineAt = time(initial+hour+240000);
+        await expect(recordingAction(identity,status,d)).resolves.toMatchObject({deadlineAt:remoteState.deadlineAt});
+        remoteState.startedAt = time(initial+1000);
+        await expect(recordingAction(identity,status,d)).rejects.toMatchObject({code:'media_unavailable'});
+        remoteState.startedAt = state.startedAt;
+        remoteState.deadlineAt = time(initial+hour+240001);
+        await expect(recordingAction(identity,status,d)).rejects.toMatchObject({code:'media_unavailable'});
+        remoteState.editorReadySupported = undefined;
+        await expect(recordingAction(identity,{...begin,captureSessionId:phase,consentVersion:4},deps()))
+            .rejects.toMatchObject({code:'recording_closed'});
+    });
+
     it('carries only an exact creator-link refusal from the verified Universe preflight',async()=>{
         const preflight = {action:'preflight' as const,attemptId:attempt};
         const reply = (payload:unknown,status=409) => ({...deps(),fetcher:async()=>Response.json(payload,{status})});
@@ -92,7 +146,7 @@ describe('assignment media broker',()=>{
         expect(JSON.parse(String(calls[0].init?.body))).toEqual({attemptId:attempt,osSessionId:identity.sessionId,
             userIdToken:identity.token,consentAccepted:true,consentVersion:1,
             repoOpen:readOpen(witness.proof,identity,attempt,clock,testSigner)});
-        expect(calls[0].init?.headers).toMatchObject(signBegin(testSigner,String(calls[0].init?.body),clock));
+        expect(calls[0].init?.headers).toMatchObject(signRepoOpen(testSigner,'begin',String(calls[0].init?.body),clock));
         expect(calls[0].url).toBe('https://universe-staging.ezil.work/internal/assignment-video/begin');
         expect(await recordingAction(identity,input,d)).toEqual(signed);
         expect(calls.at(-2)?.url).toBe('https://universe-staging.ezil.work/internal/assignment-video/status');

@@ -8,20 +8,23 @@ export const worksOrigin = 'https://api-staging.ezil.work';
 export const objectOrigin = 'https://ezil-universe-staging-assignment-media-452630323510-aps1.s3.ap-south-1.amazonaws.com';
 export const issuer = 'https://id.ezil.work/';
 export const hour = 3_600_000;
+export const prepMediaWindow = hour + 240_000;
 export const drain = 90_000;
 export const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
 const integer = (min: number, max: number) => z.number().int().min(min).max(max);
 const sequence = integer(0, 599);
 const base = { attemptId: uuid };
 const phase = {captureSessionId: uuid.optional()};
+const repoOpenProof = z.string().regex(/^[A-Za-z0-9_-]{48,1700}$/);
 export const reason = z.enum(['stopped', 'submitted', 'timeout']);
 const segment = {
     sequence, sha256: z.string().regex(/^[a-f0-9]{64}$/), byteLength: integer(1, 8 * 1024 * 1024),
-    mimeType: z.literal('video/webm'), startMs: integer(0, hour), endMs: integer(1, hour),
+    mimeType: z.literal('video/webm'), startMs: integer(0, prepMediaWindow), endMs: integer(1, prepMediaWindow),
 };
 export const requestSchema = z.discriminatedUnion('action', [
-    z.object({ ...base, ...phase, action: z.literal('begin'), repoOpenProof: z.string().regex(/^[A-Za-z0-9_-]{48,1700}$/), consentAccepted: z.literal(true), consentVersion: integer(1, 2147483647) }).strict(),
+    z.object({ ...base, ...phase, action: z.literal('begin'), repoOpenProof, consentAccepted: z.literal(true), consentVersion: integer(1, 2147483647) }).strict(),
     z.object({ ...base, action: z.literal('preflight') }).strict(),
+    z.object({ ...base, action: z.literal('editor-ready'), captureSessionId: uuid, repoOpenProof }).strict(),
     z.object({ ...base, ...phase, action: z.literal('status') }).strict(),
     z.object({ ...base, ...phase, action: z.literal('prepare'), ...segment }).strict(),
     z.object({ ...base, ...phase, action: z.literal('confirm'), sequence }).strict(),
@@ -31,19 +34,28 @@ export const requestSchema = z.discriminatedUnion('action', [
 export type Input = z.infer<typeof requestSchema>;
 export type Prepare = Extract<Input, { action: 'prepare' }>;
 const moment = z.string().datetime({offset: true});
+export const editorReadyClock = z.object({
+    startedAt: moment, deadlineAt: moment, serverNow: moment,
+}).refine(clock => {
+    const start = Date.parse(clock.startedAt);
+    const end = Date.parse(clock.deadlineAt);
+    return end > start && end - start <= hour && start <= Date.parse(clock.serverNow) + 1500;
+});
 export const eligible = z.object({status: z.literal('eligible'), attemptId: uuid,
     jobId: z.string().regex(/^[1-9][0-9]{0,18}$/), expiresAt: moment, windowStartedAt: moment.nullable(), deadlineAt: moment.nullable(),
     manifestSha256: z.string().regex(/^[a-f0-9]{64}$/), repositoryUrl: z.string().max(260), providerId: z.string().regex(/^[a-z0-9]{1,64}$/), ref: z.literal('refs/heads/main'),
     boundWorkspaceId: z.string().regex(/^[a-f0-9]{64}$/).nullable().optional(),
     upgradedWorkspaceId: z.string().regex(/^[a-f0-9]{64}$/).optional(),
     upgradeOperationId: uuid.optional(),
+    editorReadySupported: z.boolean().optional(),
 }).refine(state => (state.upgradedWorkspaceId === undefined) === (state.upgradeOperationId === undefined));
 export type Eligible = z.infer<typeof eligible>;
 const control = {
     recordingId: uuid, status: z.enum(['awaiting_frame','paused','recording', 'empty', 'partial', 'complete']),
     startedAt: moment.nullable(), deadlineAt: moment.nullable(),
     captureSessionId: uuid.optional(), repositoryOpenReceiptId: uuid.optional(), nextSequence: integer(0,600).optional(),
-    authorizationExpiresAt: moment.nullable().optional(), phaseReady: z.boolean().optional(), workspaceUnlocked: z.boolean().optional(),
+    authorizationExpiresAt: moment.nullable().optional(), editorReadySupported: z.boolean().optional(),
+    serverNow: moment.optional(), phaseReady: z.boolean().optional(), workspaceUnlocked: z.boolean().optional(),
     stopRequestedAt: moment.nullable(), revoked: z.boolean(),
     stopReason: reason.nullable().optional(),
 };
