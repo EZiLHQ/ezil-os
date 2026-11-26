@@ -144,14 +144,24 @@ describe('embedded workspace return: the same EZiL ID, kept for the work window,
         mocks.identity.mockRejectedValue(new Error('IDENTITY_REFRESH_REQUIRED'));
         expect(where(await get(owned,cookie+'=00000000-0000-4000-8000-000000000001')).searchParams.get('prompt')).toBe('none');
     });
-    it('an EZiL ID that would expire inside a work window is refreshed once, then used as it is',async()=>{
-        mocks.identity.mockImplementation(async()=>kept(subject,74*60_000));
-        expect(where(await get(owned)).searchParams.get('prompt')).toBe('none');
-        expect((await get(owned,cookie+'='+id)).headers.get('location')).toBe(workspace);
-        mocks.identity.mockImplementation(async()=>kept(subject,76*60_000));
-        const enough=await get(owned);
-        expect(enough.headers.get('location')).toBe(workspace);
-        expect(enough.headers.get('set-cookie')).toBeNull();
+    it('🔴 a matching EZiL ID the vault still accepts is used as it is, with five minutes left: no extra provider round trip',async()=>{
+        for(const left of [5*60_000,61_000,10*hourMs]){
+            mocks.identity.mockImplementation(async()=>kept(subject,left));
+            const response=await get(owned);
+            expect(response.headers.get('location')).toBe(workspace);
+            expect(response.headers.get('set-cookie')).toBeNull();
+        }
+        expect(mocks.identity).toHaveBeenCalledTimes(3);
+    });
+    it('only the vault decides expiry: its refusal is refreshed once, and a second refusal stops at the lock screen',async()=>{
+        // `retainedIdentity` rejects a lost entry, an expired token and one inside IDENTITY_MIN_VALIDITY_MS alike.
+        mocks.identity.mockRejectedValue(new Error('IDENTITY_REFRESH_REQUIRED'));
+        const first=await get(owned);
+        expect(where(first).searchParams.get('prompt')).toBe('none');
+        expect(first.headers.get('set-cookie')).toContain(cookie+'='+id+'; Path=/; Max-Age=120');
+        const second=where(await get(owned,cookie+'='+id));
+        expect(second.origin+second.pathname).toBe(origin+'/login');
+        expect(second.searchParams.has('prompt')).toBe(false);
     });
     it('🔴 another account is told so on the lock screen: never a silent refresh, a switch, or a Universe bounce',async()=>{
         mocks.identity.mockImplementation(async()=>kept('auth0|someone-else'));
