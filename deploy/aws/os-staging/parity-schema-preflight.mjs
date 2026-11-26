@@ -70,7 +70,10 @@ const decimal = value => /^(0|[1-9][0-9]{0,18})$/.test(String(value)) ? String(v
 const knownIds = new Set(Object.values(PINNED_SQL).flat().map(([id]) => id));
 function migrationIdentifier(value) {
   const id = typeof value === 'string' ? value.replace(/^app\/drizzle\//, '').replace(/\.sql$/, '') : '';
-  return knownIds.has(id) ? { migration_id: id } : { unrecognized_identifier_sha256: sha256(value) };
+  return knownIds.has(id) ? { migration_id: id } : {
+    unrecognized_identifier_sha256: sha256(value),
+    ...(/^003[4-9]_/.test(id) ? { reserved_prefix: id.slice(0, 4) } : {}),
+  };
 }
 function typeName(row) {
   return row.type_schema === 'pg_catalog' && /^(?:uuid|text|boolean|smallint|integer|bigint|jsonb|json|bytea|date|real|double precision|numeric(?:\(\d+(?:,\d+)?\))?|character varying(?:\(\d+\))?|timestamp(?:\(\d+\))? (?:with|without) time zone)(?:\[\])?$/.test(row.data_type)
@@ -265,6 +268,12 @@ export async function collectEvidence(query, mode, env) {
           if (result.status === 'bounded') result.gate = 'ledger_row_bound_exceeded';
           result.rows = rows.slice(0, LIMITS.ledgerRows).map(r => ledgerRow(r, matched));
           result.returned_count = result.rows.length;
+          result.invalid_value_count = result.rows.reduce((n, row) => n + Object.values(row)
+            .filter(value => value && typeof value === 'object' && ('invalid_value_sha256' in value || 'reserved_prefix' in value)).length, 0);
+          if (result.invalid_value_count && result.status === 'readable') {
+            result.status = 'invalid_values';
+            result.gate = 'ledger_value_not_allowlisted';
+          }
         } catch (error) {
           await q(SQL.rollbackSavepoint);
           Object.assign(result, sanitizedError(error));

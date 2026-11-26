@@ -197,6 +197,8 @@ test('known ledger shapes read only safe columns; injected strings and SQL text 
   assert.doesNotMatch(output, /customer-identity|credential:secret/);
   assert.match(output, /invalid_value_sha256/);
   assert.match(output, /unrecognized_identifier_sha256/);
+  assert.equal(result.status, 'incomplete');
+  assert.equal(result.ledgers.find(l => l.name === 'public.ezil_staging_schema_log').gate, 'ledger_value_not_allowlisted');
 });
 
 test('unknown ledger shapes and views are not read or mislabeled absent', async t => {

@@ -125,8 +125,8 @@ on production is possible; its name does not establish environment or authority.
 
 `schema_usage_denied` or `table_select_denied`, with SQLSTATE `42501`, records the
 exact app-role privilege gate before data reads. Query-time `42501` is a separate
-`permission_denied` gate (including RLS). Timeouts, unknown shapes, and row bounds
-remain explicit. An absent candidate requires a successful catalog lookup; an
+`permission_denied` gate (including RLS). Timeouts, unknown shapes, malformed checksum values, unexpected reserved 0034–0039 identifiers, and row bounds
+remain explicit. Invalid ledger values produce an incomplete gate, not a successful installation claim. An absent candidate requires a successful catalog lookup; an
 error is never converted to absence. No readable nonempty ledger produces the
 `ledger_receipts_unavailable` gate. There is no fallback to an elevated identity.
 
