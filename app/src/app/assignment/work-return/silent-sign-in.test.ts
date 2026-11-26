@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { SILENT_MARKER_KEY, SILENT_MARKER_TTL_MS, SILENT_TIMEOUT_MS, silentWorkSignIn } from './silent-sign-in';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { createElement } from 'react';
+
+import { AssignmentSignInNotice, SIGN_IN_NOTICE } from './sign-in-notice';
+import { SILENT_DISCOVER_WAIT_MS, SILENT_MARKER_KEY, SILENT_MARKER_TTL_MS, SILENT_TIMEOUT_MS, silentWorkSignIn } from './silent-sign-in';
 
 const os = 'https://os-staging.ezil.work', universe = 'https://universe-staging.ezil.work';
 const id = 'ba4cf399-1f9b-43e5-be10-45e403bc0190', owner = '0123456789abcdef', request = '6f0c1d2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f';
@@ -98,7 +102,7 @@ describe('one hidden child, while the frame answers preparing', () => {
         expect(child).toMatchObject({ hidden: true, tabIndex: -1, referrerPolicy: 'no-referrer', style: { display: 'none' } });
         expect(child.setAttribute).toHaveBeenCalledWith('aria-hidden', 'true');
         expect(frame.top.postMessage).toHaveBeenCalledExactlyOnceWith({ protocol: work, type: 'preparing', attemptId: id, challenge, identityPending: true }, universe);
-        expect(pending.mock.calls).toEqual([[true]]);
+        expect(pending.mock.calls).toEqual([['checking']]);
         expect(JSON.parse(frame.storage.data.get(SILENT_MARKER_KEY)!)).toEqual({ attempt: id, at: Date.now() });
         // Later discovers are answered, and never start a second child.
         frame.discover({ challenge: '22222222-2222-4222-8222-222222222222' });
@@ -171,7 +175,7 @@ describe('success reloads only this frame', () => {
         // Until the new document answers for itself, this one keeps saying preparing.
         frame.discover();
         expect(frame.replies()).toEqual(['preparing', 'preparing']);
-        expect(pending.mock.calls).toEqual([[true]]);
+        expect(pending.mock.calls).toEqual([['checking']]);
         expect((frame.win.top as unknown as { location?: unknown }).location).toBeUndefined();
     });
     it('a success that names another attempt is not a success', () => {
@@ -194,7 +198,7 @@ describe('failure cleans up once and hands over to the existing top-level sign-i
         expect(frame.children[0]!.remove).toHaveBeenCalledOnce();
         expect(frame.reload).not.toHaveBeenCalled();
         expect(frame.top.postMessage).toHaveBeenLastCalledWith({ protocol: work, type: 'authentication_required', attemptId: id, challenge }, universe);
-        expect(pending.mock.calls).toEqual([[true], [false]]);
+        expect(pending.mock.calls).toEqual([['checking'], ['required']]);
         // Settled: nothing more is created, reloaded or removed, whatever arrives next.
         frame.answer('signed_in');
         frame.discover();
@@ -285,7 +289,8 @@ describe('one attempt per assignment per tab, across this frame\'s own reload', 
         frame.discover();
         expect(frame.children).toHaveLength(0);
         expect(frame.replies()).toEqual(['authentication_required', 'authentication_required']);
-        expect(pending).not.toHaveBeenCalled();
+        // Said once, at the first answer: the words change to the neutral sign-in line and stay there.
+        expect(pending.mock.calls).toEqual([['required']]);
         expect(frame.reload).not.toHaveBeenCalled();
     });
     it('a browser without randomUUID falls back the same way and leaves nothing behind', () => {
@@ -295,5 +300,64 @@ describe('one attempt per assignment per tab, across this frame\'s own reload', 
         frame.discover();
         expect(frame.children).toHaveLength(0);
         expect(frame.replies()).toEqual(['authentication_required']);
+    });
+});
+
+describe('the words on the page are neutral and never an instruction to go somewhere', () => {
+    it('🔴 the server-rendered first words are "Opening Code…", before any discovery or script', () => {
+        const html = renderToStaticMarkup(createElement(AssignmentSignInNotice, { attemptId: id }));
+        expect(html).toBe('<p role="status">Opening Code…</p>');
+    });
+    it('🔴 every phase has its own short status, and none names Universe, a tab or a place to click', () => {
+        expect(SIGN_IN_NOTICE).toEqual({ opening: 'Opening Code…', checking: 'Checking your EZiL ID…', required: 'Sign in to continue' });
+        for (const text of Object.values(SIGN_IN_NOTICE)) expect(text).not.toMatch(/universe|tab|continue to|open (this|it)|return|click|from your/i);
+    });
+    it('says checking only while the child runs, then required on any failure', () => {
+        const frame = frameWindow();
+        const phase = vi.fn();
+        silentWorkSignIn(id, frame.win, phase);
+        expect(phase).not.toHaveBeenCalled();
+        frame.discover();
+        expect(phase.mock.calls).toEqual([['checking']]);
+        vi.advanceTimersByTime(SILENT_TIMEOUT_MS);
+        expect(phase.mock.calls).toEqual([['checking'], ['required']]);
+    });
+    it('a successful sign-in never says required: the words stay on checking until the frame reloads', () => {
+        const frame = frameWindow();
+        const phase = vi.fn();
+        silentWorkSignIn(id, frame.win, phase);
+        frame.discover();
+        frame.answer('signed_in');
+        vi.advanceTimersByTime(SILENT_DISCOVER_WAIT_MS + SILENT_TIMEOUT_MS);
+        expect(phase.mock.calls).toEqual([['checking']]);
+    });
+    it('🔴 a document nobody asks stops saying it is opening, without a child, a message or a marker', () => {
+        for (const options of [{}, { nested: true }]) {
+            const frame = frameWindow(options);
+            const phase = vi.fn();
+            silentWorkSignIn(id, frame.win, phase);
+            vi.advanceTimersByTime(SILENT_DISCOVER_WAIT_MS - 1);
+            expect(phase).not.toHaveBeenCalled();
+            vi.advanceTimersByTime(1);
+            expect(phase.mock.calls).toEqual([['required']]);
+            expect(frame.children).toHaveLength(0);
+            expect(frame.top.postMessage).not.toHaveBeenCalled();
+            expect(frame.storage.data.size).toBe(0);
+        }
+    });
+    it('a late discover still gets its one attempt, and an early one cancels the wait', () => {
+        const late = frameWindow(), early = frameWindow(), gone = frameWindow();
+        const [latePhase, earlyPhase, gonePhase] = [vi.fn(), vi.fn(), vi.fn()];
+        silentWorkSignIn(id, late.win, latePhase);
+        silentWorkSignIn(id, early.win, earlyPhase);
+        const dispose = silentWorkSignIn(id, gone.win, gonePhase);
+        early.discover();
+        dispose();
+        vi.advanceTimersByTime(SILENT_DISCOVER_WAIT_MS);
+        late.discover();
+        expect(latePhase.mock.calls).toEqual([['required'], ['checking']]);
+        expect(late.children).toHaveLength(1);
+        expect(earlyPhase.mock.calls).toEqual([['checking']]);
+        expect(gonePhase).not.toHaveBeenCalled();
     });
 });

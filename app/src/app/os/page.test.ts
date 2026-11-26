@@ -35,7 +35,7 @@ beforeEach(() => {
 });
 describe('OS entry URL', () => {
     it('🔴 a signed-in framed Code assignment whose retained EZiL ID is refused gets the silent sign-in document, not the shell',async()=>{
-        const repo='https://github.ezil.work/default/u-0123456789abcdef-a-'+id+'.git', NOTICE='Continue to EZiL OS sign-in from your Universe assignment tab';
+        const repo='https://github.ezil.work/default/u-0123456789abcdef-a-'+id+'.git', NOTICE='<p role="status">Opening Code…</p>';
         const open=(query:Record<string,string>,appId='code')=>AppPage({params:Promise.resolve({appId}),searchParams:Promise.resolve(query)});
         mocks.headers.mockResolvedValue(new Headers({'sec-fetch-dest':'iframe'}));
         mocks.identity.mockRejectedValue(new Error('IDENTITY_REFRESH_REQUIRED'));
@@ -68,7 +68,8 @@ describe('OS entry URL', () => {
         const searchParams={assignment:id,repo:'https://github.ezil.work/default/u-0123456789abcdef-a-'+id+'.git'};
         const call=(query:Record<string,string>)=>AppPage({params:Promise.resolve(params),searchParams:Promise.resolve(query)});
         const html=renderToStaticMarkup(await call(searchParams));
-        expect(html).toContain('Continue to EZiL OS sign-in from your Universe assignment tab');
+        expect(html).toContain('<p role="status">Opening Code…</p>');
+        expect(html).not.toMatch(/Universe assignment tab|Continue to EZiL OS/);
         expect(mocks.redirect).not.toHaveBeenCalled();
         expect(mocks.defaultComputer).not.toHaveBeenCalled();
         await expect(call({...searchParams,repo:'https://github.com/example/other.git'})).rejects.toThrow('/login?');
