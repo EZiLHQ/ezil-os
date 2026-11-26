@@ -16,7 +16,13 @@ import { selectTrialOffer, trialOfferFingerprint } from '@/server/billing/v3/tri
 import { CAMPAIGNS_ON, STANDARD_PRICE_ID, STANDARD_PRODUCT_ID, standardTrialRead } from '@/server/billing/v3/trial-campaigns.test-support';
 import type { createTRPCContext } from '../trpc';
 
+// `../trpc` reaches a `server-only` module (the MCP identity bootstrap); the marker has no meaning under vitest.
+vi.mock('server-only', () => ({}));
 vi.mock('@/server/db', () => ({ db: {} }));
+// The scoped top-up delivery itself is proven against Postgres (ai-credit-outbox.pg.test.ts); here only when
+// `topupStatus` asks for it, for whom, and how it reports the result. Default: nothing to deliver.
+const topupDelivery = vi.hoisted(() => ({ deliver: vi.fn<typeof import('@/server/billing/ai-topup-delivery').deliverPaidTopup>(async () => 'skipped') }));
+vi.mock('@/server/billing/ai-topup-delivery', () => ({ deliverPaidTopup: topupDelivery.deliver }));
 const auth0 = vi.hoisted(() => ({ enabled: vi.fn(() => true) }));
 vi.mock('@/server/auth/auth0', () => ({ auth0Enabled: auth0.enabled }));
 vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ schedulePaidMigration: vi.fn() }));
@@ -999,6 +1005,92 @@ describe('top-up quote, stale-quote guard and confirmed fulfilment (synthetic fi
         vi.spyOn(console, 'warn').mockImplementation(() => {});
         withReceipt(f, new Error('db down'));
         await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing', credits: null });
+    });
+
+    describe('the payer\'s poll delivers their own paid, pending receipt (no sweep needed)', () => {
+        const pendingThenDone = (f: ReturnType<typeof fixture>) => {
+            const read = vi.fn<AiTopupReceiptStore['aiTopupReceipt']>().mockResolvedValueOnce(receipt({ status: 'pending' }))
+                .mockResolvedValue(receipt({ status: 'done' }));
+            Object.assign(f.store, { aiTopupReceipt: read, recordAiTopup: vi.fn<AiTopupReceiptStore['recordAiTopup']>() });
+            return read;
+        };
+
+        it('asks for exactly this payment as this user, then reports the re-read receipt: credited', async () => {
+            topupDelivery.deliver.mockReset().mockResolvedValue('delivered');
+            const f = topupFixture();
+            const read = pendingThenDone(f);
+            f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid',
+                fulfillment: 'credited', credits: 500 });
+            expect(topupDelivery.deliver).toHaveBeenCalledTimes(1);
+            expect(topupDelivery.deliver).toHaveBeenCalledWith(f.deps, { paymentIntentId: 'pi_fixture', userId });
+            expect(read).toHaveBeenCalledTimes(2);
+            expect(read).toHaveBeenLastCalledWith(userId, 'pi_fixture');
+        });
+
+        it('an attempt the Gateway refuses for good is reported from the re-read receipt as "review", never credited or still processing', async () => {
+            topupDelivery.deliver.mockReset().mockResolvedValue('review');
+            const f = topupFixture();
+            const read = vi.fn<AiTopupReceiptStore['aiTopupReceipt']>().mockResolvedValueOnce(receipt({ status: 'retry' }))
+                .mockResolvedValue(receipt({ status: 'failed' }));
+            Object.assign(f.store, { aiTopupReceipt: read, recordAiTopup: vi.fn<AiTopupReceiptStore['recordAiTopup']>() });
+            f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid',
+                fulfillment: 'review', credits: null });
+            expect(read).toHaveBeenCalledTimes(2);
+        });
+
+        it.each(['queued', 'skipped'] as const)('an attempt that ends %s stays an honest "processing", with no second read or claim of success', async outcome => {
+            topupDelivery.deliver.mockReset().mockResolvedValue(outcome);
+            const f = topupFixture();
+            const read = withReceipt(f, receipt({ status: 'retry' }));
+            f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid',
+                fulfillment: 'processing', credits: null });
+            expect(topupDelivery.deliver).toHaveBeenCalledTimes(1);
+            expect(read).toHaveBeenCalledTimes(1);
+        });
+
+        it('a delivered receipt that cannot be re-read, or re-reads as another owner\'s, is still not credited', async () => {
+            topupDelivery.deliver.mockReset().mockResolvedValue('delivered');
+            vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const f = topupFixture();
+            f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+            Object.assign(f.store, { recordAiTopup: vi.fn<AiTopupReceiptStore['recordAiTopup']>(),
+                aiTopupReceipt: vi.fn<AiTopupReceiptStore['aiTopupReceipt']>().mockResolvedValueOnce(receipt({ status: 'pending' })).mockRejectedValue(new Error('db down')) });
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing', credits: null });
+            Object.assign(f.store, { aiTopupReceipt: vi.fn<AiTopupReceiptStore['aiTopupReceipt']>().mockResolvedValueOnce(receipt({ status: 'pending' }))
+                .mockResolvedValue(receipt({ status: 'done' }, '22222222-2222-4222-8222-222222222222')) });
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing', credits: null });
+        });
+
+        it('never attempts delivery for an unpaid or unowned checkout, a missing or foreign receipt, or a finished one', async () => {
+            topupDelivery.deliver.mockReset().mockResolvedValue('delivered');
+            const f = topupFixture();
+            withReceipt(f, receipt({ status: 'pending' }));
+            // Charge not confirmed: open, completed-but-unpaid, expired.
+            for (const unpaid of [{ status: 'open', paymentStatus: 'unpaid' }, { paymentStatus: 'unpaid' }, { status: 'expired', paymentStatus: 'unpaid' }] as const) {
+                f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession(unpaid));
+                await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'awaiting_payment' });
+            }
+            // Another person's checkout, and a session that is not a top-up.
+            f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ clientReferenceId: '22222222-2222-4222-8222-222222222222' }));
+            await expect(f.caller.topupStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+            f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ mode: 'subscription', sku }));
+            await expect(f.caller.topupStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+            // Paid, but no receipt yet (the webhook has not committed one), or the row is another owner's.
+            f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+            withReceipt(f, null);
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing' });
+            withReceipt(f, receipt({ status: 'pending' }, '22222222-2222-4222-8222-222222222222'));
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing' });
+            // Already delivered, or terminally failed (an operator's review): nothing to retry from a poll.
+            withReceipt(f, receipt({ status: 'done' }));
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'credited', credits: 500 });
+            withReceipt(f, receipt({ status: 'failed' }));
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'review', credits: null });
+            expect(topupDelivery.deliver).not.toHaveBeenCalled();
+        });
     });
 
     it('duplicate webhook delivery still writes one receipt, and status reports it credited once delivered', async () => {

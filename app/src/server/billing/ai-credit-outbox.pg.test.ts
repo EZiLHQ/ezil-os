@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { eq, sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
@@ -6,7 +6,9 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import * as schema from '@/server/db/schema';
 import { authUsers, billingOutbox, billingGrants } from '@/server/db/schema';
 import { aiCreditEntitlement, aiCreditOutboxItem, aiTopupOutboxItem, aiCreditRevokeItem, hasAiTopupReceipts, hasAiReversals, aiCreditRestoreItem } from './ai-credits';
-import { findPack } from './catalog';
+import { customTopupPack, findPack } from './catalog';
+import { signAiGatewayBody } from './ai-gateway-client';
+import { deliverPaidTopup } from './ai-topup-delivery';
 import { AI_CREDIT_KICK_SQL, createAiCreditOutboxStore, requeueFailedAiCredits } from './ai-credit-outbox-store';
 import { AI_CREDIT_PROTOCOL } from './ai-credits';
 import { CATALOG_V3 } from './v3/contract';
@@ -14,7 +16,9 @@ import { drainAiCreditOutbox, type AiCreditOutboxStore } from './ai-credit-outbo
 import { enqueueFreeAiCredits } from './ai-balance';
 import { createBillingStore } from './store';
 import { processStripeEvent } from './processor';
-import type { BillingStore, StripeApi, StripeInvoice, StripeSubscription } from './ports';
+import type { BillingDeps, BillingStore, StripeApi, StripeInvoice, StripeSubscription } from './ports';
+import { readBillingConfig } from './config';
+import { handleStripeWebhook } from './http/stripe-webhook';
 import type { StripeEventLike } from './stripe/events';
 
 vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ schedulePaidMigration: vi.fn() }));
@@ -385,6 +389,305 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
         expect((await rows()).map(r => [r.kind, (r.payload as Record<string, unknown>).entitlementId, (r.payload as Record<string, unknown>).credits]).sort()).toEqual([
             ['ai_grant', root, 529], ['ai_revoke', root, 529]]);
         info.mockRestore();
+    });
+
+    describe('a paid top-up is delivered without the sweep (deliverPaidTopup on the real store)', () => {
+        const CONFIG = { fundingUrl: 'https://gateway.test', fundingHmacSecret: 'topup-pg-test-secret' };
+        const ACCOUNT = 'a3c1f0de-1111-4222-8333-444455556666', OTHER_ACCOUNT = 'b4d2e1cf-1111-4222-8333-444455556666';
+        const CREDITS_MICRO = BigInt(250) * BigInt(1_000_000);
+        /** The member contract's account for this user; the claim, lease, pin and finish stay the real store's. */
+        const deps = () => ({ config: CONFIG, aiCredits: { ...store, accountFor: async () => ACCOUNT } });
+        const receiptOf = async (intent: string) => (await rows()).find(row => row.kind === 'ai_grant'
+            && (row.payload as Record<string, unknown>).paymentIntentId === intent)!;
+        const delivery = async (intent: string) => (await receiptOf(intent)).payload as { accountPublicId?: string; delivery?: Record<string, unknown> };
+
+        /** What the verified webhook commits for a paid checkout: the ledger grant and its receipt, atomically. */
+        async function paid(owner = userId, intent = `pi_${randomUUID().replaceAll('-', '')}`) {
+            if (!hasAiTopupReceipts(billing)) throw new Error('missing topup store');
+            const receipt = aiTopupOutboxItem(owner, customTopupPack(2500)!, intent, end)!;
+            expect(await billing.recordAiTopup({ userId: owner, meter: 'ai_usd_micro', kind: 'topup', amount: BigInt(25_000_000),
+                sourceType: 'payment_intent', sourceId: intent, periodStart: start, periodEnd: end }, receipt)).toBe('applied');
+            return { intent, receipt, scope: { userId: owner, eventKey: receipt.eventKey, kind: 'ai_grant' as const } };
+        }
+
+        /** A Gateway that checks the HMAC, applies each event id once, and keeps a balance per account. */
+        function gateway() {
+            const seen = new Map<string, string>(), granted = new Map<string, bigint>();
+            let failures = 0, loseResponses = 0;
+            const fetcher = vi.fn<typeof fetch>(async (url, init) => {
+                const body = String(init!.body), headers = new Headers(init!.headers);
+                expect(String(url)).toBe('https://gateway.test/v1/integrations/entitlements');
+                expect(headers.get('x-ezil-signature')).toBe(signAiGatewayBody(CONFIG.fundingHmacSecret, headers.get('x-ezil-timestamp')!, body));
+                if (failures > 0) { failures--; return new Response(null, { status: 503 }); }
+                const event = JSON.parse(body) as { eventId: string; accountPublicId: string; credits: number };
+                if (seen.has(event.eventId) && seen.get(event.eventId) !== body) return Response.json({ error: { code: 'event_conflict' } }, { status: 409 });
+                if (!seen.has(event.eventId)) {
+                    seen.set(event.eventId, body);
+                    granted.set(event.accountPublicId, (granted.get(event.accountPublicId) ?? BigInt(0)) + BigInt(event.credits) * BigInt(1_000_000));
+                }
+                if (loseResponses > 0) { loseResponses--; throw new Error('response lost'); }
+                return Response.json({ ok: true });
+            });
+            return { fetcher, balance: (account: string) => granted.get(account) ?? BigInt(0),
+                failNext: (count: number) => { failures = count; }, loseNext: (count: number) => { loseResponses = count; } };
+        }
+        beforeEach(() => { vi.spyOn(console, 'info').mockImplementation(() => {}); });
+        afterEach(() => { vi.restoreAllMocks(); });
+
+        it('funds the exact account once, at once; a duplicate webhook, a later poll and the sweep then find nothing to send', async () => {
+            const { intent, scope } = await paid();
+            const g = gateway();
+            expect(await store.topupScope!({ paymentIntentId: intent })).toEqual(scope);
+            expect(await deliverPaidTopup(deps(), { paymentIntentId: intent, fetch: g.fetcher, clock: () => NOW })).toBe('delivered');
+            expect(g.fetcher).toHaveBeenCalledTimes(1);
+            expect(g.balance(ACCOUNT)).toBe(CREDITS_MICRO);
+            expect(g.balance(OTHER_ACCOUNT)).toBe(BigInt(0));
+            expect(await receiptOf(intent)).toMatchObject({ deliveredAt: new Date(NOW), attempts: 1, lastError: null,
+                payload: expect.objectContaining({ accountPublicId: ACCOUNT, credits: 250, delivery: { status: 'done', nextAttemptAt: null } }) });
+            // The status read the payer's poll uses: this receipt, delivered.
+            if (!hasAiTopupReceipts(billing)) throw new Error('missing topup store');
+            expect(((await billing.aiTopupReceipt(userId, intent))!.payload.delivery as { status: string }).status).toBe('done');
+            expect(await store.topupScope!({ paymentIntentId: intent })).toBeNull();
+            expect(await deliverPaidTopup(deps(), { paymentIntentId: intent, fetch: g.fetcher, clock: () => NOW + 1 })).toBe('skipped');
+            expect(await deliverPaidTopup(deps(), { paymentIntentId: intent, userId, fetch: g.fetcher, clock: () => NOW + 86_400_000 })).toBe('skipped');
+            expect(await store.claim(NOW + 86_400_000)).toBeNull();
+            expect(g.fetcher).toHaveBeenCalledTimes(1);
+            expect(g.balance(ACCOUNT)).toBe(CREDITS_MICRO);
+        });
+
+        it('a transient Gateway failure stays pending under the stored backoff: polls inside it send nothing, the first poll after it funds once', async () => {
+            const { intent } = await paid();
+            const g = gateway();
+            g.failNext(1);
+            const poll = (at: number) => deliverPaidTopup(deps(), { paymentIntentId: intent, userId, fetch: g.fetcher, clock: () => at });
+            expect(await poll(NOW)).toBe('queued');
+            expect(g.balance(ACCOUNT)).toBe(BigInt(0));
+            expect(await receiptOf(intent)).toMatchObject({ deliveredAt: null, attempts: 1, lastError: 'http_503',
+                payload: expect.objectContaining({ delivery: { status: 'retry', nextAttemptAt: NOW + 60_000 } }) });
+            for (const at of [NOW + 1_500, NOW + 3_000, NOW + 59_999]) expect(await poll(at)).toBe('queued');
+            expect(g.fetcher).toHaveBeenCalledTimes(1);
+            expect((await receiptOf(intent)).attempts).toBe(1);
+            expect(await poll(NOW + 60_000)).toBe('delivered');
+            expect(g.fetcher).toHaveBeenCalledTimes(2);
+            expect(g.balance(ACCOUNT)).toBe(CREDITS_MICRO);
+            expect(await receiptOf(intent)).toMatchObject({ deliveredAt: new Date(NOW + 60_000), attempts: 2, lastError: null });
+        });
+
+        it('a response lost after the Gateway applied the event is retried with the same event id and funds once', async () => {
+            const { intent, receipt } = await paid();
+            const g = gateway();
+            g.loseNext(1);
+            expect(await deliverPaidTopup(deps(), { paymentIntentId: intent, fetch: g.fetcher, clock: () => NOW })).toBe('queued');
+            expect(g.balance(ACCOUNT)).toBe(CREDITS_MICRO);
+            expect(await delivery(intent)).toMatchObject({ accountPublicId: ACCOUNT, delivery: { status: 'retry' } });
+            expect(await deliverPaidTopup(deps(), { paymentIntentId: intent, fetch: g.fetcher, clock: () => NOW + 60_000 })).toBe('delivered');
+            expect(g.fetcher.mock.calls.map(call => JSON.parse(String(call[1]!.body)).eventId)).toEqual([receipt.eventKey, receipt.eventKey]);
+            expect(g.balance(ACCOUNT)).toBe(CREDITS_MICRO);
+        });
+
+        it('a receipt leased by another worker (the webhook, a poll or the sweep) is not sent twice; after the lease it recovers and the old worker is fenced', async () => {
+            const { intent, scope } = await paid();
+            const g = gateway();
+            const held = (await store.claim(NOW, scope))!;
+            expect(await deliverPaidTopup(deps(), { paymentIntentId: intent, fetch: g.fetcher, clock: () => NOW + 1 })).toBe('queued');
+            expect(await deliverPaidTopup(deps(), { paymentIntentId: intent, fetch: g.fetcher, clock: () => NOW + 29_999 })).toBe('queued');
+            expect(g.fetcher).not.toHaveBeenCalled();
+            expect(await deliverPaidTopup(deps(), { paymentIntentId: intent, fetch: g.fetcher, clock: () => NOW + 30_000 })).toBe('delivered');
+            await store.finish(held, { status: 'failed', reason: 'stale' }, NOW + 30_001);
+            expect(await receiptOf(intent)).toMatchObject({ deliveredAt: new Date(NOW + 30_000), attempts: 2, lastError: null });
+            expect(g.fetcher).toHaveBeenCalledTimes(1);
+            expect(g.balance(ACCOUNT)).toBe(CREDITS_MICRO);
+        });
+
+        it('ownership: another signed-in user gets no scope and no attempt for this payment, and their own payment funds only its own event', async () => {
+            const other = randomUUID();
+            await db.insert(authUsers).values({ id: other });
+            const mine = await paid(), theirs = await paid(other);
+            const g = gateway();
+            expect(await store.topupScope!({ paymentIntentId: mine.intent, userId: other })).toBeNull();
+            expect(await store.topupScope!({ paymentIntentId: mine.intent, userId })).toEqual(mine.scope);
+            expect(await deliverPaidTopup(deps(), { paymentIntentId: mine.intent, userId: other, fetch: g.fetcher, clock: () => NOW })).toBe('skipped');
+            expect(g.fetcher).not.toHaveBeenCalled();
+            expect(await receiptOf(mine.intent)).toMatchObject({ attempts: 0, deliveredAt: null });
+            // The other user's own poll delivers their receipt and never claims mine.
+            const theirDeps = { config: CONFIG, aiCredits: { ...store, accountFor: async () => OTHER_ACCOUNT } };
+            expect(await deliverPaidTopup(theirDeps, { paymentIntentId: theirs.intent, userId: other, fetch: g.fetcher, clock: () => NOW })).toBe('delivered');
+            expect(JSON.parse(String(g.fetcher.mock.calls[0]![1]!.body))).toMatchObject({ eventId: theirs.receipt.eventKey, accountPublicId: OTHER_ACCOUNT });
+            expect(g.balance(OTHER_ACCOUNT)).toBe(CREDITS_MICRO);
+            expect(g.balance(ACCOUNT)).toBe(BigInt(0));
+            expect(await receiptOf(mine.intent)).toMatchObject({ attempts: 0, deliveredAt: null });
+        });
+
+        it('a reversed payment is never funded from a request: a refund or dispute receipt on it removes the scope', async () => {
+            for (const cause of [{ type: 'refund' as const, id: 're_fixture' }, { type: 'dispute' as const, id: 'dp_fixture' }, undefined]) {
+                const { intent, receipt } = await paid();
+                await billing.enqueueOutbox(aiCreditRevokeItem(receipt, cause));
+                const g = gateway();
+                expect(await store.topupScope!({ paymentIntentId: intent })).toBeNull();
+                expect(await deliverPaidTopup(deps(), { paymentIntentId: intent, userId, fetch: g.fetcher, clock: () => NOW })).toBe('skipped');
+                expect(g.fetcher).not.toHaveBeenCalled();
+                expect(await receiptOf(intent)).toMatchObject({ kind: 'ai_grant', attempts: 0, deliveredAt: null });
+            }
+        });
+
+        it('a terminal refusal ends in review with the receipt failed; no later request reopens it', async () => {
+            const { intent, scope } = await paid();
+            const conflict = vi.fn<typeof fetch>(async () => Response.json({ error: { code: 'event_conflict' } }, { status: 409 }));
+            const alert = vi.spyOn(console, 'error').mockImplementation(() => {});
+            expect(await deliverPaidTopup(deps(), { paymentIntentId: intent, fetch: conflict, clock: () => NOW })).toBe('review');
+            expect(await receiptOf(intent)).toMatchObject({ deliveredAt: null, attempts: 1, lastError: 'event_conflict',
+                payload: expect.objectContaining({ delivery: { status: 'failed', nextAttemptAt: null } }) });
+            expect(alert).toHaveBeenCalledTimes(1);
+            expect(await store.topupScope!({ paymentIntentId: intent })).toBeNull();
+            const g = gateway();
+            expect(await deliverPaidTopup(deps(), { paymentIntentId: intent, userId, fetch: g.fetcher, clock: () => NOW + 86_400_000 })).toBe('skipped');
+            expect(await store.claim(NOW + 86_400_000, scope)).toBeNull();
+            expect(g.fetcher).not.toHaveBeenCalled();
+        });
+
+        describe('through the signed webhook alone: the payer closed every tab and no sweep runs', () => {
+            const SECRET = 'fixture-only-webhook-secret';
+            const sign = (body: string, at: number) => new Request('https://app.example/api/billing/stripe/webhook', { method: 'POST', body,
+                headers: { 'stripe-signature': `t=${Math.floor(at / 1000)},v1=${createHmac('sha256', SECRET).update(`${Math.floor(at / 1000)}.${body}`).digest('hex')}` } });
+
+            /** One paid custom top-up checkout of this user, as Stripe reports it and as its webhook event carries it. */
+            async function checkout(g: ReturnType<typeof gateway>, aiCredits: AiCreditOutboxStore = { ...store, accountFor: async () => ACCOUNT }) {
+                const intent = `pi_${randomUUID().replaceAll('-', '')}`, customer = `cus_${userId.replaceAll('-', '')}`;
+                await billing.linkCustomer(userId, customer);
+                const retrieveCheckoutSession = vi.fn<StripeApi['retrieveCheckoutSession']>(async () => ({ id: 'cs_fixture', customer, clientReferenceId: userId,
+                    mode: 'payment', status: 'complete', paymentStatus: 'paid', paymentIntentId: intent, sku: 'ai_custom_v2', amountTotal: 2500, currency: 'usd',
+                    metadataCredits: '250', trialId: null }));
+                const body = JSON.stringify({ id: `evt_${intent.slice(3)}`, type: 'checkout.session.completed', created: Math.floor(NOW / 1000), livemode: false,
+                    data: { object: { id: 'cs_fixture', mode: 'payment', payment_status: 'paid', payment_intent: intent, customer, client_reference_id: userId } } });
+                const hookDeps: BillingDeps = { usage: null, store: billing, aiCredits, stripe: { retrieveCheckoutSession } as unknown as StripeApi, now: () => new Date(),
+                    config: readBillingConfig({ STRIPE_SECRET: 'sk_test_fixture', STRIPE_WEBHOOK_SECRET: SECRET, BILLING_FUNDING_URL: CONFIG.fundingUrl,
+                        BILLING_FUNDING_HMAC_SECRET: CONFIG.fundingHmacSecret }) };
+                vi.stubGlobal('fetch', g.fetcher);
+                /** Stripe signs every delivery attempt afresh over the same body. */
+                const deliver = async (at: number) => {
+                    vi.setSystemTime(at);
+                    const response = await handleStripeWebhook(sign(body, at), hookDeps, processStripeEvent);
+                    return [response.status, await response.json()] as const;
+                };
+                const ledger = () => db.select().from(billingGrants).where(eq(billingGrants.sourceId, intent));
+                return { intent, deliver, retrieveCheckoutSession, ledger };
+            }
+            beforeEach(() => { vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(NOW); });
+            afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+            it('healthy: the first delivery commits the receipt, funds the exact account once and answers 2xx', async () => {
+                const g = gateway();
+                const c = await checkout(g);
+                expect(await c.deliver(NOW)).toEqual([200, { received: true }]);
+                expect(g.fetcher).toHaveBeenCalledTimes(1);
+                expect(g.balance(ACCOUNT)).toBe(CREDITS_MICRO);
+                expect(await receiptOf(c.intent)).toMatchObject({ deliveredAt: new Date(NOW), attempts: 1 });
+                expect(await c.ledger()).toHaveLength(1);
+                expect(await c.deliver(NOW + 5_000)).toEqual([200, { received: true, duplicate: true }]);
+                expect(g.fetcher).toHaveBeenCalledTimes(1);
+            });
+
+            it.each([
+                ['the Gateway is unreachable', (g: ReturnType<typeof gateway>) => g.failNext(1), BigInt(0)],
+                ['the Gateway applied the grant but its acknowledgement was lost', (g: ReturnType<typeof gateway>) => g.loseNext(1), CREDITS_MICRO],
+            ] as const)('pending exit, %s: 503 until the same signed event is redelivered after the backoff, then exactly one grant and a final 2xx', async (_name, fault, afterFirst) => {
+                const g = gateway();
+                fault(g);
+                const c = await checkout(g);
+                expect(await c.deliver(NOW)).toEqual([503, { error: 'delivery_pending' }]);
+                expect(g.balance(ACCOUNT)).toBe(afterFirst);
+                // Committed once, marked processed, receipt pending under its stored backoff.
+                expect(await c.ledger()).toHaveLength(1);
+                expect(await receiptOf(c.intent)).toMatchObject({ deliveredAt: null, attempts: 1,
+                    payload: expect.objectContaining({ accountPublicId: ACCOUNT, delivery: { status: 'retry', nextAttemptAt: NOW + 60_000 } }) });
+                const stripeReads = c.retrieveCheckoutSession.mock.calls.length;
+                // A redelivery inside the backoff sends nothing and stays pending.
+                expect(await c.deliver(NOW + 30_000)).toEqual([503, { error: 'delivery_pending' }]);
+                expect(g.fetcher).toHaveBeenCalledTimes(1);
+                expect(await c.deliver(NOW + 60_000)).toEqual([200, { received: true, duplicate: true }]);
+                expect(g.fetcher).toHaveBeenCalledTimes(2);
+                expect(g.balance(ACCOUNT)).toBe(CREDITS_MICRO);
+                expect(g.balance(OTHER_ACCOUNT)).toBe(BigInt(0));
+                expect(await receiptOf(c.intent)).toMatchObject({ deliveredAt: new Date(NOW + 60_000), attempts: 2, lastError: null });
+                // The charge and the ledger were never rerun, and nothing is left to redeliver.
+                expect(c.retrieveCheckoutSession).toHaveBeenCalledTimes(stripeReads);
+                expect(await c.ledger()).toHaveLength(1);
+                expect(await c.deliver(NOW + 120_000)).toEqual([200, { received: true, duplicate: true }]);
+                expect(g.fetcher).toHaveBeenCalledTimes(2);
+            });
+
+            it('partial storage outage: the Gateway applied but the receipt could not be finished; the lease keeps the state and the redelivery funds nothing twice', async () => {
+                const g = gateway();
+                let outage = true;
+                const c = await checkout(g, { ...store, accountFor: async () => ACCOUNT,
+                    finish: async (...args) => { if (outage) { outage = false; throw new Error('db down'); } return store.finish(...args); } });
+                expect(await c.deliver(NOW)).toEqual([503, { error: 'delivery_pending' }]);
+                expect(g.balance(ACCOUNT)).toBe(CREDITS_MICRO);
+                expect(await receiptOf(c.intent)).toMatchObject({ deliveredAt: null, attempts: 1,
+                    payload: expect.objectContaining({ accountPublicId: ACCOUNT, delivery: expect.objectContaining({ status: 'processing', nextAttemptAt: NOW + 30_000 }) }) });
+                expect(await c.deliver(NOW + 10_000)).toEqual([503, { error: 'delivery_pending' }]);
+                expect(g.fetcher).toHaveBeenCalledTimes(1);
+                expect(await c.deliver(NOW + 30_000)).toEqual([200, { received: true, duplicate: true }]);
+                expect(g.fetcher).toHaveBeenCalledTimes(2);
+                expect(g.balance(ACCOUNT)).toBe(CREDITS_MICRO);
+                expect(await receiptOf(c.intent)).toMatchObject({ deliveredAt: new Date(NOW + 30_000), attempts: 2 });
+            });
+
+            it('permanent exit: a refused paid entitlement answers a terminal 2xx with one sanitized alert, and a redelivery does not loop', async () => {
+                const g = gateway();
+                const refused = vi.fn<typeof fetch>(async () => Response.json({ error: { code: 'event_conflict', message: 'provider body' } }, { status: 409 }));
+                const c = await checkout(g);
+                vi.stubGlobal('fetch', refused);
+                const alert = vi.spyOn(console, 'error').mockImplementation(() => {});
+                expect(await c.deliver(NOW)).toEqual([200, { received: true }]);
+                expect(await receiptOf(c.intent)).toMatchObject({ deliveredAt: null, lastError: 'event_conflict',
+                    payload: expect.objectContaining({ delivery: { status: 'failed', nextAttemptAt: null } }) });
+                expect(alert.mock.calls.map(call => JSON.parse(String(call[0])))).toEqual([{ event: 'ai-topup-delivery-alert', alert: 'paid_topup_not_credited', reason: 'event_conflict' }]);
+                const logged = alert.mock.calls.map(call => String(call[0])).join('\n');
+                for (const needle of [c.intent, userId, ACCOUNT, 'cs_fixture', 'cus_', 'provider body']) expect(logged).not.toContain(needle);
+                expect(await c.deliver(NOW + 3_600_000)).toEqual([200, { received: true, duplicate: true }]);
+                expect(refused).toHaveBeenCalledTimes(1);
+                expect(alert).toHaveBeenCalledTimes(1);
+                expect(await c.ledger()).toHaveLength(1);
+            });
+
+            it('a refund that lands while the receipt is pending ends the redelivery 2xx without funding it', async () => {
+                const g = gateway();
+                g.failNext(1);
+                const c = await checkout(g);
+                expect(await c.deliver(NOW)).toEqual([503, { error: 'delivery_pending' }]);
+                const pending = await receiptOf(c.intent);
+                await billing.enqueueOutbox(aiCreditRevokeItem({ eventKey: pending.eventKey, userId, kind: 'ai_grant', payload: pending.payload as Record<string, unknown> },
+                    { type: 'refund', id: 're_fixture' }));
+                expect(await c.deliver(NOW + 60_000)).toEqual([200, { received: true, duplicate: true }]);
+                expect(g.fetcher).toHaveBeenCalledTimes(1);
+                expect(g.balance(ACCOUNT)).toBe(BigInt(0));
+            });
+        });
+
+        it('no charge, no receipt, no delivery: an unknown payment, a receipt without its ledger grant, a colliding second receipt, a non-top-up grant', async () => {
+            const g = gateway();
+            const attempt = (paymentIntentId: string) => deliverPaidTopup(deps(), { paymentIntentId, fetch: g.fetcher, clock: () => NOW });
+            // A checkout that was never paid wrote nothing for its payment.
+            expect(await store.topupScope!({ paymentIntentId: 'pi_neverpaid' })).toBeNull();
+            expect(await attempt('pi_neverpaid')).toBe('skipped');
+            for (const malformed of ['', 'cs_fixture', 'pi_bad id', "pi_x' or '1'='1"]) expect(await store.topupScope!({ paymentIntentId: malformed })).toBeNull();
+            // A receipt row with no ledger grant behind it (not what recordAiTopup writes).
+            const orphan = aiTopupOutboxItem(userId, customTopupPack(2500)!, 'pi_orphanreceipt', end)!;
+            await billing.enqueueOutbox(orphan);
+            expect(await store.topupScope!({ paymentIntentId: 'pi_orphanreceipt' })).toBeNull();
+            // Two receipt rows naming one payment (a collision recordAiTopup refuses): neither is delivered from a request.
+            const { intent } = await paid();
+            await billing.enqueueOutbox({ ...orphan, eventKey: `ezil-os:v1:topup:ai_custom_v2:pi_collision:grant`,
+                payload: { ...orphan.payload, entitlementId: 'ezil-os:v1:topup:ai_custom_v2:pi_collision', eventId: 'ezil-os:v1:topup:ai_custom_v2:pi_collision:grant', paymentIntentId: intent } });
+            expect(await store.topupScope!({ paymentIntentId: intent })).toBeNull();
+            expect(await attempt(intent)).toBe('skipped');
+            // A plan-period grant is the sweep's, whatever payment it names.
+            await billing.enqueueOutbox(item());
+            expect(await attempt('pi_orphanreceipt')).toBe('skipped');
+            expect(g.fetcher).not.toHaveBeenCalled();
+            expect((await rows()).every(row => row.attempts === 0 && row.deliveredAt === null)).toBe(true);
+        });
     });
 });
 
