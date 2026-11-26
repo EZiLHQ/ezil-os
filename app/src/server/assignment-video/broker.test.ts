@@ -48,6 +48,57 @@ vi.mock('server-only',()=>({}));
 beforeEach(()=>{vi.stubEnv('BILLING_FUNDING_URL','https://ai-staging.ezil.work');vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN','https://universe-staging.ezil.work');vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED',undefined);vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET',testSigner);clock=initial+5000;remoteState={...state};calls.length=0;});
 
 describe('assignment media broker',()=>{
+    it('does not let an older Begin response replace a newer active phase on the same attempt', async () => {
+        const oldPhase = '00000000-0000-4000-8000-000000000008';
+        const newPhase = '00000000-0000-4000-8000-000000000009';
+        const awaiting = (phase: string) => ({...state, status:'awaiting_frame', phaseReady:false,
+            workspaceUnlocked:false, captureSessionId:phase, nextSequence:0,
+            authorizationExpiresAt:time(clock+60_000), startedAt:null, deadlineAt:null});
+        let returnOld!: (response: Response) => void;
+        const oldReply = new Promise<Response>(resolve => { returnOld=resolve; });
+        const d = {...deps(), fetcher: async (url: RequestInfo | URL, init?: RequestInit) => {
+            const phase = JSON.parse(String(init?.body)).captureSessionId;
+            if (String(url).endsWith('/begin')) {
+                if (phase === oldPhase) return oldReply;
+                return Response.json({...awaiting(newPhase), uploadToken:cap});
+            }
+            if (String(url).endsWith('/status') && phase === newPhase) return Response.json(awaiting(newPhase));
+            throw new Error('unexpected request');
+        }};
+        const old = recordingAction(identity,{...begin,captureSessionId:oldPhase,consentVersion:4},d).catch(error=>error);
+        await expect(recordingAction(identity,{...begin,captureSessionId:newPhase,consentVersion:4},d))
+            .resolves.toMatchObject({captureSessionId:newPhase});
+        returnOld(Response.json({...awaiting(oldPhase), uploadToken:cap}));
+        await expect(old).resolves.toMatchObject({code:'recording_phase_changed',status:409});
+        await expect(recordingAction(identity,{action:'checkpoint',attemptId:attempt,captureSessionId:oldPhase,
+            reason:'connection_lost'},d)).rejects.toMatchObject({code:'recording_phase_changed'});
+        await expect(recordingAction(identity,{action:'status',attemptId:attempt,captureSessionId:newPhase},d))
+            .resolves.toMatchObject({captureSessionId:newPhase});
+    });
+
+    it.each([true,false])('keeps same-phase late repeats idempotent (new request succeeds=%s)', async newerSucceeds => {
+        const phase = '00000000-0000-4000-8000-000000000008';
+        const fill = { ...state, captureSessionId:phase, nextSequence:0, phaseReady:false, workspaceUnlocked:false,
+            status:'awaiting_frame', authorizationExpiresAt:time(clock+60_000), startedAt:null, deadlineAt:null };
+        const latestToken = cap + '_latest';
+        let returnFirst!: (response: Response) => void;
+        const firstReply = new Promise<Response>(resolve => { returnFirst=resolve; });
+        let beginCalls = 0;
+        const d = {...deps(), fetcher: async (url: RequestInfo | URL) => {
+            if (!String(url).endsWith('/begin')) throw new Error('unexpected request');
+            if (++beginCalls === 1) return firstReply;
+            return newerSucceeds ? Response.json({...fill, uploadToken:latestToken}) : new Response(null, {status:503});
+        }};
+        const request = {...begin,captureSessionId:phase,consentVersion:4};
+        const first = recordingAction(identity,request,d);
+        const latest = recordingAction(identity,request,d);
+        if (newerSucceeds) await expect(latest).resolves.toMatchObject({captureSessionId:phase});
+        else await expect(latest).rejects.toMatchObject({code:'media_unavailable'});
+        returnFirst(Response.json({...fill, uploadToken:cap}));
+        await expect(first).resolves.toMatchObject({captureSessionId:phase});
+        expect([...d.leases.values()]).toEqual([expect.objectContaining({phase, token:newerSucceeds ? latestToken : cap})]);
+    });
+
     it('starts a managed preparation\'s work clock only for the confirmed capture it holds, without a browser clock',async()=>{
         const phase = '00000000-0000-4000-8000-000000000008';
         const request = {action:'editor-ready' as const,attemptId:attempt,captureSessionId:phase,repoOpenProof:witness.proof};

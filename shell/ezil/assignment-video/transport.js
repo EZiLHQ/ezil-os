@@ -151,10 +151,12 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         if (disposed) throw failure('transport_disposed');
         return checkAssignmentVideoEligibility(attemptId, {fetcher, clock});
     }
-    async function begin() {
+    // A retired phase can stop before authorization is sent. An already-sent authorization still settles for cleanup.
+    async function begin({signal} = {}) {
         if (stopped || disposed) throw failure('recording_closed');
         // Only Universe's own signed preflight widens the media bound; without its flag the bound is the hour.
         const eligibility = await preflight();
+        if (signal?.aborted) throw failure('cancelled');
         mediaLimit = eligibility.editorReadySupported === true ? PREP_MEDIA_MS : HOUR;
         const data = await control('begin', {consentAccepted:true,consentVersion,repoOpenProof});
         const provisional = captureSessionId && data.status === 'awaiting_frame';
