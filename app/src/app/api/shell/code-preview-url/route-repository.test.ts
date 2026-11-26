@@ -442,7 +442,7 @@ describe('standalone EZiL Git URL open', () => {
 describe('the enrolled checkout signals the protected top-level shell only after the private preload acknowledges', () => {
     it('binds a signed Worker challenge, immutable enrollment, real same-session owner, and port 5679', async () => {
         const { expectedRepositoryURL } = await import('@/server/git/assignment-enrollment');
-        const { makeChallenge, readOpen } = await import('@/server/assignment-video/repo-open');
+        const { makeChallenge, readOpen, sealOpen } = await import('@/server/assignment-video/repo-open');
         const attemptId = 'ecb246af-f1b8-4c72-8e6d-414c814de821';
         const origin = 'https://os-staging.ezil.work';
         const subject = 'auth0|builder';
@@ -505,6 +505,12 @@ describe('the enrolled checkout signals the protected top-level shell only after
         const unlocked=await confirmed.json();
         expect(new URL(unlocked.codePreviewUrl).searchParams.get('folder')).toBe(body.repository.workspaceFolder);
         expect(unlocked.repository).toEqual(body.repository);
+        const aged = sealOpen(actor,{...enrolled,status:'eligible',ref:'refs/heads/main'},COMPUTER,SANDBOX,
+            repositoryOpenReceiptId,now-301_000,signingKey);
+        await locked(await open({...enter,repoOpenProof:aged.proof}));
+        const reopened = await open({...enter,phase:'reopen',repoOpenProof:aged.proof});
+        expect(reopened.status).toBe(200);
+        expect((await reopened.json()).repository).toEqual(body.repository);
         for (const response of ['missing','wrong','wrong-folder'] as const) {
             ack=response;
             await locked(await open(prep));
@@ -527,7 +533,7 @@ describe('the staged AWS protected checkout uses fresh Universe binding and the 
 
     async function assignment() {
         const {expectedRepositoryURL} = await import('@/server/git/assignment-enrollment');
-        const {makeChallenge, readOpen, workspaceIdentity} = await import('@/server/assignment-video/repo-open');
+        const {makeChallenge, readOpen, sealOpen, workspaceIdentity} = await import('@/server/assignment-video/repo-open');
         const repositoryUrl = expectedRepositoryURL(subject, 'a-' + attemptId);
         const workspaceId = workspaceIdentity(USER, COMPUTER, SANDBOX);
         const actor = {userId: USER, issuer:'https://id.ezil.work/', subject, sessionId: s.sessionId, expiresAt: Date.now()+600000};
@@ -571,6 +577,8 @@ describe('the staged AWS protected checkout uses fresh Universe binding and the 
         };
         return {open, enrollment, state, workspaceId, migration, iso,
             readProof: (value: string) => readOpen(value, actor, attemptId, Date.now(), signingKey),
+            agedProof: (eventId: string, sandbox = SANDBOX) => sealOpen(actor,
+                {...enrollment,status:'eligible',ref:'refs/heads/main'},COMPUTER,sandbox,eventId,Date.now()-301_000,signingKey).proof,
             setAuthority: (source: typeof authority) => { authority = source; },
             setAck: (value: typeof ack) => { ack = value; }};
     }
@@ -606,6 +614,56 @@ describe('the staged AWS protected checkout uses fresh Universe binding and the 
         const confirmed = await open(enter);
         expect(confirmed.status).toBe(200);
         expect(new URL((await confirmed.json()).codePreviewUrl).searchParams.get('folder')).toMatch(/^\/workspace\/projects\//);
+    });
+
+    it('reopens the same AWS checkout with an aged original receipt only while that captured phase is live', async () => {
+        const {open,enrollment,state,workspaceId,readProof,agedProof,iso} = await assignment();
+        const prepared = await open();
+        expect(prepared.status).toBe(200);
+        const {assignmentOpen,repository} = await prepared.json();
+        enrollment.boundWorkspaceId = workspaceId;
+        const originalEvent = readProof(assignmentOpen.proof).eventId;
+        state.repositoryOpenReceiptId = originalEvent;
+        const proof = agedProof(originalEvent);
+        expect(() => readProof(proof)).toThrow();
+        expect((await open({phase:'open',captureSessionId,repoOpenProof:proof})).status).toBe(409);
+        const reopen = {phase:'reopen',captureSessionId,repoOpenProof:proof};
+        const restored = await open(reopen);
+        expect(restored.status).toBe(200);
+        const answer = await restored.json();
+        expect(answer.repository).toEqual(repository);
+        expect(new URL(answer.codePreviewUrl).searchParams.get('folder')).toBe(repository.workspaceFolder);
+
+        async function refusedWithoutMint(input = reopen) {
+            const started = s.order.length;
+            const response = await open(input);
+            expect(response.status).toBe(409);
+            expect(await response.text()).not.toContain('preview-bootstrap');
+            expect(s.order.slice(started)).not.toContain('codePreviewUrl');
+            expect(s.order.slice(started)).not.toContain('worker');
+        }
+        await refusedWithoutMint({...reopen,captureSessionId:recordingId});
+        await refusedWithoutMint({...reopen,repoOpenProof:agedProof(recordingId)});
+        await refusedWithoutMint({...reopen,repoOpenProof:agedProof(originalEvent,'different-computer')});
+        const session = s.sessionId;
+        s.sessionId='different-session';
+        await refusedWithoutMint();
+        s.sessionId=session;
+        state.revoked=true;
+        await refusedWithoutMint();
+        state.revoked=false;
+        state.deadlineAt=iso(-1);
+        await refusedWithoutMint();
+        state.deadlineAt=enrollment.deadlineAt;
+        const worker=s.worker;
+        if (!worker) throw new Error('Missing fixture checkout worker');
+        s.worker=body=>{
+            state.revoked=true;
+            return worker(body);
+        };
+        const stoppedDuringCheckout=await open(reopen);
+        expect(stoppedDuringCheckout.status).toBe(409);
+        expect(await stoppedDuringCheckout.text()).not.toContain('preview-bootstrap');
     });
 
     it.each(['missing','foreign','unpaired','expired','expires-beyond-window','future-start','malformed'] as const)(

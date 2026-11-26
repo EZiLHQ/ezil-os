@@ -71,14 +71,17 @@ export function sealOpen(actor: Actor, eligible: Eligible, computerId: string, w
     return {attemptId: eligible.attemptId, proof, openedAt, windowStartedAt: eligible.windowStartedAt, deadlineAt: eligible.deadlineAt};
 }
 
-export function readOpen(proof: string, actor: Actor, attemptId: string, now: number, secret: string) {
+// Reopening the already-authorized editor may occur after the short opening proof expires. Its one caller
+// must independently verify the exact active capture and original receipt before using the decoded event.
+export function readOpen(proof: string, actor: Actor, attemptId: string, now: number, secret: string,
+    purpose: 'fresh' | 'active-reopen' = 'fresh') {
     try {
         const raw = Buffer.from(proof, 'base64url');
         if (raw.toString('base64url') !== proof || raw.length < 32 || raw.length > 1210) throw Error();
         const decipher = createDecipheriv('aes-256-gcm', encryptionKey(secret), raw.subarray(0,12));
         decipher.setAuthTag(raw.subarray(12,28));
         const data = receipt.parse(JSON.parse(Buffer.concat([decipher.update(raw.subarray(28)),decipher.final()]).toString('utf8')));
-        if (data.attemptId === attemptId && data.actor === actorBinding(actor) && data.expires > now
+        if (data.attemptId === attemptId && data.actor === actorBinding(actor) && (purpose === 'active-reopen' || data.expires > now)
             && Date.parse(data.event.openedAt) <= now && data.event.repositoryUrl === expectedRepositoryURL(actor.subject, 'a-' + attemptId)) return data.event;
     } catch { /* A foreign, altered or expired proof has the same refusal. */ }
     return refuse('assignment_open_required', 409);

@@ -65,9 +65,11 @@ import {
  * procedure's own zod schema rejects anything malformed as a 400.
  */
 export const maxDuration = 300;
+const assignedEditor = {attemptId:uuid,captureSessionId:uuid,repoOpenProof:z.string().regex(/^[A-Za-z0-9_-]{48,1700}$/)};
 const assignmentPhase = z.discriminatedUnion('phase', [
     z.object({phase:z.literal('prepare'),attemptId:uuid}).strict(),
-    z.object({phase:z.literal('open'),attemptId:uuid,captureSessionId:uuid,repoOpenProof:z.string().regex(/^[A-Za-z0-9_-]{48,1700}$/)}).strict(),
+    z.object({phase:z.literal('open'),...assignedEditor}).strict(),
+    z.object({phase:z.literal('reopen'),...assignedEditor}).strict(),
 ]);
 const assignmentLocked = () => shellRefusal(409,'assignment_recording_required','Share the assignment tab and wait for the first recorded frame to open Code.');
 const assignmentAwsUnverified = () => shellRefusal(409, 'assignment_aws_unverified', 'Universe could not verify this AWS workspace. Reopen the assignment on its assigned computer.');
@@ -431,6 +433,25 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
             return null;
         }
     };
+    async function hasLiveCapture(captureSessionId: string, receiptId: string) {
+        if (!identity || !attemptId) return false;
+        const state = await recordingAction(identity,{action:'status',attemptId,captureSessionId},{signal:deadline}).catch(()=>null);
+        return Boolean(state && state.captureSessionId === captureSessionId && state.repositoryOpenReceiptId === receiptId
+            && state.phaseReady === true && state.workspaceUnlocked === true && state.status === 'recording'
+            && state.revoked === false && state.stopRequestedAt === null && typeof state.firstFrameAt === 'string'
+            && typeof state.startedAt === 'string' && typeof state.deadlineAt === 'string'
+            && Date.parse(state.deadlineAt) > Date.now() && await sameSession());
+    }
+    let reopeningProof: ReturnType<typeof readOpen> | null = null;
+    if (phase.success && phase.data.phase === 'reopen') {
+        if (!identity || !attemptId || !signer) return assignmentLocked();
+        try {
+            reopeningProof = readOpen(phase.data.repoOpenProof,identity,attemptId,Date.now(),signer,'active-reopen');
+        } catch { return assignmentLocked(); }
+        if (reopeningProof.repositoryUrl !== parsed.canonicalURL || reopeningProof.providerId !== privatePacket?.repository.id
+            || reopeningProof.workspaceId !== workspaceIdentity(identity.userId,computerId,selected.sandboxName)
+            || !await hasLiveCapture(phase.data.captureSessionId,reopeningProof.eventId)) return assignmentLocked();
+    }
     // This is the exact machine selected and owned by the authenticated user. Universe's explicit null comes from a
     // row-locked first bind. Both fresh and already-started first opens are permitted, but an omitted field is not null.
     async function verifyAwsBinding(current: ControlTarget, enrolled: Eligible | null): Promise<boolean> {
@@ -555,13 +576,11 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
         const assignmentOpen = sealOpen(identity,enrolled,computerId,controls.sandboxName,challenge.eventId,now,signer);
         return shellJson({ok:true,repository,assignmentOpen});
     }
-    const proof = (() => { try { return readOpen(operation.repoOpenProof,identity,attemptId,now,signer); } catch { return null; } })();
+    const proof = reopeningProof ?? (() => { try { return readOpen(operation.repoOpenProof,identity,attemptId,now,signer); } catch { return null; } })();
     if (!proof || proof.workspaceId !== workspaceIdentity(identity.userId,computerId,controls.sandboxName) || proof.repositoryUrl !== parsed.canonicalURL
         || proof.providerId !== privatePacket.repository.id || proof.manifestSha256 !== enrolled.manifestSha256) return assignmentLocked();
-    const state = await recordingAction(identity,{action:'status',attemptId,captureSessionId:operation.captureSessionId},{signal:deadline}).catch(()=>null);
-    if (!state || state.captureSessionId !== operation.captureSessionId || state.repositoryOpenReceiptId !== proof.eventId || state.phaseReady !== true || state.workspaceUnlocked !== true
-        || state.status !== 'recording' || state.revoked !== false || state.stopRequestedAt !== null || typeof state.firstFrameAt !== 'string'
-        || typeof state.startedAt !== 'string' || typeof state.deadlineAt !== 'string' || Date.parse(state.deadlineAt) <= Date.now() || !(await sameSession())) return assignmentLocked();
+    // Checkout can take time. Recheck the same phase after the private Worker acknowledgement before exposing its editor URL.
+    if (!await hasLiveCapture(operation.captureSessionId,proof.eventId)) return assignmentLocked();
     return shellJson({...preview,codePreviewUrl:url,url,repository});
 
 }
