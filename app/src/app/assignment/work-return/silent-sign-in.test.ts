@@ -97,7 +97,7 @@ describe('one hidden child, while the frame answers preparing', () => {
         expect(child.src).toBe('/assignment/work-auth?' + new URLSearchParams({ attempt: id, owner, request }));
         expect(child).toMatchObject({ hidden: true, tabIndex: -1, referrerPolicy: 'no-referrer', style: { display: 'none' } });
         expect(child.setAttribute).toHaveBeenCalledWith('aria-hidden', 'true');
-        expect(frame.top.postMessage).toHaveBeenCalledExactlyOnceWith({ protocol: work, type: 'preparing', attemptId: id, challenge }, universe);
+        expect(frame.top.postMessage).toHaveBeenCalledExactlyOnceWith({ protocol: work, type: 'preparing', attemptId: id, challenge, identityPending: true }, universe);
         expect(pending.mock.calls).toEqual([[true]]);
         expect(JSON.parse(frame.storage.data.get(SILENT_MARKER_KEY)!)).toEqual({ attempt: id, at: Date.now() });
         // Later discovers are answered, and never start a second child.
@@ -121,6 +121,38 @@ describe('one hidden child, while the frame answers preparing', () => {
         expect(frame.reload).not.toHaveBeenCalled();
         expect(frame.children[0]!.remove).not.toHaveBeenCalled();
         expect(frame.replies()).toEqual(['preparing']);
+    });
+});
+
+describe('identityPending marks only this document\'s own preparing', () => {
+    const sent = (frame: ReturnType<typeof frameWindow>) => frame.top.postMessage.mock.calls.map(call => call[0] as Record<string, unknown>);
+    it('🔴 every bootstrap preparing reply carries exactly identityPending: true, including while the reload is pending', () => {
+        const frame = frameWindow();
+        silentWorkSignIn(id, frame.win);
+        frame.discover();
+        frame.discover({ challenge: '22222222-2222-4222-8222-222222222222' });
+        frame.answer('signed_in');
+        frame.discover();
+        expect(sent(frame)).toHaveLength(3);
+        for (const message of sent(frame)) {
+            expect(Object.keys(message)).toEqual(['protocol', 'type', 'attemptId', 'challenge', 'identityPending']);
+            expect(message).toMatchObject({ type: 'preparing', identityPending: true });
+        }
+    });
+    it('🔴 authentication_required never carries the field: after a failure, a timeout, or when no attempt is made', () => {
+        const failed = frameWindow(), timedOut = frameWindow(), fallback = frameWindow({ storage: 'throws' });
+        for (const frame of [failed, timedOut, fallback]) silentWorkSignIn(id, frame.win);
+        failed.discover(); failed.answer('account_mismatch'); failed.discover();
+        timedOut.discover(); vi.advanceTimersByTime(SILENT_TIMEOUT_MS); timedOut.discover();
+        fallback.discover(); fallback.discover();
+        for (const frame of [failed, timedOut, fallback]) {
+            const required = sent(frame).filter(message => message.type === 'authentication_required');
+            expect(required.length).toBeGreaterThanOrEqual(2);
+            for (const message of required) {
+                expect(Object.keys(message)).toEqual(['protocol', 'type', 'attemptId', 'challenge']);
+                expect('identityPending' in message).toBe(false);
+            }
+        }
     });
 });
 
