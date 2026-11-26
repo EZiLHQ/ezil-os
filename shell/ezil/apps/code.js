@@ -1313,8 +1313,17 @@ export async function openCodeWindow (ctx = {}) {
                             }
                         },
                     });
+                    // The signed assignment preparation alone asks the editor for its mounted workbench: there the
+                    // folder echo below (the document's address) names the verified document but proves no editor,
+                    // and the gate goes on to `editor-ready` only on `onWorkbench`. Every other window asks nothing.
+                    const prep_gate = assignmentGate?.requiresWorkbench?.() === true ? assignmentGate : null;
                     attachFolderBridge({
                         iframe: el_iframe, frameUrl: frame_url, bind, notice: folder_notice,
+                        workbench: prep_gate !== null,
+                        onWorkbench: (root) => {
+                            if ( prep_gate !== assignmentGate ) return;
+                            confirmAssignmentFolder(project, assignment_open, el_iframe, frame_url, root.path, true);
+                        },
                         // S13: only a GENUINE workbench document ends the unavailable-origin episode (one automatic
                         // reopen per episode): the bridge hears a root only from this frame's window, at the minted
                         // origin, answering this binding's hello nonce with this mint's id. The server's HTTP

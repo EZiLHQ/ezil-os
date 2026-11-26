@@ -330,10 +330,17 @@ function embeddedGate(w,{who='owner',prepare=()=>assert.fail('checkout must stay
 const seedPart=(fields={})=>({sequence:0,startMs:0,endMs:1,mimeType:'video/webm',bytes:new Uint8Array([26,69,223,163,1]).buffer,...fields});
 // Discover, bind and wait for port `ready`, as the parent does before it offers Share.
 async function bound(w,p){w.discover();w.bind([p.port]);await settle();assert.deepEqual(p.types(),['capture-ready','ready']);}
-function editorOpener(state,{root=checkoutFolder,folder=workspaceFolder}={}){
-    const frame={isConnected:true,contentWindow:{postMessage(){}}};
+// The Code window's two reports, as `../apps/code.js` makes them: the folder echo of the editor document's address,
+// then (`workbench`, asked only under the signed preparation) the editor's own mounted workbench. `state.report` sends
+// either one again later, for the same frame and address.
+function editorOpener(state,{root=checkoutFolder,folder=workspaceFolder,workbench=false,workbenchRoot=root}={}){
+    const frame=state.frame={isConnected:true,contentWindow:{postMessage(){}}};
+    const address='https://code.example/?folder='+encodeURIComponent(folder)+'&ezil_mint=m';
+    state.report=(mounted,at=mounted?workbenchRoot:root)=>mounted
+        ? confirmAssignmentFolder({repoUrl:repo},null,frame,address,at,true)
+        : confirmAssignmentFolder({repoUrl:repo},null,frame,address,at);
     return ()=>{state.opened++;state.access=state.gate.access();
-        queueMicrotask(()=>confirmAssignmentFolder({repoUrl:repo},null,frame,'https://code.example/?folder='+encodeURIComponent(folder)+'&ezil_mint=m',root));};
+        queueMicrotask(()=>{state.report(false);if(workbench)queueMicrotask(()=>state.report(true));});};
 }
 
 test('the paired Universe parent records, unlocks and ends the embedded assignment through the bound port only',async t=>{
@@ -723,14 +730,14 @@ test('when Universe signs editorReadySupported the verified editor stays parked 
     const server=fakeServer({flag:true,ack:{hold}});t.mock.method(globalThis,'fetch',server.handler);
     const lines=diagnosticLines(t);
     const w=embeddedWindow(),p=parentPort(),state={opened:0},parks=[];
-    const gate=state.gate=embeddedGate(w,{park:(...call)=>parks.push(call),prepare:async()=>checkout,open:editorOpener(state),transport:withEditorReady});
+    const gate=state.gate=embeddedGate(w,{park:(...call)=>parks.push(call),prepare:async()=>checkout,open:editorOpener(state,{workbench:true}),transport:withEditorReady});
     try{
         await bound(w,p);
         await p.rpc('begin',{captureSessionId:session,consentVersion:4});
         const seed=seedPart();await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
         const unlocking=p.rpc('unlock',{captureSessionId:session});
         await settle(30);
-        // The editor document is loaded on the verified folder, and nobody can use it yet.
+        // The editor's workbench is mounted on the verified folder, and nobody can use it yet.
         assert.equal(state.opened,1);assert.equal(gate.locked(),true);assert.equal(w.screen(),'loader');
         assert.ok(parks.every(call=>call[0]===true),'still parked');assert.deepEqual(w.types(),['preparing']);
         assert.deepEqual(p.types(),['capture-ready','ready']);
@@ -769,7 +776,7 @@ test('a refused editor-ready keeps the editor parked and fails unlock; a transie
         const server=fakeServer({flag:true,ack:{failures:[...failures]}});t.mock.method(globalThis,'fetch',server.handler);
         const lines=diagnosticLines(t);
         const w=embeddedWindow(),p=parentPort(),state={opened:0};
-        const gate=state.gate=embeddedGate(w,{prepare:async()=>checkout,open:editorOpener(state),transport});
+        const gate=state.gate=embeddedGate(w,{prepare:async()=>checkout,open:editorOpener(state,{workbench:true}),transport});
         try{
             await bound(w,p);
             await p.rpc('begin',{captureSessionId:session,consentVersion:4});
@@ -808,6 +815,136 @@ test('a stage that does not sign the flag releases the editor as before and neve
             await endShare(p);
         }finally{await gate.close();p.close();t.mock.restoreAll();}
     }
+});
+// ── The signed preparation needs the editor's own mounted workbench, never the address echo alone ──────────────────
+const flush=async(turns=40)=>{for(let i=0;i<turns;i++)await new Promise(resolve=>setImmediate(resolve));};
+// Up to an `unlock` in flight whose editor document has answered with its folder echo only.
+async function echoedOnly(t,{flag=true,opener={}}={}){
+    const server=fakeServer({flag});t.mock.method(globalThis,'fetch',server.handler);
+    const w=embeddedWindow(),p=parentPort(),state={opened:0},parks=[];
+    const gate=state.gate=embeddedGate(w,{park:(...call)=>parks.push(call),prepare:async()=>checkout,open:editorOpener(state,opener),transport:withEditorReady});
+    await bound(w,p);
+    await p.rpc('begin',{captureSessionId:session,consentVersion:4});
+    const seed=seedPart();await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
+    return {server,w,p,state,parks,gate};
+}
+const parked=({server,w,p,gate,parks},label)=>{
+    assert.deepEqual(server.asked,[],label+': Universe is told nothing');
+    assert.equal(gate.locked(),true,label);assert.ok(parks.every(call=>call[0]===true),label+': still parked');
+    assert.ok(!p.types().includes('editor-usable'),label);assert.ok(!w.types().includes('ready'),label);
+};
+test('only the signed preparation asks for the mounted workbench',async t=>{
+    for(const [flag,required] of [[true,true],[undefined,false],[false,false],['true',false],[1,false]]){
+        const server=fakeServer({flag});t.mock.method(globalThis,'fetch',server.handler);
+        const w=embeddedWindow(),p=parentPort(),gate=embeddedGate(w);
+        try{
+            assert.equal(gate.requiresWorkbench(),false,'nothing is asked before Universe answers');
+            await bound(w,p);
+            assert.equal(gate.requiresWorkbench(),required,String(flag));
+        }finally{await gate.close();p.close();t.mock.restoreAll();}
+    }
+    // The assignment in its own OS tab has no acknowledged release, and so no such question.
+    t.mock.method(globalThis,'fetch',async()=>Response.json({error:{code:'assignment_video_creator_unlinked'}},{status:409}));
+    consentWindow(entry);
+    const own=openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>'owner',computerId:'fixture',body:new Element(),park(){},
+        prepare:()=>assert.fail('checkout must stay closed'),open:()=>assert.fail('editor must stay closed')});
+    assert.equal(own.requiresWorkbench,undefined);
+    await settle();await own.close();
+});
+test('a verified folder echo whose workbench never mounts sends no editor-ready, stays parked and fails unlock on its own timer',async t=>{
+    const lines=diagnosticLines(t);
+    const run=await echoedOnly(t),{server,w,p,state,gate}=run;
+    try{
+        t.mock.timers.enable({apis:['setTimeout']});
+        const unlocking=p.rpc('unlock',{captureSessionId:session});
+        await flush();
+        assert.equal(state.opened,1,'the editor document was opened');parked(run,'echo only');
+        // The same echo again (a second hello of the same document) is still only an echo.
+        state.report(false);state.report(false);await flush();parked(run,'echo repeated');
+        t.mock.timers.tick(79999);await flush();parked(run,'just before the timer');
+        t.mock.timers.tick(1);
+        const unlocked=await unlocking;
+        assert.equal(unlocked.ok,false);assert.equal(unlocked.code,'assigned_checkout_unverified');
+        assert.equal(gate.access(),null,'no further editor may be minted for this unlock');assert.equal(w.screen(),'Sharing paused');
+        // The workbench that mounts after the timer releases nothing and tells Universe nothing.
+        state.report(true);state.report(false);await flush();
+        parked(run,'late workbench');assert.ok(!server.log.includes('editor-ready'));
+        assert.ok(!lines.some(line=>line.includes('editor_ready')||line.includes('editor.usable')),lines.join('|'));
+        t.mock.timers.reset();
+        await endShare(p);
+    }finally{t.mock.timers.reset();await gate.close();p.close();}
+});
+test('a workbench that mounts late releases once: one editor-ready, one release, and a repeat changes nothing',async t=>{
+    const run=await echoedOnly(t),{server,w,p,state,parks,gate}=run;
+    try{
+        const unlocking=p.rpc('unlock',{captureSessionId:session});
+        await settle(40);parked(run,'before the workbench');
+        // Twice at once, as two hellos of one mounted document would report it.
+        state.report(true);state.report(true);
+        const unlocked=await unlocking;
+        state.report(true);state.report(false);await settle(20);
+        assert.equal(unlocked.ok,true,JSON.stringify(unlocked));assert.equal(gate.locked(),false);
+        assert.deepEqual(server.asked,[{action:'editor-ready',attemptId:id,captureSessionId:session,repoOpenProof:proof}],'asked once');
+        assert.equal(parks.filter(call=>call[0]===false).length,1,'released once');
+        assert.equal(p.types().filter(type=>type==='editor-usable').length,1);assert.deepEqual(w.types(),['preparing','ready']);
+        await endShare(p);
+    }finally{await gate.close();p.close();}
+});
+test('a workbench report counts only for the verified folder, this frame and the phase that is still open',async t=>{
+    // Another folder, even after a good echo: refused like any unverified checkout.
+    {
+        const run=await echoedOnly(t,{opener:{workbench:true,workbenchRoot:'/root'}}),{p,gate}=run;
+        try{
+            const unlocked=await p.rpc('unlock',{captureSessionId:session});
+            assert.equal(unlocked.code,'assigned_checkout_unverified');parked(run,'wrong folder');assert.equal(gate.access(),null);
+            await endShare(p);
+        }finally{await gate.close();p.close();t.mock.restoreAll();}
+    }
+    // A frame that has left the document.
+    {
+        const run=await echoedOnly(t),{p,state,gate}=run;
+        try{
+            const unlocking=p.rpc('unlock',{captureSessionId:session});
+            await settle(40);
+            state.frame.isConnected=false;state.report(true);await settle(20);parked(run,'detached frame');
+            state.frame.isConnected=true;
+            // The share stops: the phase is over, and the workbench that mounts afterwards releases nothing.
+            p.post('lock',{captureSessionId:session,reason:'sharing_stopped'});
+            assert.equal((await unlocking).code,'workspace_locked');
+            state.report(true);await settle(20);parked(run,'after the share stopped');
+            await p.rpc('end',{captureSessionId:session,reason:'sharing_stopped',expectedSegments:1});
+            // Nothing in flight at all.
+            state.report(true);await settle(20);parked(run,'no phase');
+        }finally{await gate.close();p.close();t.mock.restoreAll();}
+    }
+});
+test('without the signed flag the folder echo releases as before and a workbench report is never what releases',async t=>{
+    const run=await echoedOnly(t,{flag:false}),{server,p,state,parks,gate}=run;
+    try{
+        const unlocked=await p.rpc('unlock',{captureSessionId:session});
+        assert.equal(unlocked.ok,true);assert.equal(gate.locked(),false);
+        state.report(true);state.report(false);await settle(20);
+        assert.equal(parks.filter(call=>call[0]===false).length,1,'released once, by the echo');
+        assert.equal(p.types().filter(type=>type==='editor-usable').length,1);assert.deepEqual(server.asked,[]);
+        await endShare(p);
+    }finally{await gate.close();p.close();t.mock.restoreAll();}
+    // A workbench report that arrives with no echo before it does not release an unsigned stage.
+    t.mock.method(globalThis,'fetch',fakeServer().handler);
+    const w=embeddedWindow(),p2=parentPort(),state2={opened:0},parks2=[];
+    const frame={isConnected:true,contentWindow:{postMessage(){}}},address='https://code.example/?folder='+encodeURIComponent(workspaceFolder)+'&ezil_mint=m';
+    const gate2=state2.gate=embeddedGate(w,{park:(...call)=>parks2.push(call),prepare:async()=>checkout,
+        open:()=>{state2.opened++;queueMicrotask(()=>confirmAssignmentFolder({repoUrl:repo},null,frame,address,checkoutFolder,true));}});
+    try{
+        await bound(w,p2);
+        await p2.rpc('begin',{captureSessionId:session,consentVersion:4});
+        const seed=seedPart();await p2.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
+        const unlocking=p2.rpc('unlock',{captureSessionId:session});
+        await settle(40);
+        assert.equal(state2.opened,1);assert.equal(gate2.locked(),true);assert.ok(parks2.every(call=>call[0]===true));
+        confirmAssignmentFolder({repoUrl:repo},null,frame,address,checkoutFolder);
+        assert.equal((await unlocking).ok,true);assert.equal(gate2.locked(),false);
+        await endShare(p2);
+    }finally{await gate2.close();p2.close();}
 });
 test('a media cutoff the broker moves is relayed only for the same start and inside the signed bound',async t=>{
     const now=Date.now(),iso=ms=>new Date(now+ms).toISOString(),startedAt=iso(-1000);

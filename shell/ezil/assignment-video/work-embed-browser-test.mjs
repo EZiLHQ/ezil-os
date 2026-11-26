@@ -62,7 +62,9 @@ const shellPage='<!doctype html><html><head><title>EZiL OS</title><link rel="sty
     +'<script>'+sampler+';window.ezil.boot();</script></body></html>';
 const editorPage='<html><body style="margin:0;background:#4e223b;color:white;font:24px monospace"><h1>Assigned editor</h1><script>addEventListener("message",e=>{'
     +'if(e.origin!=="'+origin+'"||e.data.type!=="ezil.code.hello")return;const u=new URL(location.href);'
-    +'parent.postMessage({type:"ezil.code.folder",v:1,nonce:e.data.nonce,mint:u.searchParams.get("ezil_mint"),kind:"folder",path:u.searchParams.get("folder")},e.origin);});</script></body></html>';
+    +'const identity={v:1,nonce:e.data.nonce,mint:u.searchParams.get("ezil_mint"),kind:"folder",path:u.searchParams.get("folder")};'
+    +'parent.postMessage({type:"ezil.code.folder",...identity},e.origin);'
+    +'if(e.data.workbenchReady===true)setTimeout(()=>parent.postMessage({type:"ezil.code.workbench",...identity},e.origin),200);});</script></body></html>';
 // The Universe parent's half of the protocol, as `assignment-work-capture.js` speaks it. No capture: fixture bytes.
 const parentDriver='('+((protocol,attemptId,osOrigin,session)=>{
     const frame=document.querySelector('#os'),drive=window.drive={states:[],port:[],bound:false};

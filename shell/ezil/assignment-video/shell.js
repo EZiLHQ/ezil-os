@@ -396,11 +396,16 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
         inflight.add(task);void task.finally(()=>inflight.delete(task));
     }
     // The same folder rule as the OS tab: the editor must show the verified workspace or its checkout, and nothing else.
-    function confirm(frame,frameUrl,actualRoot){
+    // `workbench`: this report is the editor's mounted workbench (`../apps/code-folder.js` `onWorkbench`), not the
+    // folder echo read from the document's address. Under the acknowledged release only that one goes on: the echo
+    // still refuses a wrong folder at once, but an editor document whose workbench never starts stays parked, tells
+    // Universe nothing and fails `unlock` on its own timer. Without the flag the echo releases as before.
+    function confirm(frame,frameUrl,actualRoot,workbench=false){
         const item=active;
         if(!item?.allowMint || !item.editor || !live(item) || !frame.isConnected)return;
         const url=new URL(frameUrl), folders=[item.meta.workspaceFolder,item.meta.checkoutFolder];
         if(!folders.includes(actualRoot) || !folders.includes(url.searchParams.get('folder'))){item.editor.reject(failure('assigned_checkout_unverified'));return;}
+        if(workbench!==editorReady)return;
         void release(item,frame,url);
     }
     /**
@@ -461,7 +466,9 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
         return closePromise;
     }
     function pageHide(){if(active?.grant)active.transport.checkpointOnExit('connection_lost');void close();}
-    const gate={repo,locked:()=>locked,confirm,close,
+    // `requiresWorkbench`: Universe signed the acknowledged release, so the Code window asks its editor for the mounted
+    // workbench and reports it through `confirm(…, true)`. Only this gate has it; a stage without the flag asks nothing.
+    const gate={repo,locked:()=>locked,confirm,close,requiresWorkbench:()=>editorReady,
         access:()=>active?.allowMint && live(active) ? {attemptId,phase:'open',repoOpenProof:active.proof,captureSessionId:active.id} : null};
     current=gate;
     prep();
@@ -707,6 +714,7 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     return gate;
 }
 
-export function confirmAssignmentFolder(project,_receipt,frame,frameUrl,actualRoot){
-    if(current?.repo===project?.repoUrl)current.confirm(frame,frameUrl,actualRoot);
+/** `workbench`: true only for the editor's own mounted-workbench report; the folder echo passes nothing. */
+export function confirmAssignmentFolder(project,_receipt,frame,frameUrl,actualRoot,workbench){
+    if(current?.repo===project?.repoUrl)current.confirm(frame,frameUrl,actualRoot,workbench===true);
 }
