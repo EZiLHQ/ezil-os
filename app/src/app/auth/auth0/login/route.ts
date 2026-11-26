@@ -1,7 +1,7 @@
 import { type NextRequest, NextResponse } from 'next/server';
 
 import { AUTH0_COOKIE, AUTH0_COOKIE_OPTIONS, Auth0Error, buildAuthorizeUrl } from '@/server/auth/auth0';
-import { isAssignmentCodeReturn } from '@/utils/assignment-work-auth';
+import { embeddedWorkReturn, isAssignmentCodeReturn } from '@/utils/assignment-work-auth';
 import { safeReturnUrl } from '@/utils/constants';
 import { ownedPublicOrigin } from '@/utils/forwarded';
 
@@ -9,7 +9,7 @@ export async function GET(request: NextRequest) {
     const returnUrl = request.nextUrl.searchParams.get('returnUrl');
     const requestedPrompt = request.nextUrl.searchParams.get('prompt');
     const assignmentSignIn = requestedPrompt === 'login' && returnUrl !== null
-        && returnUrl === safeReturnUrl(returnUrl) && isAssignmentCodeReturn(returnUrl);
+        && returnUrl === safeReturnUrl(returnUrl) && (isAssignmentCodeReturn(returnUrl) || embeddedWorkReturn(returnUrl) !== null);
     const prompt = requestedPrompt === 'none' ? 'none' : assignmentSignIn ? 'login' : undefined;
     let response: NextResponse;
     try {

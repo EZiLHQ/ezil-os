@@ -17,12 +17,31 @@ export function isAssignmentCodeReturn(path: string): boolean {
 export const workReturnPath = '/assignment/work-return';
 export const embeddedWorkReturnSuffix = '&workspace=1';
 
+const embeddedReturn = /^([0-9a-f-]{36})&workspace=1(?:&owner=([0-9a-f]{16}))?$/;
+
+/**
+ * The embedded workspace's return, byte for byte: `?attempt=<uuid>&workspace=1`, optionally followed by
+ * `&owner=<16 hex>`, the owner tag of the repository Universe assigned (`u-<owner>-a-<attempt>`). The tag is a claim
+ * from the link, never an identity: `/assignment/work-return` only compares it with the tag this server derives from
+ * its own verified EZiL ID, to tell a person signed in to another account apart from one who only needs a refresh.
+ */
+export function embeddedWorkReturn(destination: string): { attempt: string; owner: string | null } | null {
+    const prefix = workReturnPath + '?attempt=';
+    const match = destination.startsWith(prefix) ? embeddedReturn.exec(destination.slice(prefix.length)) : null;
+    return match && uuid.test(match[1]!) ? { attempt: match[1]!, owner: match[2] ?? null } : null;
+}
+
+/** The lock screen's code for "this assignment belongs to another EZiL ID" (`app/login/page.tsx`). */
+export const workAccountNotice = 'assignment_account';
+
 export function workReturnAttempt(destination: string, path: typeof workReturnPath | '/app/assignment-enrollment' = workReturnPath): string | null {
     const prefix = path + '?attempt=';
     if (!destination.startsWith(prefix)) return null;
-    const value = destination.slice(prefix.length);
-    const embedded = path === workReturnPath && value.endsWith(embeddedWorkReturnSuffix);
-    const attempt = embedded ? value.slice(0, -embeddedWorkReturnSuffix.length) : value;
+    if (path === workReturnPath) {
+        const embedded = embeddedWorkReturn(destination);
+        if (embedded) return embedded.attempt;
+    }
+    const attempt = destination.slice(prefix.length);
     return uuid.test(attempt) && attempt.length === 36 ? attempt : null;
 }
 

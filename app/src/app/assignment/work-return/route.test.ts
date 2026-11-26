@@ -1,17 +1,25 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { safeReturnUrl } from '@/utils/constants';
-import { embeddedCodeAttempt, listenForWorkSignIn, workReturnAttempt } from '@/utils/assignment-work-auth';
+import { embeddedCodeAttempt, embeddedWorkReturn, listenForWorkSignIn, workReturnAttempt } from '@/utils/assignment-work-auth';
 
-const mocks = vi.hoisted(() => ({context:vi.fn(), enabled:vi.fn()}));
+vi.mock('server-only', () => ({}));
+const mocks = vi.hoisted(() => ({context:vi.fn(), enabled:vi.fn(), identity:vi.fn()}));
 vi.mock('@/server/api/trpc', () => ({ createTRPCContext:mocks.context }));
-vi.mock('@/server/git/assignment-enrollment', () => ({ assignmentEnrollmentEnabled:mocks.enabled }));
+// The real owner-bound repository name; only the stage switch is stubbed.
+vi.mock('@/server/git/assignment-enrollment', async original => ({
+    ...await original<typeof import('@/server/git/assignment-enrollment')>(), assignmentEnrollmentEnabled:mocks.enabled }));
+vi.mock('@/server/auth/retained-identity', () => ({ retainedIdentity:mocks.identity }));
+import { ownerRepositoryName } from '@/server/git/assignment-enrollment';
 import { GET } from './route';
 
 const id='ba4cf399-1f9b-43e5-be10-45e403bc0190', origin='https://os-staging.ezil.work', universe='https://universe-staging.ezil.work';
 const returned='/assignment/work-return?attempt='+id;
 const repo='https://github.ezil.work/default/u-0123456789abcdef-a-'+id+'.git';
 const request=(path=returned, dest='document',host=origin)=>new Request(host+path,{headers:{'sec-fetch-dest':dest}});
-beforeEach(()=>{vi.clearAllMocks();mocks.enabled.mockReturnValue(true);mocks.context.mockResolvedValue({user:{id:'signed-in'},delegation:null});});
+const subject='auth0|builder', hourMs=3_600_000;
+const kept=(sub=subject,validFor=10*hourMs)=>({subject:sub,expiresAt:Date.now()+validFor});
+beforeEach(()=>{vi.clearAllMocks();mocks.enabled.mockReturnValue(true);mocks.context.mockResolvedValue({user:{id:'signed-in'},delegation:null});
+    mocks.identity.mockImplementation(async()=>kept());});
 
 describe('return from top-level OS sign-in to the original Universe assignment',()=>{
     it('preserves an exact local OAuth transaction and sends the verified OS user to one fixed stage destination',async()=>{
@@ -36,14 +44,14 @@ describe('return from top-level OS sign-in to the original Universe assignment',
         const signedIn=await GET(request(embedded));
         expect(signedIn.status).toBe(303);
         expect(signedIn.headers.get('location')).toBe(universe+'/assignment/workspace/'+id);
-        mocks.context.mockResolvedValue({user:null,delegation:null});
-        const login=await GET(request(embedded));
-        expect(new URL(login.headers.get('location')!).searchParams.get('returnUrl')).toBe(embedded);
         const enrollment='/app/assignment-enrollment?attempt='+id+'&workspace=1';
         expect(safeReturnUrl(enrollment)).not.toBe(enrollment);
     });
     it.each([returned+'&returnUrl=https://example.org',returned+'&attempt='+id,returned+'&x=1',
         returned+'&workspace=0',returned+'&workspace=1&workspace=1',returned+'&workspace=1&x=1',
+        returned+'&owner=0123456789abcdef',returned+'&workspace=1&owner=0123456789ABCDEF',returned+'&workspace=1&owner=0123456789abcde',
+        returned+'&workspace=1&owner=0123456789abcdef0',returned+'&workspace=1&owner=0123456789abcdef&owner=0123456789abcdef',
+        returned+'&owner=0123456789abcdef&workspace=1',returned+'&workspace=1&owner=',returned+'&workspace=1&owner=0123456789abcdef&x=1',
         '/assignment/work-return?workspace=1&attempt='+id,
         '/assignment/work-return?attempt=../os','//universe-staging.ezil.work/assignment/work/'+id,
         '/assignment/work-return?attempt='+id.toUpperCase()])('rejects a supplied alternative return target %s',async value=>{
@@ -79,5 +87,100 @@ describe('return from top-level OS sign-in to the original Universe assignment',
         probe(top,universe);
         expect(top.postMessage).toHaveBeenCalledWith({...data,type:'authentication_required'},universe);
         dispose();probe(top,universe);expect(top.postMessage).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('embedded workspace return: the same EZiL ID, kept for the work window, without a loop',()=>{
+    const embedded=returned+'&workspace=1', workspace=universe+'/assignment/workspace/'+id;
+    const tag=(sub:string)=>ownerRepositoryName(sub,'a-'+id).slice(2,18);
+    const owned=embedded+'&owner='+tag(subject);
+    const cookie='__Host-ezil-work-return';
+    const get=(path:string,jar?:string)=>GET(new Request(origin+path,{headers:{'sec-fetch-dest':'document',...(jar?{cookie:jar}:{})}}));
+    const where=(response:Response)=>new URL(response.headers.get('location')!);
+
+    it('reads the owner tag only in its exact position and shape',()=>{
+        expect(embeddedWorkReturn(embedded)).toEqual({attempt:id,owner:null});
+        expect(embeddedWorkReturn(owned)).toEqual({attempt:id,owner:tag(subject)});
+        expect(embeddedWorkReturn(returned)).toBeNull();
+        expect(safeReturnUrl(owned)).toBe(owned);
+        expect(tag(subject)).toMatch(/^[0-9a-f]{16}$/);
+    });
+    it('a fresh OS browser goes straight to the ordinary EZiL ID sign-in and comes back here',async()=>{
+        mocks.context.mockResolvedValue({user:null,delegation:null});
+        const response=await get(owned);
+        const login=where(response);
+        expect(response.status).toBe(303);
+        expect(login.origin+login.pathname).toBe(origin+'/auth/auth0/login');
+        expect([...login.searchParams.keys()]).toEqual(['returnUrl']);
+        expect(login.searchParams.get('returnUrl')).toBe(owned);
+        expect(response.headers.get('set-cookie')).toBeNull();
+        expect(mocks.identity).not.toHaveBeenCalled();
+    });
+    it('🔴 an OS session without its retained EZiL ID is refreshed silently, once, instead of bouncing back to Universe',async()=>{
+        mocks.identity.mockRejectedValue(new Error('IDENTITY_REFRESH_REQUIRED'));
+        const first=await get(owned);
+        const login=where(first);
+        expect(login.origin+login.pathname).toBe(origin+'/auth/auth0/login');
+        expect(login.searchParams.get('prompt')).toBe('none');
+        expect(login.searchParams.get('returnUrl')).toBe(owned);
+        expect(first.headers.get('set-cookie')).toBe(cookie+'='+id+'; Path=/; Max-Age=120; HttpOnly; Secure; SameSite=Lax');
+        expect(mocks.identity).toHaveBeenCalledWith('signed-in');
+        // The refresh came back and kept one: the workspace, and the marker is spent.
+        mocks.identity.mockImplementation(async()=>kept());
+        const second=await get(owned,cookie+'='+id);
+        expect(second.headers.get('location')).toBe(workspace);
+        expect(second.headers.get('set-cookie')).toContain(cookie+'=; Path=/; Max-Age=0');
+    });
+    it('🔴 a refresh that kept nothing ends on the lock screen: no second refresh, no Universe bounce',async()=>{
+        mocks.identity.mockRejectedValue(new Error('IDENTITY_REFRESH_REQUIRED'));
+        const response=await get(owned,'a=b; '+cookie+'='+id);
+        const login=where(response);
+        expect(login.origin+login.pathname).toBe(origin+'/login');
+        expect(login.searchParams.get('error')).toBe('auth_callback_failed');
+        expect(login.searchParams.get('returnUrl')).toBe(owned);
+        expect(response.headers.get('set-cookie')).toContain('Max-Age=0');
+    });
+    it('a marker for another attempt does not spend this one',async()=>{
+        mocks.identity.mockRejectedValue(new Error('IDENTITY_REFRESH_REQUIRED'));
+        expect(where(await get(owned,cookie+'=00000000-0000-4000-8000-000000000001')).searchParams.get('prompt')).toBe('none');
+    });
+    it('an EZiL ID that would expire inside a work window is refreshed once, then used as it is',async()=>{
+        mocks.identity.mockImplementation(async()=>kept(subject,74*60_000));
+        expect(where(await get(owned)).searchParams.get('prompt')).toBe('none');
+        expect((await get(owned,cookie+'='+id)).headers.get('location')).toBe(workspace);
+        mocks.identity.mockImplementation(async()=>kept(subject,76*60_000));
+        const enough=await get(owned);
+        expect(enough.headers.get('location')).toBe(workspace);
+        expect(enough.headers.get('set-cookie')).toBeNull();
+    });
+    it('🔴 another account is told so on the lock screen: never a silent refresh, a switch, or a Universe bounce',async()=>{
+        mocks.identity.mockImplementation(async()=>kept('auth0|someone-else'));
+        for(const jar of [undefined,cookie+'='+id]){
+            const response=await get(owned,jar);
+            const login=where(response);
+            expect(login.origin+login.pathname).toBe(origin+'/login');
+            expect(login.searchParams.get('error')).toBe('assignment_account');
+            expect(login.searchParams.get('returnUrl')).toBe(owned);
+            expect(login.searchParams.has('prompt')).toBe(false);
+        }
+    });
+    it('the matching account returns to its workspace, and a link without the tag keeps the earlier answer',async()=>{
+        expect((await get(owned)).headers.get('location')).toBe(workspace);
+        mocks.identity.mockImplementation(async()=>kept('auth0|someone-else'));
+        expect((await get(embedded)).headers.get('location')).toBe(workspace);
+    });
+    it('the standalone return never reads the retained identity',async()=>{
+        mocks.identity.mockRejectedValue(new Error('IDENTITY_REFRESH_REQUIRED'));
+        expect((await get(returned)).headers.get('location')).toBe(universe+'/assignment/work/'+id);
+        expect(mocks.identity).not.toHaveBeenCalled();
+    });
+    it('every answer is a private, unframeable redirect',async()=>{
+        mocks.identity.mockRejectedValue(new Error('IDENTITY_REFRESH_REQUIRED'));
+        for(const response of [await get(owned),await get(owned,cookie+'='+id)]){
+            expect(response.status).toBe(303);
+            expect(response.headers.get('cache-control')).toContain('no-store');
+            expect(response.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+            expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+        }
     });
 });
