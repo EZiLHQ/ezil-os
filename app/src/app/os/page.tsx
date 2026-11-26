@@ -122,12 +122,20 @@ export default async function Page({ params: routeParams, searchParams }: {
     heads.set('x-trpc-source', 'rsc-os');
     const ctx = await createTRPCContext({ headers: heads });
 
+    // The exact assigned Code entry, framed by the Universe tab paired with this deployment. Its editor needs an OS session AND that
+    // session's retained EZiL ID, so both absences get the same small document: it makes one bounded silent attempt in a
+    // hidden child and reloads only this frame (`../assignment/work-return/silent-sign-in`). Every other entry, and
+    // this one once the identity is kept, is the shell exactly as before.
+    const framedAttempt = appId === 'code' && heads.get('sec-fetch-dest') === 'iframe' ? embeddedCodeAttempt(params) : null;
+    const staged = framedAttempt !== null && (await import('@/server/git/assignment-enrollment')).assignmentEnrollmentEnabled();
+    if (staged && ctx.user && !ctx.delegation) {
+        const { retainedIdentity } = await import('@/server/auth/retained-identity');
+        // Lost with a restart, expired, or inside its own minimum validity: `retainedIdentity` alone decides.
+        if (!await retainedIdentity(ctx.user.id).then(() => true, () => false)) return <AssignmentSignInNotice attemptId={framedAttempt} />;
+    }
+
     if (!ctx.user) {
-        if (appId === 'code' && heads.get('sec-fetch-dest') === 'iframe') {
-            const attempt = embeddedCodeAttempt(params);
-            if (attempt && (await import('@/server/git/assignment-enrollment')).assignmentEnrollmentEnabled())
-                return <AssignmentSignInNotice attemptId={attempt} />;
-        }
+        if (staged) return <AssignmentSignInNotice attemptId={framedAttempt} />;
         // Same gate as `src/app/computers/layout.tsx` and
         // `src/app/computer/layout.tsx`. The pathname is known here (`/os`,
         // or `/app/<id>` for an allowlisted id), so it is used directly rather

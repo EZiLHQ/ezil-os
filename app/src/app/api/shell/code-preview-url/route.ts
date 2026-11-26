@@ -550,6 +550,11 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     if (!state || state.captureSessionId !== operation.captureSessionId || state.repositoryOpenReceiptId !== proof.eventId || state.phaseReady !== true || state.workspaceUnlocked !== true
         || state.status !== 'recording' || state.revoked !== false || state.stopRequestedAt !== null || typeof state.firstFrameAt !== 'string'
         || typeof state.startedAt !== 'string' || typeof state.deadlineAt !== 'string' || Date.parse(state.deadlineAt) <= Date.now() || !(await sameSession())) return assignmentLocked();
+    // A Universe that manages this attempt's preparation window (its own signed preflight says so) starts the work
+    // hour itself: at the signed `editor-ready` the shell sends once the editor's workbench is really mounted, or at
+    // the end of that window, whichever is first. Committing it here would start the hour before any editor exists,
+    // so this mint only releases the URL for the verified, recording, unlocked capture checked above.
+    if (enrolled.editorReadySupported === true) return shellJson({...preview,codePreviewUrl:url,url,repository});
     // A usable Code URL is itself a capability. Commit the clock for this exact verified capture
     // phase and checkout before releasing it, even if the browser is reloading or drops its reply.
     const ready = await universeCall(() => recordingAction(identity, {

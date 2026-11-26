@@ -441,6 +441,74 @@ describe('standalone EZiL Git URL open', () => {
 
 
 describe('the enrolled checkout signals the protected top-level shell only after the private preload acknowledges', () => {
+    it.each(['staging','production'])('releases a managed preparation\'s editor without starting its work hour at the mint on %s', async realm => {
+        const { expectedRepositoryURL } = await import('@/server/git/assignment-enrollment');
+        const { makeChallenge, readOpen } = await import('@/server/assignment-video/repo-open');
+        const attemptId = 'ecb246af-f1b8-4c72-8e6d-414c814de821';
+        const production = realm === 'production';
+        const origin = production ? 'https://os.ezil.work' : 'https://os-staging.ezil.work';
+        if (production) {
+            vi.stubEnv('BILLING_FUNDING_URL','https://ai.ezil.work');
+            vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED','1');
+        }
+        const subject = 'auth0|builder';
+        const repositoryUrl = expectedRepositoryURL(subject, 'a-' + attemptId);
+        const now = Date.now();
+        const signingKey = 'test-only-repo-open-key-material'.repeat(2);
+        vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN',production ? 'https://universe.ezil.work' : 'https://universe-staging.ezil.work');
+        vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET',signingKey);
+        const captureSessionId = '00000000-0000-4000-8000-000000000099';
+        const recordingId = '00000000-0000-4000-8000-000000000098';
+        let managed: boolean | undefined = true, unlocked = false, repositoryOpenReceiptId = recordingId;
+        s.universe = () => {
+            const path = s.requests.at(-1)?.url.pathname;
+            // Universe would refuse it here anyway: nothing in this mint may depend on the answer.
+            if (path?.endsWith('/editor-ready')) return new Response(null, {status: 503});
+            return Response.json(path?.endsWith('/status')
+                ? {captureSessionId,recordingId,repositoryOpenReceiptId,status:'recording',revoked:false,stopRequestedAt:null,
+                    startedAt:new Date(now-1000).toISOString(), deadlineAt:new Date(now+3839000).toISOString(),
+                    firstFrameAt:new Date(now-1000).toISOString(),phaseReady:unlocked,workspaceUnlocked:unlocked}
+                : {status:'eligible',attemptId,jobId:'9',repositoryUrl,ref:'refs/heads/main',
+                    manifestSha256:makeChallenge(attemptId,repositoryUrl).manifestSha256, providerId:'fg1wtcrexaf7acl0',
+                    windowStartedAt:null, deadlineAt:null, expiresAt:new Date(now+120000).toISOString(),
+                    ...(managed === undefined ? {} : {editorReadySupported:managed})});
+        };
+        s.gateway = scope => {const packet=standalonePacket(scope);packet.repository.canonicalURL=repositoryUrl;return Response.json(packet);};
+        s.worker = body => {
+            const request = JSON.parse(body), challenge = request.assignmentPreload;
+            const folder = '/workspace/projects/'+request.repositoryId;
+            return Response.json({ok:true,folder,checkoutFolder:folder+'/'+repositoryUrl.split('/').at(-1)!.slice(0,-4),
+                ...(challenge ? {assignmentPreload:{eventId:challenge.eventId,nonce:challenge.nonce,port:5679,status:'acknowledged'}} : {})});
+        };
+        const open = (assignment?: object) => POST(new Request(origin+'/api/shell/code-preview-url',{method:'POST',
+            headers:{origin,host:new URL(origin).host,'sec-fetch-site':'same-origin','content-type':'application/json'},
+            body:JSON.stringify({computerId:COMPUTER,intent:'open',repository:{url:repositoryUrl},assignment})}));
+        const readyCalls = () => s.requests.filter(request => request.url.pathname.endsWith('/editor-ready')).length;
+        const prepared = await open({attemptId,phase:'prepare'});
+        expect(prepared.status).toBe(200);
+        const body = await prepared.json();
+        const actor = {userId:USER,issuer:'https://id.ezil.work/',subject,sessionId:s.sessionId,expiresAt:now+600000};
+        const enter = {attemptId,phase:'open',repoOpenProof:body.assignmentOpen.proof,captureSessionId};
+        repositoryOpenReceiptId = readOpen(body.assignmentOpen.proof,actor,attemptId,Date.now(),signingKey).eventId;
+        // Every check before the release still applies: an unconfirmed, still locked capture gets no URL.
+        expect((await open(enter)).status).toBe(409);
+        unlocked = true;
+        const released = await open(enter);
+        expect(released.status).toBe(200);
+        expect(new URL((await released.json()).codePreviewUrl).searchParams.get('folder')).toBe(body.repository.workspaceFolder);
+        expect(readyCalls()).toBe(0);
+        // Only Universe's own exact `true` moves the commit: an absent or false flag keeps production's eager
+        // `editor-ready`, whose refusal here still withholds the URL.
+        for (const value of [false, undefined]) {
+            managed = value;
+            const before = readyCalls();
+            const refused = await open(enter);
+            expect(refused.status).toBe(503);
+            expect(await refused.text()).not.toContain('preview-bootstrap');
+            expect(readyCalls()).toBe(before + 1);
+        }
+    });
+
     it.each(['staging','production'])('binds the same-session owner, private 5679 and signed checkout on %s', async realm => {
         const { expectedRepositoryURL } = await import('@/server/git/assignment-enrollment');
         const { makeChallenge, readOpen } = await import('@/server/assignment-video/repo-open');

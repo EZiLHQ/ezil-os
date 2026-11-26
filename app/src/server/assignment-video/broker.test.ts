@@ -48,6 +48,86 @@ vi.mock('server-only',()=>({}));
 beforeEach(()=>{vi.stubEnv('BILLING_FUNDING_URL','https://ai-staging.ezil.work');vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN','https://universe-staging.ezil.work');vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED',undefined);vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET',testSigner);clock=initial+5000;remoteState={...state};calls.length=0;});
 
 describe('assignment media broker',()=>{
+    it('starts a managed preparation\'s work clock only for the confirmed capture it holds, without a browser clock',async()=>{
+        const phase = '00000000-0000-4000-8000-000000000008';
+        const request = {action:'editor-ready' as const,attemptId:attempt,captureSessionId:phase,repoOpenProof:witness.proof};
+        const anchor = time(initial);
+        const workClock = {startedAt:time(clock),deadlineAt:time(clock+hour),serverNow:time(clock+20)};
+        remoteState = {...state,captureSessionId:phase,nextSequence:1,phaseReady:true,workspaceUnlocked:true,editorReadySupported:true};
+        const sent: {url:string; init?:RequestInit}[] = [];
+        let answer: unknown = workClock;
+        const d = {...deps(),fetcher:async (url:URL|Request|string,init?:RequestInit)=>{
+            sent.push({url:String(url),init});
+            return Response.json(String(url).endsWith('/editor-ready') ? answer : {...remoteState, uploadToken:cap});
+        }};
+        await recordingAction(identity,{...begin,captureSessionId:phase,consentVersion:4},d);
+        // Universe manages this attempt's preparation: another capture's call is refused before anything is sent.
+        await expect(recordingAction(identity,{...request,captureSessionId:'00000000-0000-4000-8000-000000000009'},d))
+            .rejects.toMatchObject({code:'recording_phase_changed'});
+        expect(sent).toHaveLength(1);
+        await expect(recordingAction(identity,request,d)).resolves.toEqual(workClock);
+        expect(sent).toHaveLength(2);
+        const path = '/internal/assignment-video/editor-ready';
+        expect(new URL(sent[1].url).pathname).toBe(path);
+        const exact = sent[1].init?.body as string;
+        expect(JSON.parse(exact)).toEqual({
+            userIdToken:identity.token,attemptId:attempt,osSessionId:identity.sessionId,captureSessionId:phase,
+            repoOpen:readOpen(witness.proof,identity,attempt,clock,testSigner),
+        });
+        const headers = new Headers(sent[1].init?.headers);
+        const stamp = headers.get('X-Ezil-Repo-Open-Timestamp');
+        expect(headers.get('X-Ezil-Repo-Open-Signature')).toBe(createHmac('sha256',testSigner)
+            .update(stamp+'.POST '+path+'.'+exact).digest('hex'));
+        expect(requestSchema.safeParse({...request,startedAt:anchor}).success).toBe(false);
+        expect(requestSchema.safeParse({...request,captureSessionId:undefined}).success).toBe(false);
+        await expect(recordingAction(identity,{...request,repoOpenProof:'x'.repeat(75)},d))
+            .rejects.toMatchObject({code:'assignment_open_required'});
+        expect(sent).toHaveLength(2);
+        // The full production clock is kept as Universe sent it; a work clock longer than the hour, or one that
+        // starts after the server's own time, is not a clock.
+        const full = {...workClock,pausedAt:null,pauseReason:null,remainingMs:hour-20,revision:0};
+        answer = full;
+        await expect(recordingAction(identity,request,d)).resolves.toEqual(full);
+        for (const wrong of [{...workClock,deadlineAt:time(clock+hour+1)},{...workClock,startedAt:time(clock+5000)},
+            {startedAt:null,deadlineAt:null,serverNow:workClock.serverNow},{...workClock,serverNow:undefined}]) {
+            answer = wrong;
+            await expect(recordingAction(identity,request,d)).rejects.toMatchObject({code:'media_unavailable',status:503});
+        }
+        // Before this phase's first frame is confirmed nothing is sent.
+        remoteState = {...remoteState,status:'awaiting_frame',phaseReady:false,startedAt:null,deadlineAt:null,
+            authorizationExpiresAt:time(clock+60000)};
+        const cold = {...d,leases:new Map()};
+        await recordingAction(identity,{...begin,captureSessionId:phase,consentVersion:4},cold);
+        const before = sent.length;
+        await expect(recordingAction(identity,request,cold)).rejects.toMatchObject({code:'recording_phase_changed'});
+        expect(sent).toHaveLength(before);
+    });
+    it('moves a managed preparation\'s media cutoff only inside its bound and from its original start',async()=>{
+        const phase = '00000000-0000-4000-8000-000000000008';
+        remoteState = {...state,captureSessionId:phase,nextSequence:1,phaseReady:true,workspaceUnlocked:true,
+            editorReadySupported:true,deadlineAt:time(initial+hour+240000)};
+        const d = deps();
+        await recordingAction(identity,{...begin,captureSessionId:phase,consentVersion:4},d);
+        const status = {action:'status' as const,attemptId:attempt,captureSessionId:phase};
+        remoteState.deadlineAt = time(initial+hour+60000);
+        await expect(recordingAction(identity,status,d)).resolves.toMatchObject({deadlineAt:remoteState.deadlineAt,startedAt:state.startedAt});
+        remoteState.deadlineAt = time(initial+hour+240000);
+        await expect(recordingAction(identity,status,d)).resolves.toMatchObject({deadlineAt:remoteState.deadlineAt,serverNow:time(clock)});
+        remoteState.startedAt = time(initial+1000);
+        await expect(recordingAction(identity,status,d)).rejects.toMatchObject({code:'recording_state_changed'});
+        remoteState.startedAt = state.startedAt;
+        remoteState.deadlineAt = time(initial+hour+240001);
+        await expect(recordingAction(identity,status,d)).rejects.toMatchObject({code:'recording_state_changed'});
+        // Without Universe's own flag the bound is the hour, and an unpaused cutoff never moves earlier.
+        remoteState.editorReadySupported = undefined;
+        await expect(recordingAction(identity,{...begin,captureSessionId:phase,consentVersion:4},deps()))
+            .rejects.toMatchObject({code:'recording_closed'});
+        remoteState.deadlineAt = time(initial+hour);
+        const plain = deps();
+        await recordingAction(identity,{...begin,captureSessionId:phase,consentVersion:4},plain);
+        remoteState.deadlineAt = time(initial+hour-60000);
+        await expect(recordingAction(identity,status,plain)).rejects.toMatchObject({code:'recording_state_changed'});
+    });
     it('requires a real retained session and strict inputs before a capability is usable',async()=>{
         expect(requestSchema.safeParse({...begin,creatorSub:'not trusted'}).success).toBe(false);
         expect(requestSchema.safeParse({...begin,consentAccepted:false}).success).toBe(false);

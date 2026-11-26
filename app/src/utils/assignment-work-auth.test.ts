@@ -91,6 +91,47 @@ describe.each(responders.flatMap(([name, respond]) => pairs.map(([os, universe])
         });
     });
 
+describe.each(pairs)('identityPending: the sign-in document\'s additive bit on preparing (%s inside %s)', (os, universe) => {
+    const paired = () => frame({ origin: os, universe });
+    type Pending = (attemptId: string, win: Window, current: () => string, onDiscover: undefined, pending: () => unknown) => { push(): void };
+    const sent = (posted: unknown[][]) => posted.map(entry => entry[1] as Record<string, unknown>);
+    it('🔴 is exactly true on preparing while the document says so, and absent from every other reply', () => {
+        let state = 'preparing', pending: unknown = true;
+        const f = paired();
+        const responder = (app.respondToWorkDiscover as unknown as Pending)(id, f.win, () => state, undefined, () => pending);
+        f.send();
+        expect(f.posted).toEqual([['top', { protocol, type: 'preparing', attemptId: id, challenge, identityPending: true }, universe]]);
+        expect(Object.keys(sent(f.posted)[0]!)).toEqual(['protocol', 'type', 'attemptId', 'challenge', 'identityPending']);
+        // Every other state omits it even while the document still says pending.
+        for (const other of ['authentication_required', 'ready', 'unavailable']) { state = other; responder.push(); }
+        // And preparing omits it unless the answer is the boolean true.
+        state = 'preparing';
+        for (const value of [false, undefined, null, 'true', 1, {}]) { pending = value; responder.push(); }
+        for (const message of sent(f.posted).slice(1)) expect(Object.keys(message)).toEqual(['protocol', 'type', 'attemptId', 'challenge']);
+        expect(sent(f.posted).slice(1).map(message => message.type)).toEqual(['authentication_required', 'ready', 'unavailable', ...Array(6).fill('preparing')]);
+        // Same trust checks as any reply: nothing for another window, origin, attempt or challenge shape.
+        const before = f.posted.length;
+        pending = true;
+        f.send({}, {}); f.send({}, (f.win as unknown as { parent: unknown }).parent, os); f.send({ attemptId: challenge }); f.send({ challenge: 'x' });
+        expect(f.posted).toHaveLength(before);
+    });
+    it('🔴 the ordinary responders never send it: without the argument, through the notice, and from the shell copy', () => {
+        for (const state of ['preparing', 'ready', 'unavailable', 'authentication_required']) {
+            const a = paired(), s = paired(), forced = paired();
+            app.respondToWorkDiscover(id, a.win, () => state as app.WorkState);
+            shell.respondToWorkDiscover(id, s.win, () => state);
+            // The shell's copy takes no such argument: one passed anyway changes nothing.
+            (shell.respondToWorkDiscover as unknown as Pending)(id, forced.win, () => state, undefined, () => true);
+            a.send(); s.send(); forced.send();
+            for (const f of [a, s, forced]) expect(f.posted).toEqual([['top', { protocol, type: state, attemptId: id, challenge }, universe]]);
+        }
+        const notice = paired();
+        app.listenForWorkSignIn(id, notice.win);
+        notice.send();
+        expect(Object.keys(sent(notice.posted)[0]!)).toEqual(['protocol', 'type', 'attemptId', 'challenge']);
+    });
+});
+
 describe('shared embed predicates', () => {
     it.each(['https://os-prod.ezil.work', 'https://os.ezil.org', 'https://universe.ezil.work', 'http://os.ezil.work', 'https://os.ezil.work.evil.example'])(
         'no other OS host ever answers, whichever Universe asks: %s', origin => {

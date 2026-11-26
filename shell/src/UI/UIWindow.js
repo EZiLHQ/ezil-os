@@ -383,7 +383,10 @@ async function UIWindow (options) {
         const btn_attrs = (cls, label) =>
             `class="window-action-btn ${cls}" role="button" tabindex="0" aria-label="${html_encode(label)}" title="${html_encode(label)}"`;
         // Minimize button, only if window is resizable and not embedded
-        if ( options.is_resizable && options.show_minimize_button && !window.is_embedded )
+        // MODIFIED BY EZIL 2026-11-26: `minimize_when_embedded` (default absent). A framed shell still has no minimise,
+        // except a window that asks for it by name: the assignment's Code window inside its own Universe work page,
+        // whose desktop is a working one. Every other embed and every other window is as before.
+        if ( options.is_resizable && options.show_minimize_button && (!window.is_embedded || options.minimize_when_embedded === true) )
         {
             h += `<span ${btn_attrs('window-minimize-btn', i18n('minimize'))}><img src="${html_encode(window.icons['minimize.svg'])}" draggable="false"></span>`;
         }

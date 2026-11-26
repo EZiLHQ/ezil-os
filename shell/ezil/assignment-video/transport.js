@@ -49,12 +49,18 @@ export async function checkAssignmentClock(attemptId, {fetcher = globalThis.fetc
 
 /** The longest a segment's end may be: an hour, or the span the server's clock now allows once it has given paused time back. */
 const HOUR = 3600000;
+/**
+ * The media window's bound once Universe's signed preflight says it manages this attempt's preparation window
+ * (`editorReadySupported`): recording starts in that window, and the work hour starts at `editor-ready` or at its end.
+ */
+const PREP_MEDIA_MS = HOUR + 240000;
 
 export function createAssignmentVideoTransport({attemptId, repoOpenProof, consentVersion, captureSessionId, onStop, onClock, maxEndMs = () => HOUR, paused = () => false, fetcher = globalThis.fetch,
     clock = Date.now, pollMs = 3000}) {
     if (!uuid.test(attemptId) || (captureSessionId && !uuid.test(captureSessionId)) || typeof repoOpenProof !== 'string' || !/^[A-Za-z0-9_-]{48,1700}$/.test(repoOpenProof) || !Number.isSafeInteger(consentVersion) || consentVersion < 1)
         throw failure('invalid_assignment');
     let recording, poll, expiry, disposed = false, stopped = false, misses = 0;
+    let mediaLimit = HOUR;
     function clearTimers() { clearTimeout(poll); clearTimeout(expiry); }
     // While the server's clock is paused its deadline is not running down: the local copy waits instead of ending the share.
     function expire(reason, at) {
@@ -81,7 +87,7 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         if (hasClock(data) && typeof onClock === 'function') onClock(data);
         // A later deadline (the server gave back time it stopped for a system interruption) moves the local expiry with it.
         const later = Date.parse(data.deadlineAt);
-        if (!stopped && !disposed && Number.isFinite(later) && later > Date.parse(recording.deadlineAt) && later - clock() <= 3600000 + 1500) {
+        if (!stopped && !disposed && Number.isFinite(later) && later > Date.parse(recording.deadlineAt) && later - clock() <= mediaLimit + 1500) {
             recording = {...recording, deadlineAt: data.deadlineAt};
             clearTimeout(expiry);
             expiry = setTimeout(() => expire('timeout', recording.deadlineAt), later - clock());
@@ -91,7 +97,24 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
             const cutoff = data.stopRequestedAt ?? (why === 'timeout' ? recording.deadlineAt : null);
             stop(why, typeof cutoff === 'string' && Number.isFinite(Date.parse(cutoff)) ? cutoff : null);
         }
+        // A managed preparation sets its media cutoff again when the work clock starts. Before any pause it may move
+        // either way, from the same start and inside the bound; a revised (paused) window keeps the rule above.
+        if (!stopped && !disposed && mediaLimit === PREP_MEDIA_MS && recording.phaseReady && data.phaseReady && !(data.revision > 0))
+            applyPreparedDeadline(data);
         return data;
+    }
+    function applyPreparedDeadline(data) {
+        const start = Date.parse(data.startedAt);
+        const end = Date.parse(data.deadlineAt);
+        const reportedNow = Date.parse(data.serverNow);
+        const remaining = end - (Number.isFinite(reportedNow) ? reportedNow : clock());
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || end - start > mediaLimit
+            || recording.startedAt !== data.startedAt || remaining > mediaLimit + 1500) throw failure('recording_changed');
+        if (remaining <= 0) { stop('timeout', data.deadlineAt); return; }
+        if (recording.deadlineAt === data.deadlineAt) return;
+        recording = {...recording, deadlineAt: data.deadlineAt};
+        clearTimeout(expiry);
+        expiry = setTimeout(() => expire('timeout', recording.deadlineAt), remaining);
     }
     async function watch() {
         if (disposed || stopped) return;
@@ -102,11 +125,24 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
     /**
      * The validated interactive assigned editor is open: Universe starts (or resumes) the canonical countdown from it and
      * answers with its clock. The browser sends no time, only the attempt, this capture phase and its open proof.
+     *
+     * For a managed preparation this call starts the work hour, so it is sent only for a live capture whose first frame
+     * is confirmed, and its answer must be a clock: a start not after the server's own time and at most the hour.
      */
     async function editorReady() {
         if (!recording || disposed) throw failure('recording_unavailable');
+        const managed = mediaLimit === PREP_MEDIA_MS;
+        if (managed && (!recording.phaseReady || !captureSessionId || stopped)) throw failure('recording_unavailable');
         const data = await control('editor-ready', {repoOpenProof});
-        if (!data || typeof data !== 'object' || !Number.isSafeInteger(data.revision)) throw failure('recording_unavailable');
+        if (!data || typeof data !== 'object') throw failure('recording_unavailable');
+        if (!managed) {
+            if (!Number.isSafeInteger(data.revision)) throw failure('recording_unavailable');
+            return data;
+        }
+        if (stopped || disposed) throw failure('recording_unavailable');
+        const start = Date.parse(data.startedAt), end = Date.parse(data.deadlineAt), now = Date.parse(data.serverNow);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || !Number.isFinite(now) || end <= start || end - start > HOUR
+            || start > now + 1500) throw failure('media_unavailable');
         return data;
     }
     async function preflight() {
@@ -115,7 +151,9 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
     }
     async function begin() {
         if (stopped || disposed) throw failure('recording_closed');
-        await preflight();
+        // Only Universe's own signed preflight widens the media bound; without its flag the bound is the hour.
+        const eligibility = await preflight();
+        mediaLimit = eligibility.editorReadySupported === true ? PREP_MEDIA_MS : HOUR;
         const data = await control('begin', {consentAccepted:true,consentVersion,repoOpenProof});
         const provisional = captureSessionId && data.status === 'awaiting_frame';
         const deadline = Date.parse(provisional ? data.authorizationExpiresAt : data.deadlineAt);
@@ -123,7 +161,7 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
             || (recording && recording.recordingId !== data.recordingId)) throw failure('recording_changed');
         recording = data;
         clearTimers();
-        expiry = setTimeout(() => expire(provisional?'unavailable':'timeout', data.deadlineAt), Math.min(3600000, deadline-clock()));
+        expiry = setTimeout(() => expire(provisional?'unavailable':'timeout', data.deadlineAt), Math.min(mediaLimit, deadline-clock()));
         poll = setTimeout(watch, pollMs);
         return data;
     }
@@ -132,7 +170,7 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         const blob = bytes instanceof Blob ? bytes : new Blob([bytes], {type:'video/webm'});
         if (mimeType !== 'video/webm' || !Number.isSafeInteger(sequence) || sequence < 0 || sequence >= 600
             || !Number.isSafeInteger(startMs) || !Number.isSafeInteger(endMs) || endMs <= startMs
-            || startMs < 0 || endMs > Math.max(HOUR, maxEndMs()) || endMs-startMs > 60000 || !blob.size || blob.size > 8*1024*1024)
+            || startMs < 0 || endMs > Math.max(mediaLimit, maxEndMs()) || endMs-startMs > 60000 || !blob.size || blob.size > 8*1024*1024)
             throw failure('invalid_segment');
         const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
         const sha256 = Array.from(new Uint8Array(digest), n => n.toString(16).padStart(2,'0')).join('');
@@ -153,8 +191,8 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         if (result.phaseReady && captureSessionId && result.captureSessionId === captureSessionId) {
             const end=Date.parse(result.deadlineAt),serverNow=Date.parse(result.serverNow);
             const remaining=end-(Number.isFinite(serverNow)?serverNow:clock());
-            if (!Number.isFinite(end) || remaining<=0 || remaining>3600000+1500) throw failure('recording_changed');
-            recording={...recording,startedAt:result.startedAt,deadlineAt:result.deadlineAt};
+            if (!Number.isFinite(end) || remaining<=0 || remaining>mediaLimit+1500) throw failure('recording_changed');
+            recording={...recording,phaseReady:true,startedAt:result.startedAt,deadlineAt:result.deadlineAt};
             if (typeof onClock === 'function') onClock(result);
             clearTimeout(expiry); expiry=setTimeout(()=>expire('timeout',recording.deadlineAt),remaining);
         }

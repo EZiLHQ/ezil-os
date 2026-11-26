@@ -1,19 +1,68 @@
 import { createTRPCContext } from '@/server/api/trpc';
 import { assignmentAuthority, productionAssignment } from '@/server/assignment-video/authority';
-import { assignmentEnrollmentEnabled } from '@/server/git/assignment-enrollment';
-import { embeddedWorkReturnSuffix, workReturnAttempt } from '@/utils/assignment-work-auth';
+import { assignmentStageTag } from '@/server/assignment-video/stage-tag';
+import { retainedIdentity } from '@/server/auth/retained-identity';
+import { assignmentEnrollmentEnabled, ownerRepositoryName } from '@/server/git/assignment-enrollment';
+import { embeddedWorkReturn, workAccountNotice, workReturnAttempt } from '@/utils/assignment-work-auth';
 import { getReturnUrlQueryParam } from '@/utils/constants';
 import { publicOrigin } from '@/utils/forwarded';
 
 export const dynamic = 'force-dynamic';
 
+/**
+ * One automatic trip to EZiL ID per return (the sign-in of a browser with no OS session, or the silent refresh),
+ * remembered for two minutes. A hint that only ever stops a redirect: the trip is made again when it is absent, and
+ * the lock screen is shown when it is present and the trip left no session or no EZiL ID behind.
+ */
+const REFRESH_COOKIE = '__Host-ezil-work-return';
+
+const refreshCookie = (value: string, maxAge: number) =>
+    `${REFRESH_COOKIE}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
+const refreshed = (request: Request, attempt: string) =>
+    (request.headers.get('cookie') ?? '').split(';').some(part => part.trim() === `${REFRESH_COOKIE}=${attempt}`);
+
+type Outcome = 'idp_signin' | 'identity_refresh' | 'storage_unavailable' | 'identity_unavailable' | 'account_mismatch' | 'workspace_return';
+
+/**
+ * One line per decision on an accepted embedded return, and nothing else: a fixed event, one of the outcomes above
+ * and `attemptTag`, the correlation tag shared with Universe (`assignmentStageTag`). Never the attempt, a person, an
+ * owner tag, a URL, a cookie or any text that arrived with the request or was thrown.
+ */
+function record(outcome: Outcome, attempt: string): void {
+    console.info(JSON.stringify({ event: 'ezil_assignment_work_return', outcome, attemptTag: assignmentStageTag(attempt) }));
+}
+
+/**
+ * `/assignment/work-return` — where the Universe assignment page sends its own tab for an EZiL OS sign-in, and where
+ * that sign-in comes back to. A top-level document only, on the OS origin of the selected deployment, leading only to
+ * its paired Universe; it answers with a redirect and nothing else.
+ *
+ * `?attempt=<id>` alone is staging's standalone return: unchanged (signed in → Universe's work redirect, else the lock
+ * screen). Production does not serve it.
+ *
+ * `&workspace=1` is the embedded workspace, whose framed editor needs more than an OS session: the retained EZiL ID
+ * of that session (`@/server/auth/retained-identity`), for the same person Universe assigned. So, in order:
+ *  1. no OS session → the ordinary EZiL ID sign-in, ONCE, without the lock screen's extra click. There is no OS
+ *     account to switch away from; a live id.ezil.work session answers without asking. Back here still without a
+ *     session (a browser that did not keep it) → the lock screen, whose Continue is the person's own retry.
+ *  2. an OS session whose EZiL ID `retainedIdentity` refuses (lost, expired, or inside its own minimum validity) →
+ *     ONE silent (`prompt=none`) refresh. The callback refuses a silent answer for any other account, so this never
+ *     changes who is signed in. Still nothing kept after it, or after the sign-in of step 1 → the lock screen, which
+ *     never redirects. An identity
+ *     it accepts is used as it is, however long it has left: a later expiry is the editor's own sign-in challenge.
+ *  3. `&owner=<tag>` names the repository owner Universe assigned. When the tag derived from this session's verified
+ *     EZiL ID differs, this is another account: the lock screen says so and its sign-in asks id.ezil.work for the
+ *     account explicitly. The comparison is local and exact; nothing is inferred from Universe refusing a request.
+ *  4. otherwise → the Universe workspace.
+ * Every branch ends at Universe, at id.ezil.work's own top-level page, or at the lock screen, so none can loop.
+ */
 export async function GET(request: Request): Promise<Response> {
     const headers = { 'Cache-Control': 'private, no-store', 'Referrer-Policy': 'no-referrer',
         'Content-Security-Policy': "frame-ancestors 'none'", 'X-Frame-Options': 'DENY' };
     const url = new URL(request.url);
     const returnPath = url.pathname + url.search;
     const attempt = workReturnAttempt(returnPath);
-    const embedded = returnPath.endsWith(embeddedWorkReturnSuffix);
+    const embedded = embeddedWorkReturn(returnPath);
     // OS and Universe are one selected deployment: the return is served only on that deployment's own OS origin and
     // leads only to its paired Universe. Production serves the embedded workspace return alone; its top-level
     // assignment tab never used this route.
@@ -25,7 +74,26 @@ export async function GET(request: Request): Promise<Response> {
     contextHeaders.set('x-trpc-source', 'assignment-work-return');
     const ctx = await createTRPCContext({headers:contextHeaders});
     if (ctx.delegation) return new Response(null, {status:404,headers});
-    const next = ctx.user ? authority.universe + (embedded ? '/assignment/workspace/' : '/assignment/work/') + attempt
-        : authority.os + '/login?' + getReturnUrlQueryParam(returnPath);
-    return new Response(null, {status:303,headers:{...headers,Location:next}});
+    const to = (location: string, cookie?: string) =>
+        new Response(null, {status:303,headers:{...headers,Location:location,...(cookie ? {'Set-Cookie':cookie} : {})}});
+    const lockScreen = (query: Record<string, string> = {}) =>
+        authority.os + '/login?' + new URLSearchParams({...query, returnUrl: returnPath});
+
+    // Staging's standalone return, unchanged. Production never reaches it (refused above).
+    if (!embedded) return to(ctx.user ? authority.universe + '/assignment/work/' + attempt : authority.os + '/login?' + getReturnUrlQueryParam(returnPath));
+
+    const signIn = authority.os + '/auth/auth0/login?';
+    const tried = refreshed(request, attempt);
+    const settled = tried ? refreshCookie('', 0) : undefined;
+    const answer = (outcome: Outcome, location: string, cookie = settled) => { record(outcome, attempt); return to(location, cookie); };
+    const unfinished = lockScreen({error: 'auth_callback_failed'});
+    // Back from the one automatic trip and still no OS session: this browser did not keep it.
+    if (!ctx.user) return tried ? answer('storage_unavailable', unfinished)
+        : answer('idp_signin', signIn + getReturnUrlQueryParam(returnPath), refreshCookie(attempt, 120));
+    const identity = await retainedIdentity(ctx.user.id).catch(() => null);
+    if (!identity) return tried ? answer('identity_unavailable', unfinished)
+        : answer('identity_refresh', signIn + new URLSearchParams({prompt: 'none', returnUrl: returnPath}), refreshCookie(attempt, 120));
+    if (embedded.owner !== null && ownerRepositoryName(identity.subject, 'a-' + attempt) !== `u-${embedded.owner}-a-${attempt}`)
+        return answer('account_mismatch', lockScreen({error: workAccountNotice}));
+    return answer('workspace_return', authority.universe + '/assignment/workspace/' + attempt);
 }
