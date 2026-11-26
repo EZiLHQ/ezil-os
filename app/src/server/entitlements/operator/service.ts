@@ -12,8 +12,17 @@
  * - Stripe: never replaced. Paid access (or a checkout still incomplete) refuses an assign, or a change that gives
  *   more, with paid_subscription_conflict before any write; ending or shortening always works.
  * - one live operator assignment per account; starts are never scheduled or back-dated; validity is explicit.
+ * - explicit access overrides (0038): an assign with `access_override` writes the account's one live override, a slot
+ *   independent of the ordinary assignment. It may set Free, Standard or Premium, starts now, and its validity is
+ *   exactly the requested `ends_at` or until revoked. No paid conflict: it decides access ahead of Stripe without
+ *   touching Stripe, AI credits or a runtime. change (tier and/or validity) and end address it by its ref and restate
+ *   `access_override`; the flag must match the assignment's kind (present on an override, absent on an ordinary
+ *   assignment) or nothing is written. Once an override ends or expires, access falls back to Stripe, then the ordinary
+ *   grant, then Free. Ordinary assignments keep every rule above.
  */
-import { operatorGrantInEffect, isOperatorSku, type OperatorEntitlementRow, type OperatorSku } from '@/server/billing/v3/operator-access';
+import {
+    isOperatorOverrideSku, isOperatorSku, operatorGrantInEffect, operatorOverrideInEffect, type OperatorEntitlementRow, type OperatorOverrideSku, type OperatorSku,
+} from '@/server/billing/v3/operator-access';
 import { addCalendarMonthUtc } from '@/server/billing/v3/trial';
 import {
     assignmentView, FORMATS, InvalidCommand, NO_ACCESS, parseCommand, payloadSha256, PRODUCER, refused, SCOPE, sourceCatalog,
@@ -55,18 +64,32 @@ export interface OperatorEntitlementDeps {
     stripe(userId: string): Promise<StripeView>;
     readAssignments(userId: string): Promise<OperatorEntitlementRow[]>;
     withCommand<T>(commandId: string, userId: string, run: (store: CommandStore) => Promise<T>): Promise<T>;
+    /** 0038 is applied, so the catalog may advertise access overrides. */
+    accessOverridesInstalled(): Promise<boolean>;
 }
 
-/** The access OS admission resolves: Stripe paid access wins, else the operator grant in effect, else none. */
+/**
+ * The access OS admission resolves: an explicit override in effect (Free included) wins; else Stripe paid access;
+ * else the ordinary operator grant in effect; else none.
+ */
 export function effectiveAccess(stripe: StripeView, rows: readonly OperatorEntitlementRow[], now: Date): EffectiveAccess {
+    const override = operatorOverrideInEffect(rows, now);
+    if (override) return { state: 'active', product_ref: override.sku, via: 'operator' };
     if (stripe.paidAccess) return stripe.computeActive
         ? { state: 'active', product_ref: stripe.productRef, via: 'stripe' } : NO_ACCESS;
     const grant = operatorGrantInEffect(rows, now);
     return grant ? { state: 'active', product_ref: grant.sku, via: 'operator' } : NO_ACCESS;
 }
 
-export function catalog() {
-    return sourceCatalog();
+/** GET catalog: `access_overrides` only once 0038 is applied; a probe that cannot answer advertises nothing new. */
+export async function catalog(deps: Pick<OperatorEntitlementDeps, 'accessOverridesInstalled'>) {
+    let accessOverrides = false;
+    try {
+        accessOverrides = await deps.accessOverridesInstalled();
+    } catch {
+        // Unknown: keep the v1 catalog.
+    }
+    return sourceCatalog({ accessOverrides });
 }
 
 /** GET assignments: null when the pair is not one linked account (the route answers 404 and reveals nothing). */
@@ -80,9 +103,11 @@ export async function readAssignments(deps: OperatorEntitlementDeps, target: Ind
 }
 
 const live = (row: OperatorEntitlementRow) => row.endedAt === null;
+const isOverride = (row: OperatorEntitlementRow) => row.accessOverride === true;
 const inEffect = (row: OperatorEntitlementRow, now: Date) => live(row) && row.startsAt.getTime() <= now.getTime()
     && (row.endsAt === null || row.endsAt.getTime() > now.getTime());
-const RANK: Readonly<Record<OperatorSku, number>> = { standard_monthly_v3: 1, premium_monthly_v3: 2 };
+const RANK: Readonly<Record<OperatorOverrideSku, number>> = { free_v3: 0, standard_monthly_v3: 1, premium_monthly_v3: 2 };
+const sameEnd = (a: Date | null, b: Date | null) => (a?.getTime() ?? null) === (b?.getTime() ?? null);
 
 /** POST commands, for a body whose command_id is valid (the route answers 400 otherwise). Never throws a refusal. */
 export async function handleCommand(deps: OperatorEntitlementDeps, body: Record<string, unknown>, commandId: string, senderKid: string): Promise<Result> {
@@ -118,6 +143,19 @@ export async function handleCommand(deps: OperatorEntitlementDeps, body: Record<
                 if (command.product!.catalog_revision !== catalogRevision) return refuse('catalog_revision_mismatch', 'The EZiL OS catalog changed; reload it and try again.');
                 return ref;
             };
+            // An override may set any catalog product, Free included; the catalog revision still has to match.
+            const overrideProduct = (): OperatorOverrideSku | Result => {
+                const ref = command.product!.ref;
+                if (!isOperatorOverrideSku(ref)) return refuse('product_not_assignable', 'This product is not in the EZiL OS catalog.');
+                if (command.product!.catalog_revision !== catalogRevision) return refuse('catalog_revision_mismatch', 'The EZiL OS catalog changed; reload it and try again.');
+                return ref;
+            };
+            // An override's validity is authoritative: exactly the requested end, or until revoked. Never already over.
+            const overrideEnd = (validity: NonNullable<Command['validity']>): Date | null | Result => {
+                if ('until_revoked' in validity) return null;
+                const end = new Date(validity.ends_at);
+                return end.getTime() > now.getTime() ? end : refuse('invalid_command', 'ends_at must be after now; use end to stop an override.');
+            };
             const write = async (row: OperatorEntitlementRow, apply: () => Promise<boolean>) => {
                 if (!await apply()) return refuse('stale_revision', 'The assignment changed meanwhile; reload it and try again.');
                 const next = rows.filter(other => other.ref !== row.ref).concat(row);
@@ -132,36 +170,66 @@ export async function handleCommand(deps: OperatorEntitlementDeps, body: Record<
             };
 
             if (command.action === 'assign') {
-                const sku = product();
+                const override = command.access_override === true;
+                const sku = override ? overrideProduct() : product();
                 if (typeof sku !== 'string') return sku;
                 const requestedStart = command.starts_at === null ? now : new Date(command.starts_at);
                 if (Math.abs(requestedStart.getTime() - now.getTime()) > START_TOLERANCE_MS) return refuse('invalid_command', 'starts_at must be now: scheduled and back-dated assignments are not supported.');
                 // Tolerance accepts sender clock skew, never scheduling: the period begins at the server's now.
                 const startsAt = now;
-                // Server-authoritative period: an operator plan runs the plan's source-defined one calendar month
-                // (billing/v3/trial.ts addCalendarMonthUtc), anchored at the server's start, and only that computed end is
-                // stored. A well-formed ends_at on the frozen v1 wire is a non-authoritative hint: it is never compared
-                // with this end (a sender start across midnight or a late retry of an unsaved command would differ) and it
-                // can never extend access because it never determines the stored end. Until-revoked is not supported.
                 const validity = command.validity!;
-                if ('until_revoked' in validity) return refuse('invalid_command', 'An operator plan runs one calendar month; until-revoked is not supported.');
-                const endsAt = addCalendarMonthUtc(startsAt);                if (stripe.paidAccess || stripe.checkoutOpen) return paidConflict();
-                const current = rows.find(live);
-                if (current && (current.endsAt === null || current.endsAt.getTime() > now.getTime())) return refuse('invalid_command', 'An operator assignment is already in effect for this account; change or end it.');
+                let endsAt: Date | null;
+                if (override) {
+                    // An override's requested validity is stored as sent; no paid conflict, Stripe is never touched.
+                    const end = overrideEnd(validity);
+                    if (end !== null && !(end instanceof Date)) return end;
+                    endsAt = end;
+                } else {
+                    // Server-authoritative period: an operator plan runs the plan's source-defined one calendar month
+                    // (billing/v3/trial.ts addCalendarMonthUtc), anchored at the server's start, and only that computed end is
+                    // stored. A well-formed ends_at on the frozen v1 wire is a non-authoritative hint: it is never compared
+                    // with this end (a sender start across midnight or a late retry of an unsaved command would differ) and it
+                    // can never extend access because it never determines the stored end. Until-revoked is not supported.
+                    if ('until_revoked' in validity) return refuse('invalid_command', 'An operator plan runs one calendar month; until-revoked is not supported.');
+                    endsAt = addCalendarMonthUtc(startsAt);
+                    if (stripe.paidAccess || stripe.checkoutOpen) return paidConflict();
+                }
+                // One live row per kind: an override and an ordinary assignment never block or close each other.
+                const current = rows.find(row => live(row) && isOverride(row) === override);
+                if (current && (current.endsAt === null || current.endsAt.getTime() > now.getTime())) return refuse('invalid_command', override
+                    ? 'An access override is already in effect for this account; change or end it.' : 'An operator assignment is already in effect for this account; change or end it.');
                 // A live grant that lapsed by its own end date is closed at that date before the new one starts.
                 if (current) await store.closeLapsed(current.ref, now);
                 const row: OperatorEntitlementRow = { ref: `osg-${deps.newId()}`, revision: 1, userId, accountPublicId: command.target.account_public_id,
-                    sku, startsAt, endsAt, endedAt: null, issuedBy: command.issued_by ?? null };
+                    sku, startsAt, endsAt, endedAt: null, issuedBy: command.issued_by ?? null, ...(override ? { accessOverride: true } : {}) };
                 return write(row, async () => { await store.insertAssignment(row); return true; });
             }
 
             const target = rows.find(row => row.ref === command.assignment!.ref);
             if (!target || target.accountPublicId !== command.target.account_public_id) return refuse('assignment_not_found', 'No such operator assignment for this account.');
+            // The kind is immutable and the signed flag restates it: an override is addressed only with access_override,
+            // an ordinary assignment only without it. Checked before anything else about the row, so a mismatch writes nothing.
+            if (isOverride(target) !== (command.access_override === true)) return refuse('invalid_command', isOverride(target)
+                ? 'This assignment is an access override; restate access_override: true.' : 'This assignment is not an access override; send it without access_override.');
             if (target.revision !== command.assignment!.expected_revision) return refuse('stale_revision', 'The assignment changed meanwhile; reload it and try again.');
             if (!inEffect(target, now)) return refuse('invalid_command', 'This assignment has already ended.');
 
             if (command.action === 'end') {
                 const row = { ...target, revision: target.revision + 1, endedAt: now };
+                return write(row, () => store.updateAssignment(target.ref, target.revision, row));
+            }
+
+            if (isOverride(target)) {
+                // Override change: tier and/or validity, each authoritative, with no paid conflict. The start may only be restated.
+                if (command.starts_at !== null && new Date(command.starts_at).getTime() !== target.startsAt.getTime()) {
+                    return refuse('invalid_command', 'starts_at cannot move; restate the current start or send null.');
+                }
+                const sku = command.product === null ? target.sku : overrideProduct();
+                if (typeof sku !== 'string') return sku;
+                const endsAt = command.validity === null ? target.endsAt : overrideEnd(command.validity);
+                if (endsAt !== null && !(endsAt instanceof Date)) return endsAt;
+                if (sku === target.sku && sameEnd(endsAt, target.endsAt)) return refuse('invalid_command', 'Nothing would change.');
+                const row = { ...target, revision: target.revision + 1, sku, endsAt };
                 return write(row, () => store.updateAssignment(target.ref, target.revision, row));
             }
 

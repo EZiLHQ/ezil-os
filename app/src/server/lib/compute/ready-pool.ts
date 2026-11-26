@@ -1,7 +1,6 @@
 /** Single-use warm hosts. Callers own admission, lifecycle execution and transactions. */
 import { sql } from 'drizzle-orm';
-import { operatorBranchEnabled } from '@/server/entitlements/operator/installed';
-import { paidComputeAccessCtes } from '@/server/billing/v3/paid-compute-access-sql';
+import { paidComputeAccessCtes, paidComputeBranches, type PaidComputeBranches } from '@/server/billing/v3/paid-compute-access-sql';
 import { RUNNING_CLASS_STATES, type Placement, type PlacementExecutor } from './placement';
 import { AWS_REGION_PATTERN, INSTANCE_VCPU, instanceVcpu, readAwsRegions } from './aws-config';
 
@@ -245,14 +244,14 @@ export function planPool(c: PoolClass, d: PoolDemand, now: Date): { target: numb
 }
 
 /** Shared effective source, standing and receipt funding for pool eligibility and demand. */
-function eligibleCtes(at: string, user?: string, operator = false) {
-    return paidComputeAccessCtes(at, operator, user);
+function eligibleCtes(at: string, user?: string, branches: PaidComputeBranches | false = false) {
+    return paidComputeAccessCtes(at, branches, user);
 }
 /** Capacity-demand reauthorization: the owner's paid-pool eligibility right now (v3 paid standing and receipt funding, including renewal grace; live auth user) and the instance type their CURRENT plan/size selection resolves to — the same
  * predicate and mapping pool planning uses. null when not eligible. */
 export async function readPaidPoolEligibility(db: PlacementExecutor, userId: string, now: Date): Promise<{ instanceType: string } | null> {
     const at = now.toISOString();
-    const rows = rowsOf(await db.execute(sql`WITH ${eligibleCtes(at, userId, await operatorBranchEnabled(db))} SELECT instance_type FROM eligible`));
+    const rows = rowsOf(await db.execute(sql`WITH ${eligibleCtes(at, userId, await paidComputeBranches(db))} SELECT instance_type FROM eligible`));
     if (rows.length > 1) throw new Error('pool_eligibility_ambiguous');
     return rows[0] ? { instanceType: String(rows[0].instance_type) } : null;
 }
@@ -282,12 +281,12 @@ export const SWITCH_DEMAND_WINDOW_MS = 830_000;
 export async function readPoolDemand(db: PlacementExecutor, c: PoolClass, now: Date): Promise<PoolDemand> {
     checkClass(c);
     const at = now.toISOString();
-    const operator = await operatorBranchEnabled(db);
+    const branches = await paidComputeBranches(db);
     const vcpu = (column: ReturnType<typeof sql>) => sql`CASE ${column} ${sql.join(Object.entries(INSTANCE_VCPU)
         .map(([type, n]) => sql`WHEN ${type} THEN ${n}::int`), sql` `)} ELSE 8 END`;
     const running = sql.join(RUNNING_CLASS_STATES.map(state => sql`${state}`), sql`, `);
     const row = rowsOf(await db.execute(sql`
-        WITH ${eligibleCtes(at, undefined, operator)}, subscribers AS (
+        WITH ${eligibleCtes(at, undefined, branches)}, subscribers AS (
             SELECT s.* FROM eligible s WHERE s.instance_type = ${c.instanceType}
                 AND (EXISTS (SELECT 1 FROM public.ezil_computer_placements p WHERE p.owner_user_id = s.user_id
                     AND p.provider = 'aws-ec2' AND p.region = ${c.region} AND p.zone_id = ${c.zoneId}

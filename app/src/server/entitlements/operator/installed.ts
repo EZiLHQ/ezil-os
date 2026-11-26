@@ -24,5 +24,19 @@ export async function operatorBranchEnabled(db: { execute(query: SQL): Promise<u
     }
 }
 
+let overrides: { value: boolean; at: number } | null = null;
+
+/**
+ * Whether app/drizzle/0038_operator_access_overrides.sql is applied (its last object, the override slot's unique index,
+ * exists), so the catalog may advertise explicit access overrides. Cached the same way as above.
+ */
+export async function operatorOverridesInstalled(db: { execute(query: SQL): Promise<unknown> }, now = Date.now()): Promise<boolean> {
+    if (overrides && (overrides.value || now - overrides.at < 60_000)) return overrides.value;
+    const result = await db.execute(sql`SELECT to_regclass('public.ezil_operator_entitlements_one_live_override') IS NOT NULL AS present`);
+    const rows = (Array.isArray(result) ? result : (result as { rows?: Record<string, unknown>[] } | null)?.rows) ?? [];
+    overrides = { value: rows[0]?.present === true, at: now };
+    return overrides.value;
+}
+
 /** Tests only. */
-export function resetOperatorEntitlementsInstalled(): void { installed = null; }
+export function resetOperatorEntitlementsInstalled(): void { installed = null; overrides = null; }
