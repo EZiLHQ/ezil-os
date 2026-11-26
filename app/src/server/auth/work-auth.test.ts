@@ -20,6 +20,7 @@ const subject = 'auth0|builder', email = 'private-person@example.com', secret = 
 const owner = ownerRepositoryName(subject, 'a-' + attempt).slice(2, 18);
 const attemptTag = '8c472e1bbbcb7f77';
 const frame = { 'sec-fetch-dest': 'iframe', 'sec-fetch-site': 'same-origin' };
+const mine = WORK_AUTH_COOKIE + '-' + request;
 const query = (fields: Record<string, string> = { attempt, owner, request }) => '/assignment/work-auth?' + new URLSearchParams(fields);
 let lines: string[];
 
@@ -47,7 +48,7 @@ function started(path = query()) {
     const response = begin(path);
     const jar = response.headers.get('set-cookie')!.split(';')[0]!;
     const authorize = new URL(response.headers.get('location')!);
-    const tx = JSON.parse(Buffer.from(jar.slice(WORK_AUTH_COOKIE.length + 1).split('.')[0]!, 'base64url').toString());
+    const tx = JSON.parse(Buffer.from(jar.slice(jar.indexOf('=') + 1).split('.')[0]!, 'base64url').toString());
     return { response, jar, authorize, state: authorize.searchParams.get('state')!, tx: tx as Record<string, string | number> };
 }
 function callback(params: Record<string, string>, jar: string | null, headers: Record<string, string> = { 'sec-fetch-dest': 'iframe' }, host = os) {
@@ -61,8 +62,10 @@ async function inert(response: Response) {
     expect(response.headers.get('content-type')).toBe('text/html; charset=utf-8');
     expect(response.headers.get('cache-control')).toContain('no-store');
     expect(response.headers.get('referrer-policy')).toBe('no-referrer');
-    expect(response.headers.get('set-cookie')).toBe(WORK_AUTH_COOKIE + '=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax');
     const html = await response.text();
+    // Spends exactly the cookie of the request it names, and no other; names none, touches none.
+    const named = /data-request="([0-9a-f-]{36})"/.exec(html)?.[1];
+    expect(response.headers.get('set-cookie')).toBe(named ? `${WORK_AUTH_COOKIE}-${named}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax` : null);
     // No link, form, frame or redirect of its own, and nothing private.
     expect(html).not.toMatch(/<a |<form|<iframe|http-equiv|location\.(href|assign|replace)/i);
     for (const hidden of ['private-code', 'private-id-token', subject, email, secret, owner, '/login', 'authorize']) expect(html).not.toContain(hidden);
@@ -87,7 +90,7 @@ describe('the hidden child starts one scoped, silent-only EZiL ID transaction', 
         expect(Number(tx.expiresAt) - Date.now()).toBeLessThanOrEqual(120_000);
         // Its own host-only cookie; the interactive sign-in's is never written.
         expect(response.headers.get('set-cookie')).toBe(jar + '; Path=/; Max-Age=120; HttpOnly; Secure; SameSite=Lax');
-        expect(jar.startsWith(WORK_AUTH_COOKIE + '=')).toBe(true);
+        expect(jar.startsWith(mine + '=')).toBe(true);
         expect(response.headers.get('set-cookie')).not.toContain(AUTH0_COOKIE);
         expect(response.headers.get('cache-control')).toContain('no-store');
         // The hop carries no framing header of its own.
@@ -239,16 +242,41 @@ describe('the callback answer: a lost, replayed or foreign transaction', () => {
     });
     it('a tampered or re-signed cookie, an expired one, and another transaction\'s state are refused', async () => {
         const first = started(), second = started();
-        const [payload, signature] = first.jar.slice(WORK_AUTH_COOKIE.length + 1).split('.') as [string, string];
+        const [payload, signature] = first.jar.slice(mine.length + 1).split('.') as [string, string];
         const forged = Buffer.from(JSON.stringify({ ...first.tx, owner: '0'.repeat(16) })).toString('base64url');
-        for (const jar of [first.jar + 'x', `${WORK_AUTH_COOKIE}=${forged}.${signature}`, `${WORK_AUTH_COOKIE}=${payload}`,
-            `${WORK_AUTH_COOKIE}=${payload}.${createHash('sha256').update(payload).digest('base64url')}`]) {
+        for (const jar of [first.jar + 'x', `${mine}=${forged}.${signature}`, `${mine}=${payload}`,
+            `${mine}=${payload}.${createHash('sha256').update(payload).digest('base64url')}`,
+            // The right bytes under the unsuffixed name, or under another request's name, are not this transaction.
+            `${WORK_AUTH_COOKIE}=${payload}.${signature}`, `${WORK_AUTH_COOKIE}-00000000-0000-4000-8000-000000000009=${payload}.${signature}`]) {
             expect(outcomeOf(await inert(await callback({ state: first.state, code: 'private-code' }, jar)))).toBe('unavailable');
         }
         expect(outcomeOf(await inert(await callback({ state: second.state, code: 'private-code' }, first.jar)))).toBe('unavailable');
         vi.useFakeTimers(); vi.setSystemTime(Date.now() + 120_001);
         expect(outcomeOf(await inert(await callback({ state: first.state, code: 'private-code' }, first.jar)))).toBe('unavailable');
         untouched();
+    });
+    it('🔴 two assignment tabs at once each keep their own transaction, in either order', async () => {
+        const otherRequest = '00000000-0000-4000-8000-0000000000aa', otherAttempt = '00000000-0000-4000-8000-000000000001';
+        const first = started();
+        const second = started(query({ attempt: otherAttempt, owner, request: otherRequest }));
+        expect(second.jar.startsWith(`${WORK_AUTH_COOKIE}-${otherRequest}=`)).toBe(true);
+        // The browser holds both; the later start did not replace the earlier one.
+        const both = first.jar + '; ' + second.jar;
+        const late = await callback({ state: first.state, code: 'private-code' }, both);
+        expect(late.headers.get('set-cookie')).toBe(mine + '=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax');
+        const lateHtml = await late.text();
+        expect(outcomeOf(lateHtml)).toBe('signed_in');
+        expect(lateHtml).toContain(`data-attempt="${attempt}"`);
+        const other = await callback({ state: second.state, code: 'private-code' }, both);
+        expect(other.headers.get('set-cookie')).toBe(`${WORK_AUTH_COOKIE}-${otherRequest}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`);
+        const otherHtml = await other.text();
+        expect(outcomeOf(otherHtml)).toBe('signed_in');
+        expect(otherHtml).toContain(`data-request="${otherRequest}"`);
+        expect(otherHtml).toContain(`data-attempt="${otherAttempt}"`);
+        // One tab's state never opens the other tab's cookie.
+        const crossed = await callback({ state: first.state, code: 'private-code' }, second.jar);
+        expect(outcomeOf(await crossed.text())).toBe('unavailable');
+        expect(stub.bridge).toHaveBeenCalledTimes(2);
     });
     it('a replay after the answer cleared the cookie signs nobody in twice', async () => {
         const { jar, state } = started();

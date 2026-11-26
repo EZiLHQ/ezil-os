@@ -24,8 +24,9 @@ import { retainProjectIdentity } from './retained-identity';
  * What makes this narrow:
  * - Started only by an OS document (`Sec-Fetch-Site: same-origin`) as a frame (`Sec-Fetch-Dest: iframe`), on the
  *   staging origin, for an exact `attempt` / `owner` / `request` query. Anything else is a 404.
- * - Its own transaction (state, nonce, S256 PKCE verifier, 2 minutes) in its own signed host-only cookie. The
- *   interactive sign-in's `__Host-ezil-auth0` is never read, written or cleared here.
+ * - Its own transaction (state, nonce, S256 PKCE verifier, 2 minutes) in its own signed host-only cookie, named for
+ *   the request id, so two assignment tabs never overwrite each other's. The interactive sign-in's
+ *   `__Host-ezil-auth0` is never read, written or cleared here.
  * - `prompt=none` only. The answer is ALWAYS the inert document below: no redirect, no lock screen, no interactive
  *   id.ezil.work page, whatever arrived (a lost cookie, a replayed or foreign state, a provider error).
  * - A session is minted only after the ID token is verified (issuer, audience, nonce, expiry, verified email), its
@@ -34,10 +35,13 @@ import { retainProjectIdentity } from './retained-identity';
  *   a message or a log line.
  */
 export const WORK_AUTH_COOKIE = '__Host-ezil-work-auth';
+/** One cookie per request id (`<name>-<uuid>`): at most one per assignment per tab, each gone within two minutes. */
+const cookieName = (request: string) => `${WORK_AUTH_COOKIE}-${request}`;
+const stateRequest = /^ezw1\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.[\w-]{43}$/;
 const TTL_MS = 120_000;
 const closed = { 'Cache-Control': 'private, no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' };
 const refused = () => new Response(null, { status: 404, headers: { ...closed, 'Content-Security-Policy': "frame-ancestors 'none'", 'X-Frame-Options': 'DENY' } });
-const cookie = (value: string, maxAge: number) => `${WORK_AUTH_COOKIE}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
+const cookie = (request: string, value: string, maxAge: number) => `${cookieName(request)}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
 
 interface Transaction { state: string; nonce: string; codeVerifier: string; attempt: string; owner: string; request: string; expiresAt: number }
 
@@ -75,7 +79,7 @@ export function startWorkAuth(request: Request): Response {
     record('started', query.attempt);
     // A bare redirect: no framing header rides on it, so no browser can read one as a refusal of the hop itself.
     return new Response(null, { status: 303, headers: { ...closed, Location: authorize.href,
-        'Set-Cookie': cookie(`${payload}.${sign(payload)}`, TTL_MS / 1000) } });
+        'Set-Cookie': cookie(query.request, `${payload}.${sign(payload)}`, TTL_MS / 1000) } });
 }
 
 /** A callback that belongs to this flow, or that arrived in a frame on the stage: it never takes the interactive path. */
@@ -85,8 +89,9 @@ export function isWorkAuthCallback(request: Request): boolean {
 }
 
 function readTransaction(request: Request, state: string | null): Transaction | null {
-    const header = request.headers.get('cookie') ?? '';
-    const value = header.split(';').map(part => part.trim()).find(part => part.startsWith(WORK_AUTH_COOKIE + '='))?.slice(WORK_AUTH_COOKIE.length + 1);
+    // The state names its own cookie; a state of any other shape has none.
+    const name = cookieName(stateRequest.exec(state ?? '')?.[1] ?? '') + '=';
+    const value = (request.headers.get('cookie') ?? '').split(';').map(part => part.trim()).find(part => part.startsWith(name))?.slice(name.length);
     if (!value || value.length > 4096 || !state) return null;
     const parts = value.split('.');
     if (parts.length !== 2 || !/^[\w-]+$/.test(parts[0]!) || !same(sign(parts[0]!), parts[1]!)) return null;
@@ -111,8 +116,6 @@ export const WORK_AUTH_SCRIPT = `(function(){var w=window,d=document.body.datase
 const policy = `default-src 'none'; script-src 'sha256-${createHash('sha256').update(WORK_AUTH_SCRIPT).digest('base64')}'; base-uri 'none'; form-action 'none'; `
     + `frame-ancestors ${osOrigin} ${universeOrigin}`;
 
-const stateRequest = /^ezw1\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.[\w-]{43}$/;
-
 /**
  * `echo`: with no transaction to vouch for it (a browser that kept no cookie), the request id is read back from the
  * shape of the state alone. It lets the parent stop waiting at once, and only ever beside a refusal.
@@ -122,8 +125,10 @@ function settled(outcome: WorkAuthOutcome, tx: Transaction | null, echo?: string
     // Only values this server generated or validated against fixed shapes reach the page.
     const request = tx?.request ?? (outcome === 'unavailable' ? stateRequest.exec(echo ?? '')?.[1] : undefined);
     const data = `data-outcome="${outcome}"` + (request ? ` data-request="${request}"` : '') + (tx ? ` data-attempt="${tx.attempt}"` : '');
+    // Spent: this request's own cookie only. A state that names none leaves every cookie as it was.
     return new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>EZiL OS</title></head><body ${data}><script>${WORK_AUTH_SCRIPT}</script></body></html>`,
-        { status: 200, headers: { ...closed, 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': policy, 'Set-Cookie': cookie('', 0) } });
+        { status: 200, headers: { ...closed, 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': policy,
+            ...(request ? { 'Set-Cookie': cookie(request, '', 0) } : {}) } });
 }
 
 /** The callback's answer for this flow. Never throws, never redirects. */
