@@ -631,6 +631,31 @@ class ProductionEditorEnvironmentTests(unittest.TestCase):
         disabled = {**self.base, **{k: "disabled" for k in (*renderer.EDITOR_SWITCHES, renderer.ONBOARDING_GATE)}}
         self.assertEqual(renderer.validate(disabled, "production"), disabled)
 
+    def test_browser_relay_defaults_and_independent_switches_preserve_other_pilots(self):
+        for switch in renderer.BROWSER_RELAY_SWITCHES:
+            disabled = {**self.base, switch: "disabled"}
+            self.assertEqual(renderer.validate(disabled, "production"), disabled)
+            enabled = {**self.base, **delegation(EZIL_DELEGATION_ISSUER="https://connect.ezil.work",
+                       EZIL_DELEGATION_AUDIENCE="https://os.ezil.work"), switch: "enabled",
+                       "CLOUDFLARE_GUACAMOLE_WORKER_URL": "https://api-desktop.ezil.org",
+                       "CLOUDFLARE_GUACAMOLE_HMAC_SECRET": "synthetic-worker-secret"}
+            self.assertEqual(renderer.validate(enabled, "production"), enabled)
+            with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+                renderer.render(enabled, Path(tmp), "production")
+                rendered = dict(line.split("=", 1) for line in (Path(tmp) / "app.env").read_text().splitlines())
+                self.assertEqual(rendered, enabled)
+                self.assertNotIn(renderer.PRODUCTION_BROWSER_GATE, rendered)
+                self.assertNotIn(renderer.EDITOR_SWITCHES[0], rendered)
+            for key in (*renderer.DELEGATION_PINS, "CLOUDFLARE_GUACAMOLE_HMAC_SECRET"):
+                with self.subTest(missing=key), self.assertRaises(renderer.RenderError):
+                    renderer.validate({k: v for k, v in enabled.items() if k != key}, "production")
+            for key, value in [(switch, "true"), (renderer.DELEGATION_GATE, "disabled"),
+                               ("EZIL_DELEGATION_ISSUER", "https://connect-staging.ezil.work"),
+                               ("EZIL_DELEGATION_AUDIENCE", "https://os-prod.ezil.work"),
+                               ("CLOUDFLARE_GUACAMOLE_WORKER_URL", "https://api-desktop-staging.ezil.work")]:
+                with self.subTest(key=key), self.assertRaises(renderer.RenderError):
+                    renderer.validate({**enabled, key: value}, "production")
+
     def test_candidate_render_preserves_exact_switches_without_printing_values(self):
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as output:
             renderer.render(self.enabled, Path(tmp), "production")

@@ -88,7 +88,8 @@ PRODUCTION_BROWSER_PINS = (
     "EZIL_BROWSER_PROD_CANARY_USER_ID", "EZIL_BROWSER_PROD_CANARY_COMPUTER_ID",
     "EZIL_BROWSER_PROD_CANARY_TEST_ORIGIN",
 )
-PRODUCTION_BROWSER = frozenset((PRODUCTION_BROWSER_GATE, *PRODUCTION_BROWSER_PINS))
+BROWSER_RELAY_SWITCHES = ("EZIL_DELEGATED_BROWSER_OBSERVE", "EZIL_DELEGATED_BROWSER_CONTROL")
+PRODUCTION_BROWSER = frozenset((PRODUCTION_BROWSER_GATE, *PRODUCTION_BROWSER_PINS, *BROWSER_RELAY_SWITCHES))
 PRODUCTION_BROWSER_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 NATIVE_SWITCHES = ("EZIL_NATIVE_SESSIONS", "EZIL_NATIVE_AUTH_INTENTS",
                    "EZIL_NATIVE_HOST_TRANSPORT", "EZIL_NATIVE_RUNTIME_CONTROL")
@@ -268,6 +269,20 @@ def validate_production_editor(values):
 
 
 def validate_production_browser(values):
+    # The source-bound relay remains off by default. These independent switches
+    # only render configuration; producer/target admission still needs its own proof.
+    relay = tuple(values.get(name) for name in BROWSER_RELAY_SWITCHES)
+    if any(value not in (None, "enabled", "disabled") for value in relay):
+        raise RenderError("Browser relay switches must be exactly enabled or disabled")
+    if "enabled" in relay and (
+        values.get(DELEGATION_GATE) != "enabled"
+        or any(pin not in values for pin in DELEGATION_PINS)
+        or values.get("EZIL_DELEGATION_ISSUER") != "https://connect.ezil.work"
+        or values.get("EZIL_DELEGATION_AUDIENCE") != "https://os.ezil.work"
+        or values.get("CLOUDFLARE_GUACAMOLE_WORKER_URL") != "https://api-desktop.ezil.org"
+        or not values.get("CLOUDFLARE_GUACAMOLE_HMAC_SECRET")
+    ):
+        raise RenderError("Browser relay requires canonical authenticated production delegation and Worker pins")
     gate = values.get(PRODUCTION_BROWSER_GATE)
     if gate not in (None, "enabled", "disabled"):
         raise RenderError("Production Browser canary gate must be exactly enabled or disabled")
