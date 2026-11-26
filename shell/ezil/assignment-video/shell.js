@@ -255,14 +255,43 @@ export function stageDiagnostics(attemptId, {subtle=globalThis.crypto?.subtle, l
  * state the person must act on (sign in, unavailable, another computer, sharing or time paused, closed), or a parent
  * that never answers.
  *
+ * DOCUMENT SCOPE: this gate belongs to the OS document, not to the Code window that first opened it. Closing that
+ * window (its native X) only detaches the window's own hooks (`detach`): the port, the capture, its receipt, the
+ * assignment's clock, the media window and the accepted media stay as they are, and nothing is said on the window or
+ * the port. The next Code window of this same person, computer and Universe frame takes the gate back (`attach`,
+ * through `openWithAssignmentConsent`; a projectless dock launch finds its repository in `assignedProject`). Its editor
+ * is a fresh mint that names the ORIGINAL receipt and capture as phase `reopen` (`access`; no `prepare`, no `begin`, no
+ * new receipt), parked until that window reports the verified folder (and the mounted workbench under a managed
+ * preparation). Universe hears no second `editor-ready` and the port no second `editor-usable`. `begin` or `unlock`
+ * arriving while no Code window is open asks the document for one (`summon`). Stop, a server pause, `pagehide`, a lost
+ * owner, a refusal and any other Code launch in this document still end the phase exactly as before.
+ *
  * PAUSE / RE-SHARE: a server pause (`clock`) covers the editor, ends the live capture phase at the pause's own time
  * (`pause {reason:'paused', effectiveAt}`; the parent seals and ends it, or the heartbeat watch does) and refuses a new
  * `begin` (`assignment_paused`) until the clock runs again, when the port says `ready` once more. The port, the
  * eligibility and the clock outlive every share: stopping, a pause or a failure never needs a new document.
  */
-function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body, park, prepare, computerInfo, wake, transport, win, host, clockLiveMs, clockIdleMs,
-    watchMs=EMBED_WATCH_MS, silentMs=EMBED_SILENT_MS}) {
-    const owner=actor(), ui=buildGate(body), name=repo.split('/').at(-1).slice(0,-4);
+function openEmbeddedAssignment({attemptId, repo, computerId, actor, transport, win, host, clockLiveMs, clockIdleMs,
+    watchMs=EMBED_WATCH_MS, silentMs=EMBED_SILENT_MS, ...hooks}) {
+    const owner=actor(), name=repo.split('/').at(-1).slice(0,-4);
+    // `surface`: the open Code window's own hooks (`body`, `park`, `open`, `prepare`), null while that window is closed.
+    // `shown`: the message the gate last locked with (`offered`: its one button), drawn again in the next window; null
+    // while it only prepares.
+    let surface=hooks, ui=buildGate(hooks.body), shown=null, offered=null;
+    // What outlives a window: its computer's own check, its wake, and the document's own way to open Code.
+    const kept={computerInfo:hooks.computerInfo,wake:hooks.wake,summon:hooks.summon};
+    const waiters=new Set();
+    const park=(...args)=>surface?.park(...args);
+    const summon=()=>{try{kept.summon?.();}catch{/* the dock still opens it */}};
+    /** The open Code window's hooks: at once, or when the document's next Code window attaches (asked for here). */
+    function codeWindow(signal){
+        if(surface)return Promise.resolve(surface);
+        return new Promise((resolve,reject)=>{
+            waiters.add(resolve);
+            signal?.addEventListener('abort',()=>{waiters.delete(resolve);reject(failure('cancelled'));},{once:true});
+            summon();
+        });
+    }
     // The server's clock for this assignment. Universe draws it; here it only gates capture and the editor.
     const countdown=createCountdown();
     let state='preparing', locked=true, armed=false, eligible=false, closing=false, closePromise, port=null, challenge=null;
@@ -275,10 +304,11 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
     const check=item=>{if(!live(item))throw failure('recording_phase_changed');};
     const send=(type,fields={})=>{try{port?.postMessage({protocol:WORK_PROTOCOL,attemptId,type,...fields});}catch{/* closed by the parent */}};
     const reply=respondToWorkDiscover(attemptId,win,()=>state,arm);
-    function cover(loading){locked=true;park(true,loading);ui.clear();}
-    function lock(title,message){cover(false);ui.set(title,message);}
+    function cover(loading){locked=true;offered=null;park(true,loading);ui.clear();}
+    function lock(title,message){shown=[title,message];cover(false);ui.set(title,message);}
+    function offer(label,fn){offered=[label,fn];ui.action(label,fn);}
     // Preparing: the Code window's own loader stays the one surface; this gate draws nothing over it.
-    function prep(){cover(true);ui.reveal();}
+    function prep(){shown=null;cover(true);ui.reveal();}
     function setState(next,announce=true){if(state===next)return;state=next;if(announce)reply.push();}
     // `announce`: false only inside a discover, whose own reply follows and carries the new state.
     function settle(next,title,message,announce=true){
@@ -351,13 +381,13 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
             await refreshClock();scheduleClock();
             if(!isHere())return;
             if(win.location.origin==='https://os.ezil.work'){
-                const info=await Promise.resolve(computerInfo?.()).catch(()=>null);
+                const info=await Promise.resolve(kept.computerInfo?.()).catch(()=>null);
                 if(!isHere())return;
                 const refusal=computerRefusal(result,info,true);
                 if(refusal){
                     // Not a refusal of the attempt: the frame says what to do, and the same check runs again on request.
                     lock(...COMPUTER_REFUSAL[refusal]);
-                    ui.action('Check this computer again',()=>{if(isHere() && !eligible && !terminal())void eligibility();});
+                    offer('Check this computer again',()=>{if(isHere() && !eligible && !terminal())void eligibility();});
                     return;
                 }
             }
@@ -367,7 +397,7 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
             managed=result.editorReadySupported===true;
             // The ordinary wake of this person's own computer, once, so a cold start overlaps the brief and the picker.
             // It opens no editor and no checkout; every compute and billing rule is the wake's own.
-            if(!woken){woken=true;try{wake?.();}catch{/* the checkout's own wake still runs */}}
+            if(!woken){woken=true;try{kept.wake?.();}catch{/* the checkout's own wake still runs */}}
             if(held)lock(...EMBED_HELD);
             else{prep();if(port)send('ready');}
         }catch(error){if(!closing && current===gate){note('prepare.refused',error);failed(error);}}
@@ -420,7 +450,16 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
         const item=active={id:d.captureSessionId,expected:0,ctl:new AbortController(),startedAt:Date.now(),stage:'prepare'};
         startIdleWatch();scheduleClock();prep();note('prepare.start');
         try{
-            const result=await retry(()=>prepare(attemptId,{signal:item.ctl.signal}),['sandbox_starting','media_unavailable','assignment_open_unavailable'],3,
+            // The checkout is prepared through the open Code window. One closed under it is not a refusal: the same
+            // preparation runs again through the document's next Code window, while this phase is still live.
+            const prepareHere=async()=>{
+                for(;;){
+                    const at=await codeWindow(item.ctl.signal);
+                    try{return await at.prepare(attemptId,{signal:item.ctl.signal});}
+                    catch(error){if(surface===at || !live(item) || item.ctl.signal.aborted)throw error;}
+                }
+            };
+            const result=await retry(prepareHere,['sandbox_starting','media_unavailable','assignment_open_unavailable'],3,
                 ()=>live(item) && !item.ctl.signal.aborted);
             check(item);
             const sealed=result?.assignmentOpen, meta=result?.repository;
@@ -548,10 +587,13 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
             },['seed_not_confirmed','media_unavailable'],3,()=>live(item));
             check(item);
             item.stage='open';item.allowMint=true;
-            const editor=new Promise((resolve,reject)=>{item.editor={resolve,reject};});
-            const timer=setTimeout(()=>item.editor?.reject(failure('assigned_checkout_unverified')),80000);
+            let pending;
+            const editor=new Promise((resolve,reject)=>{item.editor=pending={resolve,reject};});
+            const timer=setTimeout(()=>pending.reject(failure('assigned_checkout_unverified')),80000);
             let clock;
-            try{open();clock=await editor;}finally{clearTimeout(timer);item.editor=null;}
+            // No Code window open: the document is asked for one, and `attach` opens the editor in it.
+            try{if(surface)surface.open();else summon();clock=await editor;}
+            finally{clearTimeout(timer);if(item.editor===pending)item.editor=null;}
             check(item);
             // The seed's start stays the media anchor. Under a managed preparation the work clock has just started and
             // the broker may have moved the media cutoff, so its latest valid statement for this capture is preferred.
@@ -648,35 +690,89 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
      */
     async function editorReady(item,frame){
         const pending=item.editor;
-        if(item.readying===pending)return;
-        item.readying=pending;
-        const here=()=>live(item) && item.editor===pending && item.allowMint && frame.isConnected;
+        if(pending.readying===frame)return;
+        pending.readying=frame;
+        const waiting=()=>live(item) && item.editor===pending && item.allowMint;
+        const here=()=>waiting() && pending.readying===frame && frame.isConnected;
         try{
-            const clock=await retry(()=>item.transport.editorReady(),EDITOR_READY_TRANSIENT,EDITOR_READY_TRIES,here);
-            if(!here())return;
-            note('editor_ready.reported');
-            if(typeof clock.startedAt!=='string' || !originalStart(clock))throw failure('assignment_clock_changed');
-            applyClock(clock);
+            // Asked once per capture, whichever Code window's editor reports first: a window closed while Universe
+            // answers leaves the answer here, and the next window's editor is released on it without asking again.
+            item.asked??=retry(()=>item.transport.editorReady(),EDITOR_READY_TRANSIENT,EDITOR_READY_TRIES,()=>live(item) && item.allowMint)
+                .then(clock=>{
+                    if(!(live(item) && item.allowMint))throw failure('cancelled');
+                    note('editor_ready.reported');
+                    if(typeof clock.startedAt!=='string' || !originalStart(clock))throw failure('assignment_clock_changed');
+                    applyClock(clock);
+                    return clock;
+                });
+            const clock=await item.asked;
             if(!here())return;
             if(held || countdown.state()==='paused')throw failure('assignment_paused');
             locked=false;park(false,false);ui.reveal();
+            // Universe and the port hear of this capture's editor once: a reopened Code window only shows it again.
+            if(item.released){pending.resolve();return;}
             note('editor.usable');
             const deadlineAt=isoTime(clock.deadlineAt), serverNow=isoTime(clock.serverNow);
             send('editor-usable',{captureSessionId:item.id,...(deadlineAt?{deadlineAt}:{}),...(serverNow?{serverNow}:{})});
+            item.released=true;
             pending.resolve({startedAt:clock.startedAt,deadlineAt:isoOrNull(clock.deadlineAt),serverNow:isoOrNull(clock.serverNow),
                 pausedAt:null,remainingMs:Number.isFinite(clock.remainingMs)?clock.remainingMs:null,revision:clock.revision});
             setState('ready');
         }catch(error){
-            if(!here())return;
+            if(!waiting())return;
             note('editor_ready.refused',error);
             pending.reject(error?.code?error:failure('editor_ready_failed'));
-        }finally{if(item.readying===pending)item.readying=null;}
+        }finally{if(pending.readying===frame)pending.readying=null;}
     }
-    /** Code's open-phase mint failed (`apps/code.js`): end the wait for the editor now, with the real cause. */
+    /**
+     * Code's open-phase mint failed (`apps/code.js`): end the wait for the editor now, with the real cause. A Code
+     * window reopened under a released capture is not that wait: its failed mint stays the window's own retry, and the
+     * capture goes on.
+     */
     function failOpen(res){
-        const item=active;if(!item?.editor)return;
+        const item=active;if(!item?.editor || item.editor.again)return;
         item.editor.reject(Object.assign(failure(res?.errorCode||'unknown'),{reason:res?.reason,correlationId:res?.correlationId}));
     }
+    /**
+     * The editor of a Code window opened again under this live, already released capture. Its mint is a `reopen` of
+     * the same receipt and capture (`access`), and it stays parked under the window's loader until `confirm` verifies
+     * its folder (and its mounted workbench under a managed preparation). There is no timer: the capture is the tab's,
+     * not the window's. A wrong folder ends the phase as a lost workspace does.
+     */
+    function reopenEditor(item){
+        const pending={again:true};
+        void new Promise((resolve,reject)=>Object.assign(pending,{resolve,reject})).catch(()=>{
+            if(active!==item || item.ending || item.shareEnded)return;
+            suspend(item);send('pause',{reason:'connection_lost',effectiveAt:null});void end(item,'connection_lost',item.expected);
+        }).finally(()=>{if(item.editor===pending)item.editor=null;});
+        item.editor=pending;
+    }
+    /** The Code window closed (its native X), and only that: nothing ends, nothing is sent, nothing is reset. */
+    function detach(){
+        if(closing || !surface)return;
+        surface=null;locked=true;ui.remove();
+        const pending=active?.editor;
+        if(pending?.again){active.editor=null;pending.resolve();}
+    }
+    /** This document's next Code window for the same assignment: the gate's screen, and its editor where one is due. */
+    function attach(next){
+        surface=next;ui=buildGate(next.body);
+        Object.assign(kept,{computerInfo:next.computerInfo,wake:next.wake,summon:next.summon});
+        const item=active;
+        if(shown){const action=offered;lock(...shown);if(action)offer(...action);}
+        else{
+            prep();
+            if(item?.allowMint && live(item)){
+                if(!item.editor && item.released)reopenEditor(item);
+                // After this call returns: the window's own `open` reads the gate it is handed here.
+                if(item.editor)queueMicrotask(()=>{if(surface===next && active===item && item.editor && live(item))next.open();});
+            }
+        }
+        for(const resolve of [...waiters]){waiters.delete(resolve);resolve(next);}
+    }
+    // This same document, person and computer, still framed by its paired Universe work page for this attempt.
+    const holds=(inWin,computer,who)=>!closing && current===gate && inWin===win && computer===computerId && owned() && who===owner
+        && embeddedWorkHost(win)===host && assignmentIntent(assignmentEntry(win),repo)===attemptId;
     function close(){
         if(closePromise)return closePromise;
         closing=true;reply.dispose();clearInterval(watch);clearTimeout(clockTimer);clearTimeout(silent);
@@ -702,8 +798,11 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, open, body,
     function pageHide(){if(active?.grant)active.transport.checkpointOnExit('connection_lost');void close();}
     // `requiresWorkbench`: Universe signed a managed preparation, so the Code window asks its editor for the mounted
     // workbench and reports it through `confirm(…, true)`. Only this gate has it; without the flag nothing is asked.
-    const gate={repo,locked:()=>locked,confirm,close,fail:failOpen,requiresWorkbench:()=>managed,
-        access:()=>active?.allowMint && live(active) ? {attemptId,phase:'open',repoOpenProof:active.proof,captureSessionId:active.id} : null};
+    const gate={repo,locked:()=>locked,confirm,close,fail:failOpen,requiresWorkbench:()=>managed,detach,attach,holds,windowless:()=>!closing && !surface,
+        // `open` until this capture's editor is first released; every mint after that (the Code window opened again, at
+        // any age of the capture) is `reopen`, with the ORIGINAL receipt and capture. No new checkout is prepared for it.
+        access:()=>active?.allowMint && live(active)
+            ? {attemptId,phase:active.released?'reopen':'open',repoOpenProof:active.proof,captureSessionId:active.id} : null};
     current=gate;
     prep();
     // Said only once the parent has really been silent, never as the first screen of a page that is about to answer.
@@ -727,10 +826,29 @@ export function embeddedAssignmentWindow(project, win=globalThis.window) {
     catch{return false;}
 }
 
-export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare, computerInfo, wake, transport, settleMs=STOP_SETTLE_MS,
+/** The embedded assignment this document holds with no Code window, only for this same window, computer and owner. */
+function heldAssignment(win,computerId,actor) {
+    try{return current?.windowless?.() && current.holds(win,computerId,actor?.()) ? current : null;}catch{return null;}
+}
+/**
+ * The repository a Code launch that names none opens in this document: the one assignment its Universe work page
+ * framed here, while this document still holds it for this person and computer. The dock and the launcher carry no
+ * project, so a Code window closed under an assignment comes back on that assignment, never on the person's own files.
+ */
+export function assignedProject({computerId, actor, win=globalThis.window}={}) {
+    const gate=heldAssignment(win,computerId,actor);
+    return gate ? {repoUrl:gate.repo} : null;
+}
+
+export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare, computerInfo, wake, summon, transport, settleMs=STOP_SETTLE_MS,
     saveCeilingMs=STOP_SAVE_CEILING_MS, frameMs=FRESH_FRAME_MS, clockLiveMs=CLOCK_LIVE_MS, clockIdleMs=CLOCK_IDLE_MS, reconnectMs=RECONNECT_OFFER_MS,
     embedWatchMs=EMBED_WATCH_MS, embedSilentMs=EMBED_SILENT_MS}) {
     const win=globalThis.window, repo=project?.repoUrl;
+    // An assignment this document holds with no Code window: this launch takes it back when it is for that repository,
+    // person and computer. Any other Code launch ends its phase, as relaunching its window for another project did.
+    const windowless=current?.windowless?.() ? current : null;
+    const mine=repo && heldAssignment(win,computerId,actor)?.repo===repo ? windowless : null;
+    if(windowless && !mine)void windowless.close();
     if(!win || !assignmentOsOrigin(win.location.origin)){queueMicrotask(open);return null;}
     const address=new URL(win.location.href);
     const entry=assignmentEntry(win);
@@ -739,7 +857,8 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     if(!canonical.test(repo) && !explicit){queueMicrotask(open);return null;}
     // Framed by its own paired Universe workspace: a separate gate that waits for that exact parent and never uses the picker.
     const host=attemptId?embeddedWorkHost(win):null;
-    if(host)return openEmbeddedAssignment({attemptId,repo,computerId,actor,open,body,park,prepare,computerInfo,wake,transport,win,host,clockLiveMs,clockIdleMs,
+    if(host && mine){mine.attach({open,body,park,prepare,computerInfo,wake,summon});return mine;}
+    if(host)return openEmbeddedAssignment({attemptId,repo,computerId,actor,open,body,park,prepare,computerInfo,wake,summon,transport,win,host,clockLiveMs,clockIdleMs,
         watchMs:embedWatchMs,silentMs:embedSilentMs});
 
     const owner=actor(), ui=buildGate(body);
