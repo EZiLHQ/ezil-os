@@ -70,3 +70,26 @@ test('version four provisional phase has no countdown, checkpoints without final
         assert.deepEqual(calls.map(c=>c.action),['preflight','begin','status','checkpoint']);
     }finally{t.dispose();}
 });
+test('a begin whose phase stopped during its preflight sends no begin; one already sent is always read',async()=>{
+  const stopped=new AbortController();
+  const before=fixture();
+  stopped.abort();
+  await assert.rejects(before.t.begin({signal:stopped.signal}),{code:'cancelled'});
+  assert.deepEqual(before.calls.map(x=>x.kind),['preflight']);
+  await assert.rejects(before.t.checkpoint('connection_lost'),{code:'recording_unavailable'});
+  before.t.dispose();
+  // Stopped only after the begin left: its grant is still returned to the caller that must close it.
+  const during=new AbortController(),session='00000000-0000-4000-8000-000000000003',calls=[];
+  const t=createAssignmentVideoTransport({attemptId,repoOpenProof:'p'.repeat(100),consentVersion:4,captureSessionId:session,onStop(){},fetcher:async(_path,options)=>{
+    const body=JSON.parse(options.body);calls.push(body.action);
+    if(body.action==='preflight')return Response.json({status:'eligible',attemptId,expiresAt:new Date(Date.now()+60000).toISOString()});
+    if(body.action==='begin')during.abort();
+    return Response.json({recordingId,captureSessionId:session,status:body.action==='begin'?'awaiting_frame':'paused',nextSequence:0,
+      authorizationExpiresAt:new Date(Date.now()+60000).toISOString()});
+  }});
+  try{
+    assert.equal((await t.begin({signal:during.signal})).status,'awaiting_frame');
+    await t.checkpoint('connection_lost');
+    assert.deepEqual(calls,['preflight','begin','checkpoint']);
+  }finally{t.dispose();}
+});

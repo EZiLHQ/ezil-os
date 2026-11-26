@@ -481,22 +481,47 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, transport, 
                     if(!item.shareEnded)suspend(item);
                     send('pause',{reason:why==='submitted'||why==='timeout'?why:'connection_lost',effectiveAt:at??null});
                 }});
-            item.grant=await retry(()=>item.transport.begin(),['media_unavailable'],2,()=>live(item));
+            // `granting`: the signed begin while it is in flight. A phase ended under it answers this call at once
+            // (`quit`) and leaves that request, and its transport, to `retire`. `signal`: a stop that lands before the
+            // request is sent sends none.
+            const granting=item.granting=retry(()=>item.transport.begin({signal:item.ctl.signal}),['media_unavailable'],2,()=>live(item));
+            const grant=await Promise.race([granting,new Promise((_,reject)=>{item.quit=reject;})]).finally(()=>{item.granting=item.quit=null;});
+            // A suspended phase still needs its own verified grant for cleanup.
+            if(granted(item,grant))item.grant=grant;
             check(item);
-            if(item.grant.captureSessionId!==item.id || item.grant.status!=='awaiting_frame' || !Number.isSafeInteger(item.grant.nextSequence))
-                throw failure('recording_phase_changed');
-            item.expected=item.grant.nextSequence;item.stage='seed';
+            if(!item.grant)throw failure('recording_phase_changed');
+            item.expected=grant.nextSequence;item.stage='seed';
             note('prepare.ready');
             return {captureSessionId:item.id,status:item.grant.status,nextSequence:item.grant.nextSequence};
         }catch(error){
             note('prepare.refused',error);
-            if(identityCodes.includes(error?.code))failed(error);
-            else{
-                await end(item,'connection_lost',item.expected).catch(()=>{});
-                if(isHere() && !terminal() && !active)lock(held?EMBED_HELD[0]:EMBED_PAUSED[0],held?EMBED_HELD[1]:embedMessage(error?.code||error?.message));
+            // Responses from retired phases can only answer the old request.
+            if(active===item && !item.ending){
+                if(identityCodes.includes(error?.code))failed(error);
+                else{
+                    await end(item,'connection_lost',item.expected).catch(()=>{});
+                    if(isHere() && !terminal() && !active)lock(held?EMBED_HELD[0]:EMBED_PAUSED[0],held?EMBED_HELD[1]:embedMessage(error?.code||error?.message));
+                }
             }
             throw error;
         }
+    }
+    /** The grant this document accepts for a phase: its own capture, awaiting the first frame, at a real sequence. */
+    const granted=(item,grant)=>grant?.captureSessionId===item.id && grant.status==='awaiting_frame' && Number.isSafeInteger(grant.nextSequence);
+    /**
+     * A phase ended while its signed begin was still in flight (Stop, a lost parent or owner, the window or page
+     * closing). The phase is released and its `begin` call refused at once; its transport, bound to that attempt,
+     * proof and capture, is kept apart until that one request settles. Only a grant it then returns for that same
+     * capture is checkpointed as an interrupted phase. A retry targets the same capture. A refusal, a missing
+     * response, or another capture or status cannot change the current gate or authorize a checkpoint.
+     */
+    function retire(item){
+        const {transport,granting,quit}=item;item.granting=null;
+        quit(failure('recording_phase_changed'));
+        void granting.then(grant=>granted(item,grant)
+            ? retry(()=>transport.checkpoint('connection_lost'),['media_unavailable']) : null)
+            .catch(()=>{})
+            .finally(()=>transport.dispose());
     }
     const digestOf=async bytes=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),n=>n.toString(16).padStart(2,'0')).join('');
     async function upload(d){
@@ -624,7 +649,8 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, transport, 
                 }
                 return {};
             }finally{
-                item.transport?.dispose();if(active===item)active=null;drained?.();
+                if(item.granting)retire(item);else item.transport?.dispose();
+                if(active===item)active=null;drained?.();
                 if((reason==='submitted' || reason==='timeout') && !closing){
                     over=true;clearTimeout(clockTimer);
                     lock('Assignment closed',reason==='submitted'?'Assignment submitted. Recording ended.':'The assignment time has ended.');setState('unavailable');
@@ -648,8 +674,16 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, transport, 
         const d=event.data;
         if(d?.protocol!==WORK_PROTOCOL || d.attemptId!==attemptId)return;
         if(d.type==='pulse'){if(active && active.id===d.captureSessionId)pulseAt=Date.now();return;}
-        if(d.type==='lock'){if(active && active.id===d.captureSessionId && !active.shareEnded)suspend(active);return;}
-        if(d.type==='cancel'){if(active && active.id===d.captureSessionId && !active.grant)void end(active,'connection_lost',active.expected);return;}
+        // A granted phase may still deliver its final clip, so it only locks; one with no grant yet has nothing to
+        // deliver and is released at once, as `cancel` releases it.
+        if(d.type==='lock'){
+            if(active && active.id===d.captureSessionId && !active.shareEnded){
+                if(active.grant)suspend(active);else void end(active,'connection_lost',active.expected);
+            }
+            return;
+        }
+        // The parent may have given up before receiving a valid Begin reply. Cancel its exact provisional phase.
+        if(d.type==='cancel'){if(active && active.id===d.captureSessionId && !active.seed)void end(active,'connection_lost',active.expected);return;}
         if(d.type!=='request' || !Number.isSafeInteger(d.id) || d.id<=0)return;
         const method=Object.hasOwn(methods,d.method)?methods[d.method]:null;
         const run=async()=>{
