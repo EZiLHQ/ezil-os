@@ -11,7 +11,8 @@ import type { SubscriptionRow } from '@/server/billing/meters';
 import type { BillingDeps, BillingStore, GrantRow, PaymentIssueRow } from '@/server/billing/ports';
 import { billingV2EntitlementReader, gateComputerStart, loadComputeBillingState, paidComputeUnmeteredState } from '@/server/billing/v2/compute-access';
 import { paidCloudflareCandidates } from '@/server/lib/compute/placement';
-import { readPaidPoolEligibility } from '@/server/lib/compute/ready-pool';
+import { readPaidPoolEligibility, readPoolDemand } from '@/server/lib/compute/ready-pool';
+import { aiIncludedModelsFor } from '@/server/billing/v3/ai-models';
 import { sourceCatalog, type Result } from './contract';
 import type { CommandStore } from './service';
 import { handleAdminEntitlementRequest, type Endpoint } from './http';
@@ -117,8 +118,15 @@ describe.skipIf(!MODULE)('operator reader parity on offline PostgreSQL', () => {
             CREATE TABLE public.ezil_billing_size_preferences (user_id uuid PRIMARY KEY, size text);
             CREATE TABLE public.ezil_billing_grants (id text, user_id uuid, subscription_id text, meter text, amount bigint, period_start timestamptz, period_end timestamptz);
             CREATE TABLE public.ezil_billing_payment_issues (user_id uuid, subscription_id text, invoice_kind text, resolved_at timestamptz, issue text, stripe_event_created timestamptz);
-            CREATE TABLE public.ezil_computers (id uuid PRIMARY KEY, user_id uuid, slot int DEFAULT 1, deleted_at timestamptz);
-            CREATE TABLE public.ezil_computer_placements (computer_id uuid PRIMARY KEY, provider text);
+            CREATE TABLE public.ezil_computers (id uuid PRIMARY KEY, user_id uuid, slot int DEFAULT 1, deleted_at timestamptz, metadata jsonb);
+            CREATE TABLE public.ezil_computer_placements (computer_id uuid PRIMARY KEY, provider text, owner_user_id uuid,
+                region text, zone_id text, instance_type text, state text, instance_id text, lifecycle_job_id uuid);
+            CREATE TABLE public.ezil_compute_pool_hosts (id uuid, region text, zone_id text, instance_type text, state text,
+                health text, instance_id text, ready_at timestamptz, editor_ready_at timestamptz, enrolled_at timestamptz,
+                created_at timestamptz, generation bigint, leased_computer_id uuid, leased_at timestamptz, leased_generation bigint,
+                lease_token uuid, claim_generation bigint, claim_lease_epoch bigint, claim_fence text, claim_volume_serial text);
+            CREATE TABLE public.ezil_compute_capacity_demands (region text, closed_at timestamptz, expires_at timestamptz, vcpu int, cleanup jsonb);
+            CREATE TABLE public.ezil_billing_compute_epochs (id uuid, subscription_id text, user_id uuid, computer_id uuid, size text, ready_at timestamptz);
             CREATE TABLE public.ezil_compute_migrations (computer_id uuid, user_id uuid, state text, last_error text, updated_at timestamptz);`);
         const drizzle = path.resolve(__dirname, '../../../../drizzle');
         // Production has its own 0034 history. Qualify this exact 0038 on 0019/0020, independently of 0023 and 0034–0037.
@@ -478,6 +486,87 @@ describe.skipIf(!MODULE)('operator reader parity on offline PostgreSQL', () => {
         await expectStripeStandardRestored();
         expect(await stripeSnapshot()).toEqual(before);
         expect(await rows(sql`SELECT revision, ended_at FROM public.ezil_operator_entitlements`)).toEqual([{ revision: 1, ended_at: null }]);
+    });
+
+    const demand = (instanceType: 'm6i.large' | 'm6i.2xlarge', executor: Executor = db) => readPoolDemand(executor,
+        { region: 'ap-south-1', zoneId: 'aps1-az1', instanceType }, now);
+    const durableSnapshot = async () => ({
+        ...(await stripeSnapshot()),
+        operatorGrants: await rows(sql`SELECT * FROM public.ezil_operator_entitlements ORDER BY ref`),
+        receipts: await rows(sql`SELECT * FROM public.ezil_operator_entitlement_events ORDER BY id`),
+        indexes: await rows(sql`SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public'
+            AND tablename IN ('ezil_operator_entitlements', 'ezil_operator_entitlement_events') ORDER BY indexname`),
+        constraints: await rows(sql`SELECT conname, pg_get_constraintdef(oid) AS definition FROM pg_constraint
+            WHERE conrelid = 'public.ezil_operator_entitlements'::regclass ORDER BY conname`),
+        roles: await rows(sql`SELECT relname, relacl, relrowsecurity FROM pg_class WHERE oid IN
+            ('public.ezil_operator_entitlements'::regclass, 'public.ezil_operator_entitlement_events'::regclass) ORDER BY relname`),
+    });
+
+    it.each(['free_v3', 'premium_monthly_v3'])('application rollback with active %s preserves rows, revisions, indexes and receipts; demand matches policy', async sku => {
+        await assign(); // keep an ordinary paid grant in its independent slot
+        await fundedStripeStandard();
+        const body = override({ product: { ref: sku, catalog_revision: REVISION }, validity: { until_revoked: true } });
+        const result = await send(body);
+        expect(result.outcome).toBe('applied');
+        const before = await durableSnapshot();
+        // The qualified down-plan is source replacement only. Fresh deps model the rollback process's cold reader;
+        // no SQL down migration, grant ending or row rewrites are performed.
+        resetOperatorEntitlementsInstalled();
+        const rolled = createOperatorEntitlementDeps(db, billing, () => now);
+        expect(await rolled.readAssignments(USER)).toHaveLength(2);
+        expect((await state()).summary).toMatchObject({ plan: { sku, access: { override: true } },
+            actions: { checkout: false, upgrade: false, downgrade: false } });
+        expect(await aiIncludedModelsFor(USER, () => billing)).toBeNull(); // payer's AI remains paid
+        if (sku === 'free_v3') {
+            await expectFreeEverywhere();
+            expect(await demand('m6i.large')).toMatchObject({ activeStandard: 0, activePremium: 0 });
+            expect(await demand('m6i.2xlarge')).toMatchObject({ activeStandard: 0, activePremium: 0 });
+        } else {
+            expect(await reader()).toMatchObject({ planId: sku, status: 'active' });
+            expect(await pool()).toEqual({ instanceType: 'm6i.2xlarge' });
+            expect(await migration()).toEqual([{ userId: USER, computerId: COMPUTER, toSize: 'premium' }]);
+            expect(await demand('m6i.large')).toMatchObject({ activeStandard: 0, activePremium: 0 });
+            expect(await demand('m6i.2xlarge')).toMatchObject({ activeStandard: 0, activePremium: 1 });
+            expect(await gateComputerStart({ deps: billing, userId: USER, computerId: COMPUTER, kind: 'aws-ec2', instanceType: 'm6i.2xlarge', now }))
+                .toEqual({ allowed: true });
+        }
+        expect(await send(body)).toEqual({ ...result, outcome: 'replayed' });
+        expect(await durableSnapshot()).toEqual(before);
+        now = new Date('2027-01-01T00:00:00Z'); // until-revoked semantics survive well beyond ordinary/Stripe expiry
+        expect((await state()).planSku).toBe(sku);
+        expect(await durableSnapshot()).toEqual(before);
+    });
+
+    it.each(['42501', '42P01', '57014'])('unknown assignment read (%s) holds admission/AI and never falls back to funded Stripe', async code => {
+        await fundedStripeStandard(); await send(override());
+        const before = await durableSnapshot();
+        const broken: Executor = { execute: query => {
+            if (dialect.sqlToQuery(query).sql.startsWith('SELECT ref, revision')) {
+                return Promise.reject(Object.assign(new Error('synthetic assignment read failure'), { code }));
+            }
+            return db.execute(query); // a 42P01 on a dependency cannot masquerade as an absent operator table
+        } };
+        const deps = { ...billing, store: { ...store, operatorEntitlementsFor: (id: string) => readOperatorEntitlements(broken, id) } };
+        await expect(loadComputeBillingState(deps, USER, now)).rejects.toThrow('synthetic assignment read failure');
+        expect(await gateComputerStart({ deps, userId: USER, computerId: COMPUTER, kind: 'aws-ec2', instanceType: 'm6i.large', now }))
+            .toEqual({ allowed: false, reason: 'billing_unavailable' });
+        expect(await aiIncludedModelsFor(USER, () => deps)).toBeUndefined();
+        expect(await durableSnapshot()).toEqual(before);
+    });
+
+    it('cold table-probe failure holds all SQL consumers with an active Free override and leaves all data untouched', async () => {
+        await fundedStripeStandard(); await send(override());
+        const before = await durableSnapshot();
+        const broken: Executor = { execute: query => {
+            if (dialect.sqlToQuery(query).sql.includes("to_regclass('public.ezil_operator_entitlements')")) {
+                throw new Error('synthetic table probe unavailable');
+            }
+            return db.execute(query);
+        } };
+        await expect(readPaidPoolEligibility(broken, USER, now)).rejects.toThrow('synthetic table probe unavailable');
+        await expect(paidCloudflareCandidates(broken, now)).rejects.toThrow('synthetic table probe unavailable');
+        await expect(demand('m6i.large', broken)).rejects.toThrow('synthetic table probe unavailable');
+        expect(await durableSnapshot()).toEqual(before);
     });
 
 });

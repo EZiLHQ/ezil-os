@@ -3,7 +3,7 @@
  * Each test rolls back its transaction, using the exact 0019/0038 migrations and synthetic identities. Each scenario
  * is checked against TypeScript precedence. Set EZIL_PGLITE_MODULE to an installed PGlite ESM entry; no DB URL or env file.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { sql, type SQL } from 'drizzle-orm';
@@ -13,7 +13,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { SubscriptionRow } from '../meters';
 import { planFromSubscriptions } from './catalog';
 import type { AccessRow } from './effective-access';
-import { accessOverrideInstalled, paidComputeAccessCtes, resetAccessOverrideInstalled } from './paid-compute-access-sql';
+import { paidComputeAccessCtes, paidComputeBranches } from './paid-compute-access-sql';
+import { paidComputeAccessCtes as baselineCtes } from './live86a6-paid-compute-access-sql.test-support';
+import { readOperatorEntitlements } from '@/server/entitlements/operator/store';
+import { operatorOverridesInstalled } from '@/server/entitlements/operator/installed';
 import { deriveStanding, operatorAccessFor, paidAccess } from './standing';
 
 const modulePath = process.env.EZIL_PGLITE_MODULE;
@@ -100,8 +103,8 @@ describe.skipIf(!modulePath)('paid-compute SQL: explicit access overrides (in-me
         const plan = planFromSubscriptions({ subs: a.subs, now: at, userCreatedAt: null, operator });
         return paidAccess(standing) && (plan.sku === 'standard_monthly_v3' || plan.sku === 'premium_monthly_v3') ? plan.sku : null;
     }
-    async function sqlEligible(tx: Tx, userId: string, override: boolean) {
-        return rowsOf(await tx.execute(sql`WITH ${paidComputeAccessCtes(at.toISOString(), { operator: true, override }, userId)}
+    async function sqlEligible(tx: Tx, userId: string) {
+        return rowsOf(await tx.execute(sql`WITH ${paidComputeAccessCtes(at.toISOString(), await paidComputeBranches(tx), userId)}
             SELECT sku, instance_type FROM eligible`));
     }
     async function installOverrideSchema(tx: Tx) {
@@ -110,17 +113,41 @@ describe.skipIf(!modulePath)('paid-compute SQL: explicit access overrides (in-me
         await tx.execute(sql.raw(readFileSync(path.resolve(__dirname, '../../../../drizzle/0038_operator_access_overrides.sql'), 'utf8')));
     }
 
-    it('the column probe is "no" without the source lane column and "yes" with it', async () => {
+    it('verified absence, pre-0038 and installation in one process use fresh availability and compatible reads', async () => {
         await rolledBack(async tx => {
-            const migration = readFileSync(path.resolve(__dirname, '../../../../drizzle/0019_operator_entitlements.sql'), 'utf8');
-            await tx.execute(sql.raw(migration));
-            await tx.execute(sql.raw('ALTER TABLE public.ezil_operator_entitlements DROP COLUMN IF EXISTS access_override'));
-            resetAccessOverrideInstalled();
-            expect(await accessOverrideInstalled(tx, 0)).toBe(false);
-            resetAccessOverrideInstalled();
-            await tx.execute(sql.raw('ALTER TABLE public.ezil_operator_entitlements ADD COLUMN access_override boolean NOT NULL DEFAULT false'));
-            expect(await accessOverrideInstalled(tx, 0)).toBe(true);
-            resetAccessOverrideInstalled();
+            expect(await paidComputeBranches(tx)).toEqual({ operator: false });
+            const payer = await account(tx, 'pre_table', { stripe: 'standard_monthly_v3' });
+            expect(await sqlEligible(tx, payer.id)).toEqual([{ sku: 'standard_monthly_v3', instance_type: 'm6i.large' }]);
+            await tx.execute(sql.raw(readFileSync(path.resolve(__dirname, '../../../../drizzle/0019_operator_entitlements.sql'), 'utf8')));
+            expect(await paidComputeBranches(tx)).toEqual({ operator: true });
+            expect(await operatorOverridesInstalled(tx)).toBe(false);
+            expect(await readOperatorEntitlements(tx, payer.id)).toEqual([]);
+            await tx.execute(sql`INSERT INTO public.ezil_operator_entitlements (ref, user_id, account_public_id, sku, revision, starts_at)
+                VALUES (${`osg-${randomUUID()}`}, ${payer.id}::uuid, ${randomUUID()}::uuid, 'premium_monthly_v3', 1, ${period[0].toISOString()}::timestamptz)`);
+            expect(await sqlEligible(tx, payer.id)).toEqual([{ sku: 'standard_monthly_v3', instance_type: 'm6i.large' }]);
+            await tx.execute(sql`UPDATE public.ezil_billing_subscriptions SET status = 'canceled' WHERE user_id = ${payer.id}::uuid`);
+            expect(await sqlEligible(tx, payer.id)).toEqual([{ sku: 'premium_monthly_v3', instance_type: 'm6i.large' }]);
+            await tx.execute(sql.raw(readFileSync(path.resolve(__dirname, '../../../../drizzle/0038_operator_access_overrides.sql'), 'utf8')));
+            expect(await operatorOverridesInstalled(tx)).toBe(true);
+            await tx.execute(sql`INSERT INTO public.ezil_operator_entitlements (ref, user_id, account_public_id, sku, revision, starts_at, access_override)
+                VALUES (${`osg-${randomUUID()}`}, ${payer.id}::uuid, ${randomUUID()}::uuid, 'free_v3', 1, ${period[0].toISOString()}::timestamptz, true)`);
+            expect(await sqlEligible(tx, payer.id)).toEqual([]);
+        });
+    });
+
+    it('partial 0038: live Free/paid overrides still decide without the capability index; no column probe is needed', async () => {
+        await rolledBack(async tx => {
+            await installOverrideSchema(tx);
+            const free = await account(tx, 'partial_free', { stripe: 'premium_monthly_v3', rows: [{ sku: 'standard_monthly_v3' }, { sku: 'free_v3', accessOverride: true }] });
+            const paid = await account(tx, 'partial_paid', { stripe: 'standard_monthly_v3', size: 'cmp-8', rows: [{ sku: 'premium_monthly_v3', accessOverride: true }] });
+            await tx.execute(sql.raw('DROP INDEX public.ezil_operator_entitlements_one_live_override'));
+            expect(await operatorOverridesInstalled(tx)).toBe(false);
+            const guarded: Tx = { execute: query => {
+                if (dialect.sqlToQuery(query).sql.includes('information_schema.columns')) throw new Error('column probe unavailable');
+                return tx.execute(query);
+            } };
+            expect(await sqlEligible(guarded, free.id)).toEqual([]);
+            expect(await sqlEligible(guarded, paid.id)).toEqual([{ sku: 'premium_monthly_v3', instance_type: 'm6i.2xlarge' }]);
         });
     });
 
@@ -146,37 +173,36 @@ describe.skipIf(!modulePath)('paid-compute SQL: explicit access overrides (in-me
             ];
             for (const [name, spec, sku, instanceType] of cases) {
                 const a = await account(tx, name, spec);
-                const rows = await sqlEligible(tx, a.id, true);
+                const rows = await sqlEligible(tx, a.id);
                 expect(tsEligible(a), `${name}: TypeScript`).toBe(sku);
                 expect(rows, `${name}: SQL`).toEqual(sku === null ? [] : [{ sku, instance_type: instanceType }]);
             }
         });
     });
 
-    it('positive control: without the override branch the same Free override over Stripe is still eligible (today\'s SQL)', async () => {
+    it('negative control: exact live86a6 source admits the Free-overridden payer; rollback source excludes it', async () => {
         await rolledBack(async tx => {
             await installOverrideSchema(tx);
-            const a = await account(tx, 'branch_off', { stripe: 'premium_monthly_v3', rows: [{ sku: 'free_v3', accessOverride: true }] });
-            expect(await sqlEligible(tx, a.id, false)).toEqual([{ sku: 'premium_monthly_v3', instance_type: 'm6i.large' }]);
-            expect(await sqlEligible(tx, a.id, true)).toEqual([]);
-            // The fleet-wide form (no user filter) agrees: the account is absent with the branch, present without it.
-            const fleet = async (override: boolean) => rowsOf(await tx.execute(sql`WITH ${paidComputeAccessCtes(at.toISOString(), { operator: true, override })}
-                SELECT user_id::text AS user_id FROM eligible WHERE user_id = ${a.id}::uuid`)).length;
-            expect(await fleet(true)).toBe(0);
-            expect(await fleet(false)).toBe(1);
+            const a = await account(tx, 'baseline', { stripe: 'premium_monthly_v3', rows: [{ sku: 'standard_monthly_v3' }, { sku: 'free_v3', accessOverride: true }] });
+            expect(rowsOf(await tx.execute(sql`WITH ${baselineCtes(at.toISOString(), true, a.id)} SELECT sku, instance_type FROM eligible`)))
+                .toEqual([{ sku: 'premium_monthly_v3', instance_type: 'm6i.large' }]);
+            expect(await sqlEligible(tx, a.id)).toEqual([]);
+            const fleet = rowsOf(await tx.execute(sql`WITH ${paidComputeAccessCtes(at.toISOString(), await paidComputeBranches(tx))}
+                SELECT user_id::text AS user_id FROM eligible`));
+            expect(fleet).toEqual([]);
         });
     });
 });
 
-describe('paid-compute SQL text without the override branch', () => {
-    it('a bare boolean and { override: false } build the same SQL, with no override reference', () => {
+describe('rollback SQL source control', () => {
+    it('pins the negative-control file byte-for-byte to the exact live parent', () => {
+        const baseline = readFileSync(path.resolve(__dirname, 'live86a6-paid-compute-access-sql.test-support.ts'));
+        expect(createHash('sha256').update(baseline).digest('hex')).toBe('38047061dcd5eff80f60077d7fc28b1ccc10f59d2234151eaa934b752678da56');
+    });
+    it('every present-table form uses compatible override reads; absent-table form never references the table', () => {
         const text = (q: SQL) => new PgDialect().sqlToQuery(q).sql;
-        const user = '00000000-0000-4000-8000-000000000001';
-        const legacy = text(paidComputeAccessCtes(at.toISOString(), true, user));
-        expect(legacy).not.toContain('override');
-        expect(text(paidComputeAccessCtes(at.toISOString(), { operator: true, override: false }, user))).toBe(legacy);
-        expect(text(paidComputeAccessCtes(at.toISOString(), { operator: true, override: true }))).toContain('access_override');
-        // The override branch needs the operator branch (no table, no column).
-        expect(text(paidComputeAccessCtes(at.toISOString(), { operator: false, override: true }))).not.toContain('override');
+        expect(text(paidComputeAccessCtes(at.toISOString(), true))).toContain("to_jsonb(o)->>'access_override'");
+        expect(text(paidComputeAccessCtes(at.toISOString(), { operator: true }))).toBe(text(paidComputeAccessCtes(at.toISOString(), true)));
+        expect(text(paidComputeAccessCtes(at.toISOString(), false))).not.toContain('ezil_operator_entitlements');
     });
 });

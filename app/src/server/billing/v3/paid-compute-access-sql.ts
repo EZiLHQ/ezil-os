@@ -4,57 +4,34 @@
  * still covers the account even when its receipt is missing/reversed. Pool planning and migration discovery share
  * these CTEs; discovery never writes a receipt or provisions a computer.
  *
- * Explicit access overrides (`override` branch, only where the source lane's `access_override` column exists): a live
- * override decides first. A Free override removes the account from `effective` (Stripe and grant alike); a Standard or
- * Premium override is the account's one `effective` row whatever Stripe or a grant says. Without the column the SQL is
- * exactly the pre-override SQL.
+ * A live override decides first: Free removes the account from `effective`; a paid override replaces Stripe/grants.
+ * Once table availability is verified, JSON column reads honor overrides even during partial 0038 installation and
+ * remain compatible with true pre-0038 rows. Column-probe failure or stale absence can never select legacy paid SQL.
  */
 import { sql, type SQL } from 'drizzle-orm';
 import { operatorBranchEnabled } from '@/server/entitlements/operator/installed';
 import { PAYMENT_GRACE_SECONDS } from './standing';
 
-/** Which operator branches the installed schema carries: 0019's table, and its `access_override` column. */
-export interface PaidComputeBranches { operator: boolean; override: boolean }
+/** Whether the operator table was verified present. No independent override switch: every table read honors it. */
+export interface PaidComputeBranches { operator: boolean }
 
-let overrideColumn: { value: boolean; at: number } | null = null;
-
-/**
- * Whether `ezil_operator_entitlements.access_override` exists (the source lane's migration; this app can deploy first).
- * Cached as `operatorEntitlementsInstalled` is: "yes" for the life of the process, "no" for a minute. A failed probe is "no".
- */
-export async function accessOverrideInstalled(db: { execute(query: SQL): Promise<unknown> }, now = Date.now()): Promise<boolean> {
-    if (overrideColumn && (overrideColumn.value || now - overrideColumn.at < 60_000)) return overrideColumn.value;
-    try {
-        const result = await db.execute(sql`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public'
-            AND table_name = 'ezil_operator_entitlements' AND column_name = 'access_override') AS present`);
-        const rows = (Array.isArray(result) ? result : (result as { rows?: Record<string, unknown>[] } | null)?.rows) ?? [];
-        overrideColumn = { value: rows[0]?.present === true, at: now };
-    } catch {
-        return false;
-    }
-    return overrideColumn.value;
-}
-
-/** Tests only. */
-export function resetAccessOverrideInstalled(): void { overrideColumn = null; }
-
-/** The branches for `paidComputeAccessCtes`; each fails closed to "absent". */
+/** A failed availability probe throws before any eligibility, demand or migration query is issued. */
 export async function paidComputeBranches(db: { execute(query: SQL): Promise<unknown> }): Promise<PaidComputeBranches> {
-    const operator = await operatorBranchEnabled(db);
-    return { operator, override: operator && await accessOverrideInstalled(db) };
+    return { operator: await operatorBranchEnabled(db) };
 }
 
-/** `branches`: a bare boolean is the operator branch alone (no override branch), as before overrides. */
+/** `false` is only for a verified absent operator table. Both pre-0038 and current tables use the same reader. */
 export function paidComputeAccessCtes(at: string, branches: boolean | PaidComputeBranches, userId?: string) {
     const operator = typeof branches === 'boolean' ? branches : branches.operator;
-    const override = typeof branches === 'boolean' ? false : branches.operator && branches.override;
+    const override = operator;
+    const overrideFlag = sql`COALESCE((to_jsonb(o)->>'access_override')::boolean, false)`;
     // An account with a live explicit override is decided by it alone (Stripe and grant rows give way).
     const noOverride = (column: SQL) => override ? sql`AND NOT EXISTS (SELECT 1 FROM override_live ov WHERE ov.user_id = ${column})` : sql``;
     const overrideLive = !override ? sql`` : sql`
         override_live AS (
             SELECT DISTINCT ON (o.user_id) o.user_id, o.sku, o.starts_at, o.ends_at
             FROM public.ezil_operator_entitlements o JOIN auth.users u ON u.id = o.user_id
-            WHERE o.access_override AND o.ended_at IS NULL AND o.starts_at <= ${at}::timestamptz AND (o.ends_at IS NULL OR o.ends_at > ${at}::timestamptz)
+            WHERE ${overrideFlag} AND o.ended_at IS NULL AND o.starts_at <= ${at}::timestamptz AND (o.ends_at IS NULL OR o.ends_at > ${at}::timestamptz)
                 AND o.sku IN ('free_v3', 'standard_monthly_v3', 'premium_monthly_v3')
                 AND u.deleted_at IS NULL AND (u.banned_until IS NULL OR u.banned_until <= ${at}::timestamptz)
                 ${userId ? sql`AND o.user_id = ${userId}::uuid` : sql``}
@@ -70,7 +47,7 @@ export function paidComputeAccessCtes(at: string, branches: boolean | PaidComput
             AND u.deleted_at IS NULL AND (u.banned_until IS NULL OR u.banned_until <= ${at}::timestamptz)
             ${userId ? sql`AND o.user_id = ${userId}::uuid` : sql``}
             AND NOT EXISTS (SELECT 1 FROM stripe_standing s WHERE s.user_id = o.user_id AND s.covers)${override ? sql`
-            AND NOT o.access_override ${noOverride(sql`o.user_id`)}` : sql``}`;
+            AND NOT ${overrideFlag} ${noOverride(sql`o.user_id`)}` : sql``}`;
     // A paid override is paid access with no Stripe period or receipt (funding.ts: its plan's own fair use).
     const paidOverride = !override ? sql`` : sql`
         UNION ALL SELECT ov.user_id, ov.sku, 'active' AS status, NULL::text AS stripe_subscription_id,

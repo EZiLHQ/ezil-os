@@ -14,7 +14,7 @@ import { deriveStanding, paidAccess } from '@/server/billing/v3/standing';
 import { fairUseAllowance } from '@/server/billing/v3/funding';
 import { buildSummaryV2, summaryMeters } from '@/server/billing/v2/summary';
 import type { Result } from './contract';
-import { operatorOverridesInstalled } from './installed';
+import { operatorEntitlementsInstalled, operatorOverridesInstalled } from './installed';
 import type { CommandStore, IdentityCheck, OperatorEntitlementDeps, StoredEvent, StripeView } from './service';
 
 export interface Executor { execute(query: SQL): Promise<unknown> }
@@ -23,8 +23,11 @@ export interface TransactionalExecutor extends Executor { transaction<T>(run: (t
 /** The source cannot answer (a missing table/view or a database failure): the route says 503, nothing applied. */
 export class SourceUnavailable extends Error { constructor(what: string) { super(what); this.name = 'SourceUnavailable'; } }
 
-const rowsOf = (result: unknown): Record<string, unknown>[] =>
-    (Array.isArray(result) ? result : (result as { rows?: Record<string, unknown>[] } | null)?.rows) ?? [];
+const rowsOf = (result: unknown): Record<string, unknown>[] => {
+    const rows = Array.isArray(result) ? result : (result as { rows?: unknown } | null)?.rows;
+    if (!Array.isArray(rows)) throw new SourceUnavailable('rows');
+    return rows;
+};
 
 function missingRelation(error: unknown): boolean {
     for (let e = error as { code?: string; cause?: unknown } | undefined, depth = 0; e && depth < 5; e = e.cause as typeof e, depth++) {
@@ -70,7 +73,9 @@ export async function readOperatorEntitlements(db: Executor, userId: string): Pr
         const rows = rowsOf(await db.execute(sql`${SELECT} WHERE user_id = ${userId}::uuid ORDER BY (ended_at IS NULL) DESC, starts_at DESC, ref LIMIT 50`));
         return rows.map(toRow).filter((row): row is OperatorEntitlementRow => row !== null);
     } catch (error) {
-        if (missingRelation(error)) return [];
+        // A missing dependency/view or a failed probe is not proof of no overrides. Only verified table absence is
+        // the supported pre-0019 state. Normal reads use compatible JSON fields and need no schema-column probes.
+        if (missingRelation(error) && !await operatorEntitlementsInstalled(db)) return [];
         throw error;
     }
 }

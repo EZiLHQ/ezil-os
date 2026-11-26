@@ -75,6 +75,8 @@ describe('ezil-os entitlement routes', () => {
         expect([installed.status, await installed.json()]).toEqual([200, { ...sourceCatalog(), access_overrides: true }]);
         const broken = await call(signed('GET', 'catalog'), 'catalog', { deps: async () => { throw new SourceUnavailable('commands'); } });
         expect([broken.status, await broken.json()]).toEqual([200, sourceCatalog()]);
+        const unknown = await call(signed('GET', 'catalog'), 'catalog', { deps: deps({ accessOverridesInstalled: async () => { throw new Error('probe unavailable'); } }) });
+        expect([unknown.status, await unknown.json()]).toEqual([200, sourceCatalog()]);
     });
 
     it('GET assignments: both ids required (400), a non-linked pair is 404 and reveals nothing, a linked one is 200', async () => {
