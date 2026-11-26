@@ -68,6 +68,14 @@ test('a managed answer keeps the pause and revision fields Universe sent with it
     assert.deepEqual(await h.transport.editorReady(),h.work);
     h.work.startedAt = iso(now+3000+5000);
     await assert.rejects(h.transport.editorReady(),{code:'media_unavailable'});
+    // After an upgrade pause the same clock ends more than an hour after its start: accepted only as a revised clock.
+    Object.assign(h.work,{startedAt:iso(now-2400000),deadlineAt:iso(now-2400000+hour+900000),remainingMs:2100000});
+    assert.deepEqual(await h.transport.editorReady(),h.work);
+    assert.deepEqual(await h.transport.editorReady(),h.work);
+    for (const revision of [0,undefined,'2',-1]) {
+        h.work.revision = revision;
+        await assert.rejects(h.transport.editorReady(),{code:'media_unavailable'});
+    }
 });
 
 test('without the flag the media bound stays the hour',async t=>{
