@@ -1,12 +1,16 @@
 /**
- * Operator-assigned individual plan access (product entitlements v1, producer `ezil-os`; Plans brief
- * 40e7021e76d781d796d5f8bb03f1b616, contract 58d78935). An EZiL operator assigns Standard or Premium to one account
+ * Operator-assigned individual plan access (product entitlements v1, producer `ezil-os`; the Plans brief, contract
+ * 58d78935). An EZiL operator assigns Standard or Premium to one account
  * through the signed Gateway command (`server/entitlements/operator`). It is an administrative grant: no Stripe
  * subscription, invoice, renewal, charge or AI credits, and never written into the Stripe tables.
  *
  * Effective access, one rule for every reader: Stripe paid access wins (paid, renewal grace, ending at period end);
  * otherwise an operator grant in effect; otherwise Free. The operator plan then has the paid plan's product access
  * (paid compute policy v1: no monthly computer-hours cutoff, six-hour sessions, AWS, the plan's machine choice).
+ *
+ * Explicit access overrides (0038): an assign with `access_override` writes a row with its own live slot that may set Free, Standard or Premium. While unexpired it comes first:
+ * explicit override > valid Stripe > ordinary grant > Free. `operatorGrantInEffect` (the ordinary rule above) never
+ * returns an override; `operatorOverrideInEffect` is the override rule.
  */
 import { CATALOG_V2 } from '../v2/contract';
 import { CATALOG_V3 } from './contract';
@@ -14,6 +18,11 @@ import type { ResolvedPlanV3 } from './catalog';
 
 export const OPERATOR_SKUS = Object.freeze(['standard_monthly_v3', 'premium_monthly_v3'] as const);
 export type OperatorSku = typeof OPERATOR_SKUS[number];
+/** The SKUs an ordinary operator grant carries (the same set as `OperatorSku`). */
+export type PaidOperatorSku = OperatorSku;
+/** What an explicit access override may set (0038): Free as well as the paid plans. */
+export const OPERATOR_OVERRIDE_SKUS = Object.freeze(['free_v3', ...OPERATOR_SKUS] as const);
+export type OperatorOverrideSku = typeof OPERATOR_OVERRIDE_SKUS[number];
 
 /** One row of `ezil_operator_entitlements` (app/drizzle/0019_operator_entitlements.sql). */
 export interface OperatorEntitlementRow {
@@ -21,7 +30,8 @@ export interface OperatorEntitlementRow {
     revision: number;
     userId: string;
     accountPublicId: string;
-    sku: OperatorSku;
+    /** Standard or Premium; Free only on an access override (0038's CHECK). */
+    sku: OperatorOverrideSku;
     startsAt: Date;
     /** null = until revoked. */
     endsAt: Date | null;
@@ -29,9 +39,16 @@ export interface OperatorEntitlementRow {
     endedAt: Date | null;
     /** The issuing organization's name shown on the plan card (0023); null/absent = EZiL (every pre-0023 row). */
     issuedBy?: string | null;
+    /** An explicit access override (0038): its own live slot, first while unexpired. Absent/false = an ordinary grant. */
+    accessOverride?: boolean;
 }
+/** An ordinary grant as `operatorGrantInEffect` returns it: never Free. */
+export type PaidOperatorEntitlementRow = OperatorEntitlementRow & { sku: PaidOperatorSku };
 
+/** Standard or Premium: what an ordinary grant may carry. */
 export const isOperatorSku = (sku: string): sku is OperatorSku => (OPERATOR_SKUS as readonly string[]).includes(sku);
+/** Free, Standard or Premium: what an access override may carry. */
+export const isOperatorOverrideSku = (sku: string): sku is OperatorOverrideSku => (OPERATOR_OVERRIDE_SKUS as readonly string[]).includes(sku);
 
 /** The organization a grant without its own issuing-organization name is shown as assigned by. */
 export const DEFAULT_ISSUED_BY = 'EZiL';
@@ -58,16 +75,33 @@ export const isIssuedBy = (v: unknown): v is string => {
 /** What the plan card says assigned a grant: its stored name, or EZiL for none (legacy) or anything unreadable. */
 export const issuedByOf = (grant: Pick<OperatorEntitlementRow, 'issuedBy'>): string => isIssuedBy(grant.issuedBy) ? grant.issuedBy : DEFAULT_ISSUED_BY;
 
-/** The grant in effect at `now`: started, not past its end, not ended by an operator. Newest start wins. */
-export function operatorGrantInEffect(rows: readonly OperatorEntitlementRow[] | null | undefined, now: Date): OperatorEntitlementRow | null {
+const inEffectAt = (row: OperatorEntitlementRow, at: number) => row.startsAt.getTime() <= at
+    && (row.endsAt === null || row.endsAt.getTime() > at) && row.endedAt === null;
+const newestFirst = (a: OperatorEntitlementRow, b: OperatorEntitlementRow) => b.startsAt.getTime() - a.startsAt.getTime() || (a.ref < b.ref ? -1 : 1);
+
+/** The ordinary grant in effect at `now`: started, not past its end, not ended by an operator; never an override. Newest start wins. */
+export function operatorGrantInEffect(rows: readonly OperatorEntitlementRow[] | null | undefined, now: Date): PaidOperatorEntitlementRow | null {
     const at = now.getTime();
-    return (rows ?? []).filter(row => isOperatorSku(row.sku) && row.startsAt.getTime() <= at
-        && (row.endsAt === null || row.endsAt.getTime() > at) && row.endedAt === null)
-        .sort((a, b) => b.startsAt.getTime() - a.startsAt.getTime() || (a.ref < b.ref ? -1 : 1))[0] ?? null;
+    return (rows ?? []).filter((row): row is PaidOperatorEntitlementRow => row.accessOverride !== true && isOperatorSku(row.sku) && inEffectAt(row, at))
+        .sort(newestFirst)[0] ?? null;
 }
 
-/** The plan an operator grant gives: the paid offer, active, with no Stripe subscription, renewal or cancel date. */
+/**
+ * The explicit access override in effect at `now` (Free, Standard or Premium), or null. It decides EZiL OS access ahead
+ * of Stripe and of any ordinary grant; once it expires or is ended, the fallback is the rule without it.
+ */
+export function operatorOverrideInEffect(rows: readonly OperatorEntitlementRow[] | null | undefined, now: Date): OperatorEntitlementRow | null {
+    const at = now.getTime();
+    return (rows ?? []).filter(row => row.accessOverride === true && isOperatorOverrideSku(row.sku) && inEffectAt(row, at))
+        .sort(newestFirst)[0] ?? null;
+}
+
+/**
+ * The plan an operator grant gives: the paid offer, active, with no Stripe subscription, renewal or cancel date. A Free
+ * override gives the Free plan itself (`free`), carrying the row.
+ */
 export function operatorPlan(grant: OperatorEntitlementRow, free: ResolvedPlanV3): ResolvedPlanV3 & { operator: OperatorEntitlementRow } {
+    if (!isOperatorSku(grant.sku)) return { ...free, operator: grant };
     const offer = CATALOG_V3[grant.sku];
     // The v2 family the v3 resolver maps each paid SKU to (catalog.ts planFromSubscriptions).
     const family = CATALOG_V2[grant.sku === 'standard_monthly_v3' ? 'standard_monthly_v2' : 'compute_monthly_v2'].family;
@@ -82,7 +116,7 @@ export function operatorPlan(grant: OperatorEntitlementRow, free: ResolvedPlanV3
  * replaced) or no grant is in effect. `stripePaidAccess` is the Stripe-only standing (`deriveStanding` without an
  * operator), so the rule is evaluated once, the same way, by every reader.
  */
-export function operatorAccess(input: { grants: readonly OperatorEntitlementRow[] | null | undefined; now: Date; stripePaidAccess: boolean }): OperatorEntitlementRow | null {
+export function operatorAccess(input: { grants: readonly OperatorEntitlementRow[] | null | undefined; now: Date; stripePaidAccess: boolean }): PaidOperatorEntitlementRow | null {
     return input.stripePaidAccess ? null : operatorGrantInEffect(input.grants, input.now);
 }
 
