@@ -17,8 +17,16 @@
 //   3. A paid top-up whose dialog closes BEFORE the server answers `credited` (x while "Adding your AI credits…")
 //      still reaches the displayed balance: Billing keeps asking `billing.topupStatus` and re-reads on `credited`.
 //      Before the watch existed Billing stayed at "0 credits left" for good (incident 2026-11-26).
+//   4. A top-up the server has ALREADY credited, with the dialog showing the new balance, reaches Billing however the
+//      person leaves the dialog: Done, × (Close billing sheet), Escape or the backdrop. Each makes exactly one
+//      billing.summary read and starts no watch. These runs open the dialog from Billing's own Add credits button with
+//      a balance already above zero, and find Done and × by role and name, as a person does. Before the fix only Done
+//      re-read: after ×, Escape or the backdrop Billing kept the old balance the dialog had just replaced (seen in a
+//      hosted staging run, 2026-11-26: 1,199 in the dialog, 1,099 in Billing). On the previous bundle the two
+//      re-read checks of each of those six runs fail.
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 
 import { fileURLToPath } from 'node:url';
@@ -39,9 +47,12 @@ if ( ! chromium ) {
     process.exit(2);
 }
 
-const OSDIR = path.join(WT, 'app/public/os');
+// EZIL_SHELL_OUT_DIR: a directory holding the three shell files to run instead of the committed ones (`build-shell.sh`
+// honours the same variable). It may hold a deployed shell's bytes saved by hand; nothing here fetches or contacts it.
+const OSDIR = process.env.EZIL_SHELL_OUT_DIR ? path.resolve(process.env.EZIL_SHELL_OUT_DIR) : path.join(WT, 'app/public/os');
 for ( const file of ['icons.js', 'bundle.min.js', 'bundle.min.css'] ) {
     if ( ! fs.existsSync(path.join(OSDIR, file)) ) { console.error(`SKIP: ${file} is not built (run shell/build-shell.sh).`); process.exit(2); }
+    console.log(`INFO  ${file} sha256 ${createHash('sha256').update(fs.readFileSync(path.join(OSDIR, file))).digest('hex')}`);
 }
 const icons = fs.readFileSync(path.join(OSDIR, 'icons.js'), 'utf8');
 const bundle = fs.readFileSync(path.join(OSDIR, 'bundle.min.js'), 'utf8');
@@ -63,7 +74,8 @@ const PAYLOAD = {
             focus: '/api/shell/focus', codePreviewUrl: '/api/shell/code-preview-url' } },
 };
 
-function makeBackend () {
+/** `opening`: the credits the simulated wallet holds before the top-up. */
+function makeBackend (opening = 0) {
     const state = { credited: false, calls: [], sessionPolls: 0 };
     // The simulated ledger settles on its own clock (SETTLE_MS after the provider completes), whoever is polling.
     const settle = () => { if ( state.completed && Date.now() - state.completedAt >= SETTLE_MS ) state.credited = true; return state.credited; };
@@ -72,10 +84,11 @@ function makeBackend () {
         const s = summaryV3('standard');
         s.actions.topup = true;
         s.catalog.packs = [{ sku: 'ai_topup_1000', aiCredits: 1000, creditCents: 1000, totalCents: 1000, discountPercent: 0, currency: 'usd' }];
-        const remaining = state.credited ? '1000000000' : '0';
-        s.ai.account = { userId: 'user-1', remainingMicro: remaining, totalMicro: state.credited ? '1200000000' : '200000000',
+        const left = opening + (state.credited ? 1000 : 0);
+        const remaining = String(left * 1000000);
+        s.ai.account = { userId: 'user-1', remainingMicro: remaining, totalMicro: String((left + 200) * 1000000),
             usedMicro: '200000000', heldMicro: '0', asOf: new Date().toISOString() };
-        s.ai.balance = state.credited ? 1000 : 0; s.ai.balanceMicro = remaining; s.ai.state = state.credited ? 'ok' : 'empty';
+        s.ai.balance = left; s.ai.balanceMicro = remaining; s.ai.state = left > 0 ? 'ok' : 'empty';
         return s;
     };
     const wrap = json => ({ result: { data: { json } } });
@@ -128,11 +141,16 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const checks = [];
 const push = (name, pass, detail = '') => { checks.push({ name, pass: !! pass }); console.log(`${pass ? 'PASS' : 'FAIL'}  ${name}${detail ? `  [${detail}]` : ''}`); return !! pass; };
 
-/** `late`: the simulated ledger settles SETTLE_MS after the provider completes, and the person closes the dialog first. */
-async function run (browser, topology, late) {
-    const label = `${topology}${late ? ' · dialog closed before credit' : ''}`;
+/**
+ * `late`: the simulated ledger settles SETTLE_MS after the provider completes, and the person closes the dialog first.
+ * `leave`: how the person leaves the dialog once it shows the credited balance (Done, ×, Escape or backdrop); these
+ * runs start from OPENING credits and open the dialog from Billing's Add credits button.
+ */
+const OPENING = 1099;
+async function run (browser, topology, late, leave = null) {
+    const label = `${topology}${late ? ' · dialog closed before credit' : ''}${leave ? ` · credited, left by ${leave}` : ''}`;
     SETTLE_MS = late ? 5000 : 1000;
-    const backend = makeBackend();
+    const backend = makeBackend(leave ? OPENING : 0);
     const context = await browser.newContext({ viewport: { width: 1366, height: 820 } });
     const page = await context.newPage();
     const popups = [], topNavs = [];
@@ -176,15 +194,25 @@ async function run (browser, topology, late) {
     const balance = () => frame.evaluate(() => (document.querySelector('[data-pane="billing"] #ai-credits')?.textContent ?? 'none').replace(/\s+/g, ' ').trim());
     const status = () => frame.evaluate(() => document.querySelector('[data-role="billing-action-status"]')?.textContent ?? '');
     const summaries = () => backend.state.calls.filter(call => call === 'GET billing.summary').length;
+    const sessionReads = () => backend.state.calls.filter(call => call === 'GET billing.topupStatus' || call === 'GET billing.checkoutStatus').length;
 
     push(`${label}: the shell booted`, await until(() => Array.isArray(window.ezil?.registry?.APPS) && window.ezil.registry.APPS.length > 0));
     const flags = await frame.evaluate(() => ({ embedded: window.is_embedded === true, top: window === window.top }));
     push(`${label}: the topology is the one named`, topology === 'framed' ? flags.embedded && ! flags.top : ! flags.embedded && flags.top, JSON.stringify(flags));
     await sleep(800);
-    // Exactly registry.js `openBilling`, which Code's billing bridge calls for a credit refusal.
-    await frame.evaluate(({ payload }) => window.ezil.registry.launch('settings', { payload, computer: payload.computer, desktopState: payload.desktopState,
-        initialTab: 'billing', billingRecovery: { reason: 'insufficient_credits', requestId: '22222222-2222-4222-8222-222222222222' } }), { payload: PAYLOAD });
-    push(`${label}: Code's credit request opens Add AI credits`, await until(() => document.querySelector('.ezil-upgrade-backdrop [role="dialog"]')?.dataset.sheet === 'topup'));
+    const dialogOpen = () => until(() => document.querySelector('.ezil-upgrade-backdrop [role="dialog"]')?.dataset.sheet === 'topup');
+    if ( leave ) {
+        // The person's own way in: Settings -> Billing, then the Add credits button beside the balance.
+        await frame.evaluate(({ payload }) => window.ezil.registry.launch('settings', { payload, computer: payload.computer, desktopState: payload.desktopState,
+            initialTab: 'billing' }), { payload: PAYLOAD });
+        await frame.locator('[data-pane="billing"] #ai-credits').getByRole('button', { name: 'Add credits', exact: true }).click({ timeout: 8000 }).catch(() => {});
+        push(`${label}: Billing's Add credits button opens Add AI credits`, await dialogOpen(), (await balance()).slice(0, 60));
+    } else {
+        // Exactly registry.js `openBilling`, which Code's billing bridge calls for a credit refusal.
+        await frame.evaluate(({ payload }) => window.ezil.registry.launch('settings', { payload, computer: payload.computer, desktopState: payload.desktopState,
+            initialTab: 'billing', billingRecovery: { reason: 'insufficient_credits', requestId: '22222222-2222-4222-8222-222222222222' } }), { payload: PAYLOAD });
+        push(`${label}: Code's credit request opens Add AI credits`, await dialogOpen());
+    }
     const primary = '.ezil-upgrade-backdrop [data-action="topup-continue"]';
     const primaryHit = await hit(primary);
     push(`${label}: Continue to payment is the topmost element at its centre`, primaryHit === 'topmost', primaryHit);
@@ -195,7 +223,25 @@ async function run (browser, topology, late) {
 
     backend.state.completed = true; backend.state.completedAt = Date.now();
     await frame.evaluate(() => window.__completeProvider());
-    if ( ! late ) {
+    if ( leave ) {
+        const was = `${OPENING.toLocaleString('en-US')} credits left`, now = `${(OPENING + 1000).toLocaleString('en-US')} credits left`;
+        const dialog = frame.getByRole('dialog', { name: 'Add AI credits' });
+        const copy = await until(() => document.querySelector('[data-role="topup-new-balance"]')?.textContent, undefined, 20000);
+        push(`${label}: the dialog shows the server's new balance`, copy === `Your balance is now ${(OPENING + 1000).toLocaleString('en-US')} credits.`, String(copy));
+        const before = { balance: await balance(), reads: summaries(), sessionReads: sessionReads() };
+        push(`${label}: behind the open dialog Billing still shows the balance from before the payment`, before.balance.includes(was), before.balance.slice(0, 60));
+        if ( leave === 'Done' ) await dialog.getByRole('button', { name: 'Done', exact: true }).click({ timeout: 4000 });
+        else if ( leave === '×' ) await dialog.getByRole('button', { name: 'Close billing sheet', exact: true }).click({ timeout: 4000 });
+        else if ( leave === 'Escape' ) await page.keyboard.press('Escape');
+        else await frame.locator('.ezil-upgrade-backdrop').click({ position: { x: 6, y: 6 }, timeout: 4000 });
+        push(`${label}: the dialog closed`, await until(() => ! document.querySelector('.ezil-upgrade-backdrop')));
+        push(`${label}: Billing shows the server's new balance`, await until(text => (document.querySelector('[data-pane="billing"] #ai-credits')?.textContent ?? '').includes(text), now), (await balance()).slice(0, 60));
+        // Longer than the dialog's poll interval (1.5 s) and the Billing watch's first delay (3 s): a second read or a watch would show.
+        await sleep(3500);
+        push(`${label}: exactly one billing.summary read followed the close`, summaries() === before.reads + 1, `${before.reads} -> ${summaries()}`);
+        push(`${label}: no session status is asked again after the close (no watch for a credited top-up)`, sessionReads() === before.sessionReads, `${before.sessionReads} -> ${sessionReads()}`);
+        push(`${label}: Billing shows no pending or closed-checkout notice`, (await status()) === '', await status());
+    } else if ( ! late ) {
         const copy = await until(() => document.querySelector('[data-role="topup-new-balance"]')?.textContent, undefined, 20000);
         push(`${label}: the dialog shows the server's new balance`, copy === 'Your balance is now 1,000 credits.', String(copy));
         await frame.locator('.ezil-upgrade-backdrop [data-action="done"]').click({ timeout: 4000 });
@@ -223,6 +269,7 @@ async function run (browser, topology, late) {
 const browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
 try {
     for ( const topology of ['standalone', 'framed'] ) for ( const late of [false, true] ) await run(browser, topology, late);
+    for ( const topology of ['standalone', 'framed'] ) for ( const leave of ['Done', '×', 'Escape', 'backdrop'] ) await run(browser, topology, false, leave);
 } finally { await browser.close(); }
 const failed = checks.filter(check => ! check.pass);
 console.log(`${checks.length - failed.length}/${checks.length} framed top-up checks passed (simulated provider and billing API)`);

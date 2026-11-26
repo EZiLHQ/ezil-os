@@ -172,6 +172,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, summary,
     let deadline = 0;
     let fulfillment = null;
     let creditedCredits = null;
+    let doneNotified = false;
     const timers = new Set();
     const v3 = sku.endsWith('_v3');
     const trialMode = ! pack && trial === true && sku === TRIAL_SKU;
@@ -196,6 +197,9 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, summary,
                 try { onUnconfirmed?.({ sessionId: session.sessionId, paid: sessionCompleted && paymentStatus === 'paid' }); }
                 catch { /* Closing must still tear down. */ }
             }
+            // The server credited this top-up, so Billing's balance is out of date however the sheet is left: ×, Esc
+            // and the backdrop ask for the same single re-read as Done (which has already asked by the time it closes).
+            if ( pack && fulfillment === 'credited' ) { try { notifyDone(); } catch { /* Closing must still tear down. */ } }
             closed = true;
             clearTimers();
             controller.abort();
@@ -331,8 +335,14 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, summary,
         }
         if ( hadFocus ) focusFirst();
     }
+    /** `onDone` at most once per sheet. Marked first, so a close that `onDone` itself causes cannot ask again. */
+    function notifyDone () {
+        if ( doneNotified ) return;
+        doneNotified = true;
+        onDone?.();
+    }
     function returnToBilling () {
-        try { onDone?.(); } finally { close(); }
+        try { notifyDone(); } finally { close(); }
     }
     /** The quote's dates in the summary column (viewer's zone). Before a quote, only what is already certain. */
     function renderTrialTerms () {
