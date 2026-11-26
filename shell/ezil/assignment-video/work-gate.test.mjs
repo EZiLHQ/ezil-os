@@ -835,8 +835,15 @@ test('a media cutoff the broker moves is relayed only for the same start and ins
             await bound(w,p);
             await p.rpc('begin',{captureSessionId:session,consentVersion:4});
             const seed=seedPart();await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
-            const answer=(await p.rpc('status',{captureSessionId:session})).value;
-            assert.deepEqual(answer,{captureSessionId:session,status:'recording',stopRequestedAt:null,...(expected??{})},JSON.stringify([flag,status]));
+            const answer=await p.rpc('status',{captureSessionId:session});
+            const label=JSON.stringify([flag,status]);
+            if (flag && !expected) {
+                assert.equal(answer.ok,false,label);
+                assert.equal(answer.code,'recording_changed',label);
+            } else {
+                assert.equal(answer.ok,true,label);
+                assert.deepEqual(answer.value,{captureSessionId:session,status:'recording',stopRequestedAt:null,...(expected??{})},label);
+            }
             await endShare(p);
         }finally{await gate.close();p.close();t.mock.restoreAll();}
     }
