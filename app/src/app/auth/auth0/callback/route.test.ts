@@ -3,11 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
 vi.mock('server-only', () => ({}));
-const stub = vi.hoisted(() => ({ set: vi.fn(), exchangeCode: vi.fn(), verifyIdToken: vi.fn(), bridge: vi.fn(), refuseSwitch: vi.fn(), retain: vi.fn(), getUser: vi.fn() }));
+const stub = vi.hoisted(() => ({ stage: vi.fn(), set: vi.fn(), exchangeCode: vi.fn(), verifyIdToken: vi.fn(), bridge: vi.fn(), refuseSwitch: vi.fn(), retain: vi.fn(), getUser: vi.fn() }));
 vi.mock('next/headers', () => ({ cookies: async () => ({ set: stub.set }) }));
 vi.mock('@/server/auth/auth0', async importOriginal => ({ ...await importOriginal<typeof import('@/server/auth/auth0')>(), exchangeCode: stub.exchangeCode, verifyIdToken: stub.verifyIdToken }));
 vi.mock('@/server/auth/bridge', () => ({ bridgeAuth0Identity: stub.bridge, refuseSilentAccountSwitch: stub.refuseSwitch }));
 vi.mock('@/server/auth/retained-identity', () => ({ retainProjectIdentity: stub.retain }));
+// Off by default, as everywhere but staging: the embedded assignment's silent child (`@/server/auth/work-auth`).
+vi.mock('@/server/git/assignment-enrollment', async original => ({
+    ...await original<typeof import('@/server/git/assignment-enrollment')>(), assignmentEnrollmentEnabled: stub.stage }));
 // The OS session, asked only on a replayed or lost transaction. None by default.
 vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: { getUser: stub.getUser } }) }));
 
@@ -382,5 +385,47 @@ describe('Auth0 callback returning to an embedded assignment workspace', () => {
             expect(response.headers.get('location')).toBe(origin + back);
             expect(stub.retain).toHaveBeenCalledWith('private-id-token');
         }
+    });
+});
+
+describe('Auth0 callback inside a frame, or for the embedded assignment child, never takes the interactive path', () => {
+    const framed = (query: Record<string, string>, cookieValue: string | null = cookie) => new NextRequest(
+        `${origin}/auth/auth0/callback?${new URLSearchParams(query)}`,
+        { headers: { 'sec-fetch-dest': 'iframe', ...(cookieValue === null ? {} : { cookie: `${AUTH0_COOKIE}=${cookieValue}` }) } });
+    async function inert(response: Awaited<ReturnType<typeof GET>>) {
+        expect(response.status).toBe(200);
+        expect(response.headers.get('location')).toBeNull();
+        const html = await response.text();
+        expect(html).toContain('data-outcome="unavailable"');
+        expect(html).not.toMatch(/\/login|authorize|private-code/);
+        // The interactive sign-in's transaction, possibly another tab's, is neither spent nor cleared.
+        expect(response.cookies.get(AUTH0_COOKIE)).toBeUndefined();
+        for (const call of [stub.exchangeCode, stub.verifyIdToken, stub.bridge, stub.retain]) expect(call).not.toHaveBeenCalled();
+    }
+    it('🔴 on the stage, a framed callback with a valid interactive transaction is the inert document: no sign-in, no lock screen', async () => {
+        stub.stage.mockReturnValue(true);
+        await inert(await GET(framed({ state, code: 'private-code' })));
+    });
+    it.each(['login_required', 'no state', 'a lost cookie'])('🔴 on the stage, a framed callback with %s is the inert document too', async name => {
+        stub.stage.mockReturnValue(true);
+        const query: Record<string, string> = name === 'login_required' ? { state, error: 'login_required' }
+            : name === 'no state' ? { code: 'private-code' } : { state, code: 'private-code' };
+        await inert(await GET(framed(query, name === 'a lost cookie' ? null : cookie)));
+    });
+    it('a marked state is never an interactive transaction, in a frame or not, on the stage or not', async () => {
+        const marked = 'ezw1.6f0c1d2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f.' + 'A'.repeat(43);
+        stub.stage.mockReturnValue(true);
+        await inert(await GET(new NextRequest(`${origin}/auth/auth0/callback?${new URLSearchParams({ state: marked, code: 'private-code' })}`, { headers: { cookie: `${AUTH0_COOKIE}=${cookie}` } })));
+        stub.stage.mockReturnValue(false);
+        const away = await GET(framed({ state: marked, code: 'private-code' }));
+        expect(away.status).toBe(404);
+        expect(away.headers.get('location')).toBeNull();
+        expect(stub.exchangeCode).not.toHaveBeenCalled();
+    });
+    it('the ordinary top-level callback is unchanged on the stage, and a framed one is unchanged away from it', async () => {
+        stub.stage.mockReturnValue(true);
+        expect((await GET(request())).headers.get('location')).toBe(`${origin}/os?computer=one`);
+        stub.stage.mockReturnValue(false);
+        expect((await GET(framed({ state, code: 'private-code' }))).headers.get('location')).toBe(`${origin}/os?computer=one`);
     });
 });

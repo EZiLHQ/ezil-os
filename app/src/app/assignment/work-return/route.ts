@@ -1,7 +1,6 @@
-import { createHash } from 'node:crypto';
-
 import { createTRPCContext } from '@/server/api/trpc';
 import { osOrigin, universeOrigin } from '@/server/assignment-video/contract';
+import { assignmentStageTag } from '@/server/assignment-video/stage-tag';
 import { retainedIdentity } from '@/server/auth/retained-identity';
 import { assignmentEnrollmentEnabled, ownerRepositoryName } from '@/server/git/assignment-enrollment';
 import { embeddedWorkReturn, workAccountNotice, workReturnAttempt } from '@/utils/assignment-work-auth';
@@ -26,13 +25,11 @@ type Outcome = 'idp_signin' | 'identity_refresh' | 'storage_unavailable' | 'iden
 
 /**
  * One line per decision on an accepted embedded return, and nothing else: a fixed event, one of the outcomes above
- * and `attemptTag`, the stage correlation tag shared with Universe: the first 16 hex of
- * SHA-256(`ezil.assignment.stage.v1` NUL attempt id). Never the attempt, a person, an owner tag, a URL, a cookie or
+ * and `attemptTag`, the stage correlation tag shared with Universe (`assignmentStageTag`). Never the attempt, a person, an owner tag, a URL, a cookie or
  * any text that arrived with the request or was thrown.
  */
 function record(outcome: Outcome, attempt: string): void {
-    const attemptTag = createHash('sha256').update('ezil.assignment.stage.v1\0' + attempt, 'utf8').digest('hex').slice(0, 16);
-    console.info(JSON.stringify({ event: 'ezil_assignment_work_return', outcome, attemptTag }));
+    console.info(JSON.stringify({ event: 'ezil_assignment_work_return', outcome, attemptTag: assignmentStageTag(attempt) }));
 }
 
 /**
