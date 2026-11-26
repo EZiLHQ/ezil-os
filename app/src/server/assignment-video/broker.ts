@@ -10,6 +10,10 @@ const storage = globalThis as typeof globalThis & { ezilAssignmentMediaLeases?: 
 // The same process already holds the verified OS session identity. A process loss requires a new authenticated begin.
 // No Works capability, retained ID token, signature, signed URL or storage key is persisted.
 const defaults = storage.ezilAssignmentMediaLeases ??= new Map<string, Capability>();
+// Order successful capabilities only within the exact lease key. An older HTTP response
+// can arrive after its successor already obtained a capability from Universe.
+const leaseOrders = new WeakMap<Capability, number>();
+let beginOrder = 0;
 const preflightUrl = universeOrigin + '/internal/assignment-video/preflight';
 
 export function recordingAction(identity: Identity, input: Extract<Input, {action: 'preflight'}>, deps?: Dependencies):
@@ -70,6 +74,7 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
         return result.data;
     }
     if (input.action === 'begin') {
+        const order = ++beginOrder;
         const requestedPhase = input.captureSessionId;
         const result = started.safeParse(await openControl('begin', input.repoOpenProof, {
             consentAccepted: true, consentVersion: input.consentVersion,
@@ -91,11 +96,18 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
         if (!leases.has(key) && leases.size >= 2048) return refuse('media_unavailable', 503);
         const previous = leases.get(key);
         const same = previous?.recording === receipt.recordingId && previous.phase === requestedPhase;
-        leases.set(key, {recording:receipt.recordingId, token:uploadToken, deadline, phase:requestedPhase, mediaLimit,
+        if (previous && (leaseOrders.get(previous) ?? 0) > order) {
+            // A repeat of that same phase may return its receipt without replacing the current capability.
+            if (same) return receipt;
+            return refuse('recording_phase_changed', 409);
+        }
+        const capability: Capability = {recording:receipt.recordingId, token:uploadToken, deadline, phase:requestedPhase, mediaLimit,
             seed:provisional ? receipt.nextSequence : undefined,
             seedConfirmed: receipt.phaseReady === true || (same && previous.seedConfirmed),
             mediaStart: !provisional && validWindow ? t0 : same ? previous.mediaStart : undefined,
-            preparedEnds:same ? previous.preparedEnds : new Map()});
+            preparedEnds:same ? previous.preparedEnds : new Map()};
+        leaseOrders.set(capability, order);
+        leases.set(key, capability);
         return receipt;
     }
 
