@@ -284,6 +284,32 @@ try {
         feedbackSubmitSchema.parse(JSON.parse(body));
         assert.ok(new TextEncoder().encode(body).byteLength < 32 * 1024, `${new TextEncoder().encode(body).byteLength} bytes`);
     });
+    await check('only an embedded Universe assignment suppresses the feedback chip across native app history', () => {
+        const attempt = '26685417-c1e4-4cc9-a136-cf9b4d72e1f6';
+        const repo = 'https://github.ezil.work/default/u-1234567890abcdef-a-' + attempt + '.git';
+        const home = 'https://os-staging.ezil.work/app/code?' + new URLSearchParams({repo, assignment: attempt});
+        const top = new JSDOM('<iframe></iframe>', {url: 'https://universe-staging.ezil.work/assignment/work'});
+        const frame = top.window.document.querySelector('iframe');
+        frame.src = home;
+        const child = frame.contentWindow;
+        child.__EZIL_BOOT__ = window.__EZIL_BOOT__;
+        const globals = {window: globalThis.window, document: globalThis.document};
+        try {
+            Object.defineProperty(globalThis, 'window', {configurable: true, value: child});
+            Object.defineProperty(globalThis, 'document', {configurable: true, value: child.document});
+            assert.equal(feedback.feedback_enabled(), true);
+            feedback.mount_feedback_chip();
+            assert.equal(child.document.querySelector('button.ezil-feedback-chip'), null);
+            child.history.replaceState(null, '', '/os');
+            feedback.mount_feedback_chip();
+            assert.equal(child.document.querySelector('button.ezil-feedback-chip'), null);
+        } finally {
+            child.dispatchEvent(new child.Event('ezil:teardown'));
+            top.window.close();
+            for (const key of ['window', 'document'])
+                Object.defineProperty(globalThis, key, {configurable: true, value: globals[key]});
+        }
+    });
     await check('in-app icon: mounted once, icon only, hidden on the home screen, shown only while an app window is open', async () => {
         feedback.mount_feedback_chip(); feedback.mount_feedback_chip();
         assert.equal(document.querySelectorAll('.ezil-feedback-chip').length, 1);
