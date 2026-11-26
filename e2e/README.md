@@ -60,6 +60,18 @@ Each executed check emits one JSON line `{check, ok, ms}`, followed by `{result:
 
 Browser-free validation: `node --check e2e/live-check.mjs` and `node --test e2e/live-check.test.mjs`.
 
+## Removed `/computer/<uuid>` page
+
+Anonymous and read-only: no account, no browser.
+
+```sh
+EZIL_E2E_APP=https://os-staging.ezil.work node e2e/removed-computer-route.mjs
+```
+
+It requests both shapes without following redirects. Bare `/computer` never had a page and answered 404 before the removal too, so it proves nothing alone. `/computer/<uuid>` was the dynamic page: while it is deployed its auth gate answers a redirect to `/login` for any id, and once removed it answers 404. The controls (`/computers`, `/os`, `/app/browser?computer=<uuid>`, `/app/desktop?computer=<uuid>`) must still redirect to `/login` with their own address as `returnUrl`. Exit 0 when all hold, 1 otherwise. It prints paths and statuses only.
+
+Browser-free validation: `node --test e2e/removed-computer-route.test.mjs`.
+
 ## Signing in without the UI
 
 `/login` offers only "Continue with EZiL ID" (Auth0), which automation cannot drive, so every hosted harness signs in through `e2e/sign-in.mjs` instead. It performs the Supabase Auth password grant for `EZIL_E2E_EMAIL` (`POST $NEXT_PUBLIC_SUPABASE_URL/auth/v1/token?grant_type=password` with the anon key), writes the session into the browser context as the app's Supabase SSR auth cookie exactly as `@supabase/ssr` would (`__Host-ezil-os-auth`, split into `.0`, `.1`, … chunks when large, on HTTPS; `sb-<ref>-auth-token` on loopback HTTP), then loads the destination and fails if it lands on `/login`.
