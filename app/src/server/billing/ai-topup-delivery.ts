@@ -20,7 +20,10 @@ export type AiTopupDelivery = 'delivered' | 'queued' | 'review' | 'skipped';
  * account pin and finish fences, the same HMAC event and idempotent `eventId`. So a webhook, a poll and the sweep
  * cannot send it twice at once, a failed attempt is not repeated before its backoff, and a repeat the Gateway does
  * see applies once. The scope comes from the stored receipt (`topupScope`): its own owner, an existing ledger grant,
- * and no reversal on the payment. `userId` (the poll's signed-in user) only narrows it.
+ * and no reversal on the payment. `userId` (the poll's signed-in user) only narrows it. The claim then decides the
+ * "no reversal" part again, atomically with the lease and under the lock reversals are written under (`soleReceipt`):
+ * a refund or dispute recorded before the claim is never overtaken. One recorded after the claim is a later event;
+ * its own receipt revokes the grant through the ordinary delivery, as for any delivered purchase.
  *
  * - `skipped`: nothing here for another attempt to deliver: the store has no scope read, the payment has no
  *   deliverable receipt (none, another owner's, already delivered, terminally failed, or reversed), or the caller's
@@ -59,7 +62,8 @@ export async function deliverPaidTopup(deps: {
             return 'queued';
         }
         const counts = await drainAiCreditOutbox({ config: deps.config, aiCredits: store, clock, fetch: input.fetch, log: () => {} },
-            { limit: 1, deadlineMs: deadlineAt, requestTimeoutMs: AI_TOPUP_REQUEST_MS, scope, report: line => {
+            // `soleReceipt`: the claim re-decides, under the root lock, that no reversal has been written since the scope read.
+            { limit: 1, deadlineMs: deadlineAt, requestTimeoutMs: AI_TOPUP_REQUEST_MS, scope: { ...scope, soleReceipt: true }, report: line => {
                 console.info(JSON.stringify({ event: 'ai-topup-delivery', status: line.status, attempts: line.attempts, reason: line.reason }));
                 if (line.status === 'failed') console.error(JSON.stringify({ event: 'ai-topup-delivery-alert', alert: 'paid_topup_not_credited', reason: line.reason }));
             } });

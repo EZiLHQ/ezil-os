@@ -407,7 +407,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
             const receipt = aiTopupOutboxItem(owner, customTopupPack(2500)!, intent, end)!;
             expect(await billing.recordAiTopup({ userId: owner, meter: 'ai_usd_micro', kind: 'topup', amount: BigInt(25_000_000),
                 sourceType: 'payment_intent', sourceId: intent, periodStart: start, periodEnd: end }, receipt)).toBe('applied');
-            return { intent, receipt, scope: { userId: owner, eventKey: receipt.eventKey, kind: 'ai_grant' as const } };
+            return { intent, receipt, scope: { userId: owner, eventKey: receipt.eventKey, kind: 'ai_grant' as const, soleReceipt: true as const } };
         }
 
         /** A Gateway that checks the HMAC, applies each event id once, and keeps a balance per account. */
@@ -528,6 +528,52 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
                 expect(g.fetcher).not.toHaveBeenCalled();
                 expect(await receiptOf(intent)).toMatchObject({ kind: 'ai_grant', attempts: 0, deliveredAt: null });
             }
+        });
+
+        it('a reversal committed between the scope read and the claim is decided by the claim itself: no lease, no attempt, no send', async () => {
+            for (const cause of [{ type: 'refund' as const, id: 're_between' }, { type: 'dispute' as const, id: 'dp_between' }]) {
+                const { intent, receipt, scope } = await paid();
+                const g = gateway();
+                let scopeRead: unknown = null;
+                // The store exactly as it is, with the reversal landing after the scope read and before the claim.
+                const racing: AiCreditOutboxStore = { ...store, accountFor: async () => ACCOUNT,
+                    topupScope: async input => { scopeRead = await store.topupScope!(input); return scopeRead as Awaited<ReturnType<NonNullable<AiCreditOutboxStore['topupScope']>>>; },
+                    claim: async (now, claimScope) => {
+                        await billing.enqueueOutbox(aiCreditRevokeItem(receipt, cause));
+                        return store.claim(now, claimScope);
+                    } };
+                expect(await deliverPaidTopup({ config: CONFIG, aiCredits: racing }, { paymentIntentId: intent, userId, fetch: g.fetcher, clock: () => NOW })).toBe('queued');
+                // The scope read saw a deliverable receipt; the claim refused it.
+                expect(scopeRead).toEqual(scope);
+                expect(g.fetcher).not.toHaveBeenCalled();
+                expect(g.balance(ACCOUNT)).toBe(BigInt(0));
+                const untouched = await receiptOf(intent);
+                expect(untouched).toMatchObject({ kind: 'ai_grant', attempts: 0, deliveredAt: null, lastError: null });
+                expect((untouched.payload as Record<string, unknown>).delivery).toBeUndefined();
+                expect((untouched.payload as Record<string, unknown>).accountPublicId).toBeUndefined();
+                // Every later request finds no scope at all, so a webhook redelivery ends 2xx and a poll stays "processing".
+                expect(await deliverPaidTopup(deps(), { paymentIntentId: intent, fetch: g.fetcher, clock: () => NOW + 60_000 })).toBe('skipped');
+                expect(g.fetcher).not.toHaveBeenCalled();
+            }
+        });
+
+        it('the sole-receipt rule is the paid top-up scope\'s only: a plain scope and the sweep still claim a grant that has a reversal beside it', async () => {
+            const { receipt, scope } = await paid();
+            await billing.enqueueOutbox(aiCreditRevokeItem(receipt, { type: 'refund', id: 're_ordered' }));
+            expect(await store.claim(NOW, scope)).toBeNull();
+            // The same row, without the rule (the Free starter's scope shape): claimed.
+            const plain = (await store.claim(NOW, { userId, eventKey: receipt.eventKey, kind: 'ai_grant' }))!;
+            expect(plain).toMatchObject({ eventKey: receipt.eventKey, attempts: 1 });
+            await store.finish(plain, { status: 'retry', reason: 'http_503', nextAttemptAt: NOW }, NOW);
+            // The sweep (no scope) delivers both rows, as before this change.
+            const kinds: string[] = [];
+            for (let pass = 0; pass < 2; pass++) {
+                const row = (await store.claim(NOW))!;
+                kinds.push(row.kind);
+                await store.finish(row, { status: 'done', reason: null }, NOW);
+            }
+            expect(kinds.sort()).toEqual(['ai_grant', 'ai_revoke']);
+            expect(await store.claim(NOW + 86_400_000)).toBeNull();
         });
 
         it('a terminal refusal ends in review with the receipt failed; no later request reopens it', async () => {
@@ -751,6 +797,41 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI outbox concurrent cl
                 expect(await store.claim(NOW)).toBeNull();
             });
             expect(await store.claim(NOW)).toMatchObject({ userId, attempts: 1 });
+        } finally {
+            await db.delete(authUsers).where(eq(authUsers.id, userId));
+            await client.end();
+        }
+    });
+
+    it('a paid top-up claim is ordered against a reversal in flight by the root lock: no claim while it is held, never a wait', async () => {
+        const client = postgres(process.env.BILLING_TEST_DATABASE_URL!, {
+            max: 2, prepare: false, connection: { statement_timeout: 1000 },
+        });
+        const db = drizzle(client, { schema });
+        const billing = createBillingStore(db), store = createAiCreditOutboxStore(db), userId = randomUUID();
+        const receipt = aiTopupOutboxItem(userId, customTopupPack(2500)!, `pi_${userId.replaceAll('-', '')}`, end)!;
+        const root = String(receipt.payload.entitlementId);
+        const scope = { userId, eventKey: receipt.eventKey, kind: 'ai_grant' as const, soleReceipt: true as const };
+        try {
+            await db.insert(authUsers).values({ id: userId });
+            await billing.enqueueOutbox(receipt);
+            // A reversal being written (`recordAiReversal` takes this lock first) on another connection.
+            await client.begin(async tx => {
+                await tx`select pg_advisory_xact_lock(hashtextextended(${`billing:ai_root:${root}`}, 0))`;
+                const started = Date.now();
+                expect(await store.claim(NOW, scope)).toBeNull();
+                expect(Date.now() - started).toBeLessThan(900);
+                // Its row is written but not committed yet: invisible to the claim, which the lock alone still refuses.
+                await tx`insert into ezil_billing_outbox (event_key, user_id, kind, payload) values (${`${root}:revoke:refund:re_inflight`},
+                    ${userId}::uuid, 'ai_revoke', (${JSON.stringify(aiCreditRevokeItem(receipt, { type: 'refund', id: 're_inflight' }).payload)}::text)::jsonb)`;
+                expect(await store.claim(NOW, scope)).toBeNull();
+            });
+            // The reversal committed: the claim is free to run and now refuses on what it reads.
+            expect(await store.claim(NOW, scope)).toBeNull();
+            expect((await db.select().from(billingOutbox).where(eq(billingOutbox.eventKey, receipt.eventKey)))[0]).toMatchObject({ attempts: 0, deliveredAt: null });
+            // Without the reversal the same scoped claim takes the row once the lock is free.
+            await db.delete(billingOutbox).where(eq(billingOutbox.eventKey, `${root}:revoke:refund:re_inflight`));
+            expect(await store.claim(NOW, scope)).toMatchObject({ userId, eventKey: receipt.eventKey, attempts: 1 });
         } finally {
             await db.delete(authUsers).where(eq(authUsers.id, userId));
             await client.end();

@@ -35,7 +35,8 @@ describe('deliverPaidTopup (one scoped attempt for one paid top-up receipt)', ()
         expect(await deliverPaidTopup({ config: CONFIG, aiCredits: store }, { paymentIntentId: INTENT, fetch: fetcher })).toBe('delivered');
         expect(store.topupScope).toHaveBeenCalledWith({ paymentIntentId: INTENT });
         expect(store.claim).toHaveBeenCalledTimes(1);
-        expect(store.claim.mock.calls[0]![1]).toEqual(SCOPE);
+        // Always the sole-receipt claim, whatever the store's scope answer carried: the claim re-checks for a reversal.
+        expect(store.claim.mock.calls[0]![1]).toEqual({ ...SCOPE, soleReceipt: true });
         expect(fetcher).toHaveBeenCalledTimes(1);
         expect(String(fetcher.mock.calls[0]![0])).toBe('https://gateway.test/v1/integrations/entitlements');
         expect(JSON.parse(fetcher.mock.calls[0]![1]!.body as string)).toEqual({ eventId: `ezil-os:v1:topup:ai_custom_v2:${INTENT}:grant`,
