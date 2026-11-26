@@ -279,9 +279,11 @@ function openEmbeddedAssignment({attemptId, repo, computerId, actor, transport, 
             // request is sent sends none.
             const granting=item.granting=retry(()=>item.transport.begin({signal:item.ctl.signal}),['media_unavailable'],2,()=>live(item));
             const grant=await Promise.race([granting,new Promise((_,reject)=>{item.quit=reject;})]).finally(()=>{item.granting=item.quit=null;});
+            // A suspended phase still needs its own verified grant for cleanup.
+            if(granted(item,grant))item.grant=grant;
             check(item);
-            if(!granted(item,grant))throw failure('recording_phase_changed');
-            item.grant=grant;item.expected=grant.nextSequence;
+            if(!item.grant)throw failure('recording_phase_changed');
+            item.expected=grant.nextSequence;
             note('prepare.ready');
             return {captureSessionId:item.id,status:item.grant.status,nextSequence:item.grant.nextSequence};
         }catch(error){

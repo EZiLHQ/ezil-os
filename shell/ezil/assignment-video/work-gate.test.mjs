@@ -1499,3 +1499,30 @@ test('a bare cancel does not retire a phase whose first frame already committed'
         assert.equal(server.log.filter(event=>event==='checkpoint').length,1);
     }finally{await gate.close();await settle();p.close();}
 });
+
+test('a verified grant returned during gate close releases only the interrupted capture',async t=>{
+    const server=fakeServer(),hold=heldBegin(server);t.mock.method(globalThis,'fetch',hold.handler);
+    const w=embeddedWindow(),p=parentPort();
+    const gate=embeddedGate(w,{prepare:async()=>checkout});
+    try{
+        await bound(w,p);
+        void p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        await hold.sent;
+        const closing=gate.close();
+        await settle(50);
+        hold.release();
+        await closing;await settle(50);
+        assert.deepEqual(hold.checkpoints,[[session,'connection_lost']]);
+        assert.equal(server.log.filter(event=>['prepare','confirm','put'].includes(event)).length,0,'no recording bytes travelled');
+        const nextWindow=embeddedWindow(),nextParent=parentPort();
+        const nextGate=embeddedGate(nextWindow,{prepare:async()=>checkout});
+        try{
+            await bound(nextWindow,nextParent);
+            const reply=await nextParent.rpc('begin',{captureSessionId:successor,consentVersion:4});
+            assert.equal(reply.value.captureSessionId,successor);
+            assert.deepEqual(hold.checkpoints,[[session,'connection_lost']]);
+            assert.deepEqual((await endShare(nextParent,successor)).value,{});
+            assert.deepEqual(hold.checkpoints,[[session,'connection_lost'],[successor,'connection_lost']]);
+        }finally{await nextGate.close();await settle();nextParent.close();}
+    }finally{await gate.close();await settle();p.close();}
+});
