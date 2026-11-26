@@ -23,7 +23,13 @@ import { reconcileColdStart, reconcileColdStarts, startComputer, type BootOutcom
 
 const url = process.env.DELEGATION_TEST_DATABASE_URL;
 // This suite cannot accidentally run against a deployment or a different local DB.
-if (url && url !== 'postgres://postgres:synthetic-editor-test@127.0.0.1:32857/postgres') throw new Error('Recovery tests require the assigned disposable PostgreSQL endpoint');
+if (url && url !== 'postgres://postgres:synthetic-editor-test@127.0.0.1:32857/postgres') {
+    const target = new URL(url);
+    if (!['localhost', '127.0.0.1'].includes(target.hostname)
+        || !/^\/ezil_integration_test_[0-9]+$/.test(target.pathname)) {
+        throw new Error('Recovery tests require an assigned disposable local PostgreSQL database');
+    }
+}
 
 describe.skipIf(!url)('admitted AWS recovery on synthetic PostgreSQL', () => {
     let client: ReturnType<typeof postgres>;
