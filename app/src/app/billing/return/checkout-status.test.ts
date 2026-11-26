@@ -556,10 +556,11 @@ describe('Checkout return AI-credit fulfillment', () => {
         expect(count('billing.summary')).toBe(0);
     });
 
-    it('an incomplete top-up retains the existing unconfirmed copy', async () => {
+    it('an incomplete top-up waits in credit words and never mentions a plan', async () => {
         topup = () => topupReceipt('awaiting_payment', { status: 'pending', paymentStatus: 'unpaid', credits: null });
         await render();
-        expect(text()).toBe('Payment confirmation is pending. Your plan updates after payment is confirmed.Back to Billing');
+        expect(text()).toBe('Payment confirmation is pending. Your AI credits update after payment is confirmed.Back to Billing');
+        expect(text()).not.toMatch(/plan/i);
         expect(count('billing.summary')).toBe(0);
     });
 
@@ -570,6 +571,15 @@ describe('Checkout return AI-credit fulfillment', () => {
         expect(count('billing.summary')).toBe(0);
         await tick(60_000);
         expect(text()).not.toMatch(/Payment received|credits added/);
+    });
+
+    it('a session the server never classified stays neutral at the deadline: no plan, no credits', async () => {
+        topup = () => new Promise(() => {});
+        await render();
+        await tick(60_000);
+        expect(text()).toBe('Payment confirmation is pending. Check Settings → Billing for updates.Check againBack to Billing');
+        expect(text()).not.toMatch(/plan|credit/i);
+        expect(count('billing.summary')).toBe(0);
     });
 
     it('the paid deadline offers Check again, reclassifies, and recovers to credited', async () => {
@@ -598,7 +608,7 @@ describe('Checkout return AI-credit fulfillment', () => {
         expect(target.querySelector('button')).toBeNull();
     });
 
-    it.each([null, undefined, '1000', 1.5, Number.MAX_SAFE_INTEGER + 1])('unreadable credit amount %s retains confirmed delivery', async credits => {
+    it.each([null, undefined, '1000', 1.5, Number.MAX_SAFE_INTEGER + 1, 0, -1000, Number.NaN])('unreadable credit amount %s retains confirmed delivery', async credits => {
         topup = () => topupReceipt('credited', { credits });
         await render();
         expect(text()).toBe('Your AI credits were added. Your balance is now 1,234 credits.Back to Billing');
