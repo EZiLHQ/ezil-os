@@ -100,6 +100,8 @@ const events=[],errors=[],consoleLines=[],controls={};let seeded=false,editorClo
 const held=new Promise(r=>released=r);
 try{
     const context=await browser.newContext({viewport:{width:1200,height:780}});
+    // Every framed document counts the click-cue leases it is sent, before any of its own scripts run.
+    await context.addInitScript(()=>{window.cueLeases=0;addEventListener('message',event=>{if(event.data?.type==='ezil.assignment.click-cues')window.cueLeases++;});});
     await context.route('**/*',async route=>{
         const req=route.request(),u=new URL(req.url()),post=()=>req.postDataJSON()||{};
         const json=(body,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(body)});
@@ -235,6 +237,14 @@ try{
     assert.deepEqual(events.filter(e=>e.startsWith('desktop:')),['desktop:warm'],'one wake across share, minimise, restore, expand and the editor open');
     assert.deepEqual(controls,{windowedAtLaunch:true,head:true,minimize:1,state:'preparing',geometry:{inside:true,dock:true,clear:true},dockItem:1,expands:true,restores:true});
     assert.equal(await codeWindow.locator('.window-body').getAttribute('data-ezil-assignment-work'),'open');
+    // Released and recording: real left and right clicks on the Code window's head draw no "L" or "R" mark, and across
+    // more than one of the old sender's 1.5s renewals the shell has sent the editor no click-cue lease.
+    for(const button of ['left','right']){
+        await codeWindow.locator('> .window-head').click({button});
+        assert.equal(await os.locator('.ezil-assignment-click').count(),0,'no click mark on the shell after a '+button+' click');
+    }
+    await page.keyboard.press('Escape');await wait(1700);
+    assert.equal(await os.frameLocator('.window[data-app="code"] .window-app-iframe').locator('body').evaluate(()=>window.cueLeases),0,'no click-cue lease reaches the editor');
     for(const line of consoleLines)assert.ok(![attemptId,session,repo,proof,boot.user.id,recordingId].some(secret=>line.includes(secret)),'a diagnostic names no identifier: '+line);
     assert.deepEqual(errors,[]);
     console.log(JSON.stringify({result:'pass',prepClock,surfaces:timeline.length,port:port.map(m=>m.type),states,controls,diagnostics:consoleLines.length}));

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createHash} from 'node:crypto';
-import {confirmAssignmentFolder,embeddedAssignmentWindow,openWithAssignmentConsent,refusalClass,stageDiagnostics} from './shell.js';
+import {assignedProject,confirmAssignmentFolder,embeddedAssignmentWindow,openWithAssignmentConsent,refusalClass,stageDiagnostics} from './shell.js';
 import {createAssignmentVideoTransport} from './transport.js';
 import {assignmentWorkDesktop} from './work-protocol.js';
 const id='2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a';
@@ -275,7 +275,8 @@ function embeddedWindow(url=entry,{ancestors}={}){
         assert.equal(data.attemptId,id);return data.type;});
     const shown=text=>elements.some(e=>e.textContent===text);
     // The gate's own panel: hidden while the Code window's loader is the surface.
-    const panel=()=>elements.find(e=>e.className==='ezil-assignment-work-gate');
+    // The latest one: each Code window of the document gets its own.
+    const panel=()=>elements.findLast(e=>e.className==='ezil-assignment-work-gate');
     const screen=()=>panel().hidden?'loader':panel().children[0].children[0].textContent;
     return {win,top,posted,assigned,opened,discover,bind,types,shown,listeners,screen};
 }
@@ -1021,6 +1022,185 @@ test('the ordinary wake is asked once, only after the signed eligibility answer,
         try{out.discover();out.bind([port.port]);await settle();assert.equal(asked,0,'no wake for a refused, unverified or signed-out frame');}
         finally{await closed.close();port.close();t.mock.restoreAll();}
     }
+});
+// ── The gate belongs to the OS document: its Code window may close (native X) and open again (dock) under one capture ──
+// The document's next Code window for the same assignment, as `../apps/code.js` opens it from a projectless dock launch.
+const dockLaunch=(hooks,{who='owner',computerId='fixture',project=assignedProject({computerId,actor:()=>who})}={})=>
+    openWithAssignmentConsent({project,actor:()=>who,computerId,body:new Element(),park(){},
+        prepare:()=>assert.fail('a reopened window prepares no checkout'),open:()=>assert.fail('no editor is due'),...hooks});
+// A released, recording assignment under the signed preparation: one begin, one seed, one editor-ready, one editor-usable.
+async function releasedAssignment(t,{flag=true}={}){
+    const server=fakeServer({flag});t.mock.method(globalThis,'fetch',server.handler);
+    const w=embeddedWindow(),p=parentPort(),state={opened:0},parks=[];
+    const gate=state.gate=embeddedGate(w,{park:(...call)=>parks.push(call),prepare:async()=>checkout,open:editorOpener(state,{workbench:flag}),transport:withEditorReady});
+    await bound(w,p);
+    await p.rpc('begin',{captureSessionId:session,consentVersion:4});
+    const seed=seedPart();await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
+    const unlocked=await p.rpc('unlock',{captureSessionId:session});
+    assert.equal(unlocked.ok,true);assert.equal(gate.locked(),false);
+    assert.deepEqual(p.types(),['capture-ready','ready','editor-usable']);assert.deepEqual(w.types(),['preparing','ready']);
+    return {server,w,p,state,gate,parks,unlocked};
+}
+const count=(log,action)=>log.filter(entry=>(Array.isArray(entry)?entry[0]:entry)===action).length;
+test('closing only the Code window keeps the port, the capture and both clocks; the dock opens the same checkout again, once',async t=>{
+    const {server,w,p,state,gate}=await releasedAssignment(t);
+    try{
+        const before={port:p.got.length,window:w.posted.length,log:server.log.length};
+        state.frame.isConnected=false;gate.detach();await settle(20);
+        // Nothing is said and nothing ends: no pause, no reopen, no window state, no request.
+        assert.deepEqual({port:p.got.length,window:w.posted.length,log:server.log.length},before,'native X is silent on the port, the window and the server');
+        assert.equal(gate.locked(),true,'no editor without a window');
+        assert.deepEqual(gate.access(),{attemptId:id,phase:'reopen',repoOpenProof:proof,captureSessionId:session},'the original receipt and capture are still this document\'s');
+        // The capture goes on without a Code window: the parent's pulse and its next clip are taken as before.
+        p.post('pulse',{captureSessionId:session});
+        const clip=seedPart({sequence:1,startMs:0,endMs:11000});
+        assert.deepEqual((await p.rpc('upload',{captureSessionId:session,part:clip},[clip.bytes])).value,{confirmed:true,sequence:1});
+        assert.deepEqual((await p.rpc('status',{captureSessionId:session})).value,
+            {captureSessionId:session,status:'recording',stopRequestedAt:null,deadlineAt:server.moved.deadlineAt,serverNow:server.moved.serverNow});
+        // A projectless launch finds the assigned repository only for this person and this computer.
+        assert.deepEqual(assignedProject({computerId:'fixture',actor:()=>'owner'}),{repoUrl:repo});
+        assert.equal(assignedProject({computerId:'another',actor:()=>'owner'}),null);
+        assert.equal(assignedProject({computerId:'fixture',actor:()=>'someone-else'}),null);
+        assert.equal(assignedProject({computerId:'fixture',actor:()=>null}),null);
+        assert.equal(assignedProject({computerId:'fixture',actor:()=>'owner',win:{...w.win}}),null,'another window is not this document');
+        // The dock's window: the same gate, parked under its own loader until ITS editor mounts the verified workbench.
+        const again={opened:0},parks=[];
+        again.gate=dockLaunch({park:(...call)=>parks.push(call),open:editorOpener(again,{workbench:false})});
+        assert.equal(again.gate,gate,'the document\'s gate, not a second one');
+        assert.deepEqual(parks,[[true,true]]);assert.equal(w.screen(),'loader');
+        await settle(20);
+        assert.equal(again.opened,1,'one fresh editor');
+        assert.deepEqual(again.access,{attemptId:id,phase:'reopen',repoOpenProof:proof,captureSessionId:session},'a reopen of the original receipt and capture');
+        assert.equal(count(server.log,'preflight'),2,'no eligibility, checkout or begin is asked again');
+        assert.equal(gate.locked(),true,'the folder echo alone does not release it');
+        assert.ok(parks.every(call=>call[0]===true));
+        state.report(true);await settle();
+        assert.equal(gate.locked(),true,'the closed window\'s editor is not this window\'s');
+        again.report(true);await settle();
+        assert.equal(gate.locked(),false);assert.deepEqual(parks.at(-1),[false,false]);
+        again.report(true);await settle();
+        assert.deepEqual(parks.filter(call=>call[0]===false).length,1,'released once');
+        // One begin, one clock, one editor-ready, one editor-usable; no pause, no reopen, no second window state.
+        assert.equal(count(server.log,'begin'),1);assert.equal(server.asked.length,1,'editor-ready is never signed twice');
+        assert.deepEqual(p.types(),['capture-ready','ready','editor-usable']);assert.deepEqual(w.types(),['preparing','ready']);
+        assert.equal(count(server.log,'checkpoint'),0);
+        // The explicit Stop still ends the phase at once.
+        p.post('lock',{captureSessionId:session,reason:'sharing_stopped'});await settle();
+        assert.equal(gate.locked(),true);assert.equal(gate.access(),null);assert.equal(w.screen(),'Sharing paused');
+        assert.deepEqual((await p.rpc('end',{captureSessionId:session,reason:'sharing_stopped',expectedSegments:2})).value,{});
+        assert.equal(server.log.at(-1),'checkpoint');
+        // A stopped share draws its own message in the next window too, and opens no editor.
+        again.frame.isConnected=false;gate.detach();
+        const third=dockLaunch({});assert.equal(third,gate);assert.equal(w.screen(),'Sharing paused');await settle();
+    }finally{await gate.close();await settle();p.close();}
+});
+test('a reopened editor on any folder but the verified checkout ends the phase as a lost workspace does',async t=>{
+    const {server,w,p,state,gate}=await releasedAssignment(t);
+    try{
+        state.frame.isConnected=false;gate.detach();
+        const again={opened:0};
+        again.gate=dockLaunch({open:editorOpener(again,{root:'/workspace/other',folder:'/workspace/other',workbench:true})});
+        await settle(30);
+        assert.equal(again.opened,1);assert.equal(gate.locked(),true);assert.equal(gate.access(),null);
+        assert.deepEqual(p.types(),['capture-ready','ready','editor-usable','pause']);
+        assert.deepEqual(p.got.findLast(d=>d.type==='pause'),{protocol,attemptId:id,type:'pause',reason:'connection_lost',effectiveAt:null});
+        assert.equal(server.log.at(-1),'checkpoint');assert.equal(w.screen(),'Sharing paused');assert.equal(server.asked.length,1);
+    }finally{await gate.close();await settle();p.close();}
+});
+test('without a Code window, Stop, the outer pagehide and any other Code launch still end the phase at once',async t=>{
+    // Stop: the parent's lock and end are taken exactly as with a window.
+    let f=await releasedAssignment(t);
+    f.state.frame.isConnected=false;f.gate.detach();
+    f.p.post('lock',{captureSessionId:session,reason:'sharing_stopped'});await settle();
+    assert.equal(f.gate.access(),null);
+    assert.deepEqual((await f.p.rpc('end',{captureSessionId:session,reason:'sharing_stopped',expectedSegments:1})).value,{});
+    assert.equal(f.server.log.at(-1),'checkpoint');assert.deepEqual(f.p.types(),['capture-ready','ready','editor-usable']);
+    await f.gate.close();await settle();f.p.close();
+    // The document going away: the keepalive checkpoint, then pause and reopen, as before.
+    t.mock.restoreAll();f=await releasedAssignment(t);
+    f.state.frame.isConnected=false;f.gate.detach();
+    assert.equal(f.w.listeners.get('pagehide').size,1,'the document\'s own pagehide stays bound while the window is closed');
+    for(const fn of [...f.w.listeners.get('pagehide')])fn();
+    await settle(20);
+    assert.equal(f.gate.access(),null);assert.equal(assignedProject({computerId:'fixture',actor:()=>'owner'}),null,'a closing gate is not taken back');
+    assert.ok(count(f.server.log,'checkpoint')>=1);assert.equal(f.p.types().at(3),'pause');
+    await endShare(f.p);await f.gate.close();await settle();
+    assert.deepEqual(f.p.types(),['capture-ready','ready','editor-usable','pause','reopen']);f.p.close();
+    // Another person, another computer or another project in this document's next Code window: the held phase ends.
+    for(const other of [{who:'someone-else'},{computerId:'another'},{project:null},{project:{repoUrl:'https://github.ezil.work/default/ordinary.git'}}]){
+        t.mock.restoreAll();f=await releasedAssignment(t);
+        f.state.frame.isConnected=false;f.gate.detach();
+        let opened=0;
+        const next=dockLaunch({open:()=>{opened++;},prepare:async()=>checkout},other);
+        assert.notEqual(next,f.gate,JSON.stringify(other));
+        await settle(20);
+        assert.equal(f.gate.access(),null);assert.equal(f.p.types().at(3),'pause',JSON.stringify(other));
+        await endShare(f.p);await f.gate.close();await settle();
+        assert.deepEqual(f.p.types(),['capture-ready','ready','editor-usable','pause','reopen'],JSON.stringify(other));
+        assert.equal(f.server.asked.length,1);
+        await next?.close();f.p.close();
+    }
+});
+test('a Code window closed while its share prepares is not a refusal: the document is asked for the window, and the same phase goes on in it',async t=>{
+    const server=fakeServer({flag:true});t.mock.method(globalThis,'fetch',server.handler);
+    const w=embeddedWindow(),p=parentPort(),first={opened:0};let summoned=0,dropCheckout;
+    const summon=()=>{summoned++;};
+    const gate=first.gate=embeddedGate(w,{summon,transport:withEditorReady,open:editorOpener(first,{workbench:true}),
+        prepare:()=>new Promise((_,reject)=>{dropCheckout=()=>reject(Object.assign(new Error('closed'),{code:'workspace_disconnected'}));})});
+    try{
+        await bound(w,p);
+        const beginning=p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        await settle();
+        // Native X while the checkout prepares: that window's mint is dropped, the phase is not.
+        gate.detach();dropCheckout();await settle(20);
+        assert.equal(summoned,1,'the document is asked for its Code window');
+        assert.deepEqual(p.types(),['capture-ready','ready']);assert.equal(count(server.log,'begin'),0);
+        const second={opened:0};
+        second.gate=dockLaunch({summon,prepare:async()=>checkout,open:editorOpener(second,{workbench:true})});
+        assert.equal(second.gate,gate);
+        const grant=await beginning;
+        assert.deepEqual(grant.value,{captureSessionId:session,status:'awaiting_frame',nextSequence:0});
+        assert.equal(count(server.log,'begin'),1);
+        const seed=seedPart();await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
+        // Closed again before the editor is asked for: unlock asks for the window and opens the editor in it.
+        gate.detach();
+        const unlocking=p.rpc('unlock',{captureSessionId:session});
+        await settle(30);
+        assert.equal(summoned,2);assert.equal(second.opened,0);
+        const third={opened:0};
+        third.gate=dockLaunch({summon,open:editorOpener(third,{workbench:true})});
+        const unlocked=await unlocking;
+        assert.equal(unlocked.ok,true,JSON.stringify(unlocked));assert.equal(third.opened,1);assert.equal(gate.locked(),false);
+        assert.equal(third.access.phase,'open','the first release of a capture is still an open');
+        assert.deepEqual(p.types(),['capture-ready','ready','editor-usable']);assert.equal(server.asked.length,1);
+        assert.equal(count(server.log,'begin'),1);assert.equal(count(server.log,'checkpoint'),0);
+        await endShare(p);
+    }finally{await gate.close();await settle();p.close();}
+});
+test('an editor-ready answered after its window closed is kept: the next window is released on it, and Universe is not asked again',async t=>{
+    let answer;const hold=new Promise(r=>answer=r);
+    const server=fakeServer({flag:true,ack:{hold}});t.mock.method(globalThis,'fetch',server.handler);
+    const w=embeddedWindow(),p=parentPort(),first={opened:0};
+    const gate=first.gate=embeddedGate(w,{prepare:async()=>checkout,open:editorOpener(first,{workbench:true}),transport:withEditorReady});
+    try{
+        await bound(w,p);
+        await p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        const seed=seedPart();await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
+        const unlocking=p.rpc('unlock',{captureSessionId:session});
+        await settle(30);
+        assert.equal(server.asked.length,1);
+        first.frame.isConnected=false;gate.detach();
+        answer();await settle(30);
+        assert.equal(gate.locked(),true);assert.deepEqual(p.types(),['capture-ready','ready'],'a closed window releases nothing');
+        const second={opened:0};
+        second.gate=dockLaunch({open:editorOpener(second,{workbench:true})});
+        const unlocked=await unlocking;
+        assert.equal(unlocked.ok,true,JSON.stringify(unlocked));assert.equal(second.opened,1);assert.equal(gate.locked(),false);
+        assert.equal(server.asked.length,1,'one signed editor-ready for the capture');
+        assert.deepEqual(p.got.filter(d=>d.type==='editor-usable'),
+            [{protocol,attemptId:id,type:'editor-usable',captureSessionId:session,deadlineAt:server.work.deadlineAt,serverNow:server.work.serverNow}]);
+        await endShare(p);
+    }finally{await gate.close();await settle();p.close();}
 });
 test('stage diagnostics carry only the attempt tag and a coarse refusal class, and do nothing without Web Crypto',async()=>{
     const lines=[],note=stageDiagnostics(id,{log:{info:line=>lines.push(line)}});
