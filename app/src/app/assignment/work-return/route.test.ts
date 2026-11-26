@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { safeReturnUrl } from '@/utils/constants';
 import { embeddedCodeAttempt, embeddedWorkReturn, listenForWorkSignIn, workReturnAttempt } from '@/utils/assignment-work-auth';
 
@@ -18,6 +19,7 @@ const repo='https://github.ezil.work/default/u-0123456789abcdef-a-'+id+'.git';
 const request=(path=returned, dest='document',host=origin)=>new Request(host+path,{headers:{'sec-fetch-dest':dest}});
 const subject='auth0|builder', hourMs=3_600_000;
 const kept=(sub=subject,validFor=10*hourMs)=>({subject:sub,expiresAt:Date.now()+validFor});
+afterEach(()=>{vi.restoreAllMocks();});
 beforeEach(()=>{vi.clearAllMocks();mocks.enabled.mockReturnValue(true);mocks.context.mockResolvedValue({user:{id:'signed-in'},delegation:null});
     mocks.identity.mockImplementation(async()=>kept());});
 
@@ -220,3 +222,58 @@ describe('embedded workspace return: the same EZiL ID, kept for the work window,
         }
     });
 });
+
+describe('embedded workspace return: one structured decision line, correlated with Universe, carrying no input',()=>{
+    const embedded=returned+'&workspace=1', other='auth0|someone-else', cookie='__Host-ezil-work-return';
+    const owned=embedded+'&owner='+ownerRepositoryName(subject,'a-'+id).slice(2,18);
+    const signedOut={user:null,delegation:null}, lost=()=>Promise.reject(new Error('private thrown text '+subject));
+    // SHA-256('ezil.assignment.stage.v1' NUL attempt) for this file's attempt, computed outside this repository.
+    const attemptTag='8c472e1bbbcb7f77';
+    let lines: string[];
+    beforeEach(()=>{lines=[];vi.spyOn(console,'info').mockImplementation((...args:unknown[])=>{lines.push(args.map(String).join(' '));});});
+    const get=(path:string,jar?:string,dest='document',host=origin)=>
+        GET(new Request(host+path,{headers:{'sec-fetch-dest':dest,cookie:'session=private-cookie-value'+(jar?'; '+jar:'')}}));
+
+    it('derives the shared tag from the fixed prefix, one NUL byte and the canonical attempt id',async()=>{
+        const expected=createHash('sha256').update(Buffer.concat([Buffer.from('ezil.assignment.stage.v1','utf8'),Buffer.from([0]),Buffer.from(id,'utf8')])).digest('hex').slice(0,16);
+        expect(expected).toBe(attemptTag);
+        await get(owned);
+        expect(JSON.parse(lines[0]!).attemptTag).toBe(attemptTag);
+    });
+    it.each([
+        ['idp_signin',signedOut,undefined,false],
+        ['storage_unavailable',signedOut,undefined,true],
+        ['identity_refresh',undefined,lost,false],
+        ['identity_unavailable',undefined,lost,true],
+        ['account_mismatch',undefined,async()=>kept(other),false],
+        ['account_mismatch',undefined,async()=>kept(other),true],
+        ['workspace_return',undefined,async()=>kept(),false],
+        ['workspace_return',undefined,async()=>kept(),true],
+    ] as const)('%s is exactly one line of three fixed keys',async(outcome,context,identity,marked)=>{
+        if(context)mocks.context.mockResolvedValue(context);
+        if(identity)mocks.identity.mockImplementation(identity);
+        await get(owned,marked?cookie+'='+id:undefined);
+        expect(lines).toHaveLength(1);
+        const line=lines[0]!;
+        expect(JSON.parse(line)).toEqual({event:'ezil_assignment_work_return',outcome,attemptTag});
+        expect(Object.keys(JSON.parse(line))).toEqual(['event','outcome','attemptTag']);
+        expect(line).toMatch(/^\{"event":"ezil_assignment_work_return","outcome":"[a-z_]+","attemptTag":"[0-9a-f]{16}"\}$/);
+        // Nothing that arrived with the request, identifies a person, or was thrown.
+        for(const secret of [id,owned.slice(-16),subject,other,'signed-in','private','http','/assignment','cookie',cookie,'owner'])
+            expect(line).not.toContain(secret);
+    });
+    it('a link without the owner tag is logged the same way',async()=>{
+        await get(embedded);
+        expect(lines.map(line=>JSON.parse(line))).toEqual([{event:'ezil_assignment_work_return',outcome:'workspace_return',attemptTag}]);
+    });
+    it('writes nothing for the standalone return, a rejected address, a frame, production, a disabled stage or a delegation',async()=>{
+        await get(returned);
+        await get(embedded+'&x=1');await get(owned+'0');await get('/assignment/work-return?attempt='+id.toUpperCase()+'&workspace=1');
+        await get(owned,undefined,'iframe');
+        await get(owned,undefined,'document','https://os.ezil.work');
+        mocks.enabled.mockReturnValueOnce(false);await get(owned);
+        mocks.context.mockResolvedValue({user:{id:'signed'},delegation:{}});await get(owned);
+        expect(lines).toEqual([]);
+    });
+});
+

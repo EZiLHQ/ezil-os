@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { createTRPCContext } from '@/server/api/trpc';
 import { osOrigin, universeOrigin } from '@/server/assignment-video/contract';
 import { retainedIdentity } from '@/server/auth/retained-identity';
@@ -19,6 +21,19 @@ const refreshCookie = (value: string, maxAge: number) =>
     `${REFRESH_COOKIE}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
 const refreshed = (request: Request, attempt: string) =>
     (request.headers.get('cookie') ?? '').split(';').some(part => part.trim() === `${REFRESH_COOKIE}=${attempt}`);
+
+type Outcome = 'idp_signin' | 'identity_refresh' | 'storage_unavailable' | 'identity_unavailable' | 'account_mismatch' | 'workspace_return';
+
+/**
+ * One line per decision on an accepted embedded return, and nothing else: a fixed event, one of the outcomes above
+ * and `attemptTag`, the stage correlation tag shared with Universe: the first 16 hex of
+ * SHA-256(`ezil.assignment.stage.v1` NUL attempt id). Never the attempt, a person, an owner tag, a URL, a cookie or
+ * any text that arrived with the request or was thrown.
+ */
+function record(outcome: Outcome, attempt: string): void {
+    const attemptTag = createHash('sha256').update('ezil.assignment.stage.v1\0' + attempt, 'utf8').digest('hex').slice(0, 16);
+    console.info(JSON.stringify({ event: 'ezil_assignment_work_return', outcome, attemptTag }));
+}
 
 /**
  * `/assignment/work-return` — where the Universe assignment page sends its own tab for an EZiL OS sign-in, and where
@@ -65,12 +80,15 @@ export async function GET(request: Request): Promise<Response> {
     const signIn = osOrigin + '/auth/auth0/login?';
     const tried = refreshed(request, attempt);
     const settled = tried ? refreshCookie('', 0) : undefined;
-    const unfinished = () => to(lockScreen({error: 'auth_callback_failed'}), settled);
-    if (!ctx.user) return tried ? unfinished() : to(signIn + getReturnUrlQueryParam(returnPath), refreshCookie(attempt, 120));
+    const answer = (outcome: Outcome, location: string, cookie = settled) => { record(outcome, attempt); return to(location, cookie); };
+    const unfinished = lockScreen({error: 'auth_callback_failed'});
+    // Back from the one automatic trip and still no OS session: this browser did not keep it.
+    if (!ctx.user) return tried ? answer('storage_unavailable', unfinished)
+        : answer('idp_signin', signIn + getReturnUrlQueryParam(returnPath), refreshCookie(attempt, 120));
     const identity = await retainedIdentity(ctx.user.id).catch(() => null);
-    if (!identity) return tried ? unfinished()
-        : to(signIn + new URLSearchParams({prompt: 'none', returnUrl: returnPath}), refreshCookie(attempt, 120));
+    if (!identity) return tried ? answer('identity_unavailable', unfinished)
+        : answer('identity_refresh', signIn + new URLSearchParams({prompt: 'none', returnUrl: returnPath}), refreshCookie(attempt, 120));
     if (embedded.owner !== null && ownerRepositoryName(identity.subject, 'a-' + attempt) !== `u-${embedded.owner}-a-${attempt}`)
-        return to(lockScreen({error: workAccountNotice}), settled);
-    return to(universeOrigin + '/assignment/workspace/' + attempt, settled);
+        return answer('account_mismatch', lockScreen({error: workAccountNotice}));
+    return answer('workspace_return', universeOrigin + '/assignment/workspace/' + attempt);
 }
