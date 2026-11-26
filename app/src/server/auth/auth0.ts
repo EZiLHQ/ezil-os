@@ -15,7 +15,9 @@ export const AUTH0_COOKIE_OPTIONS = { httpOnly: true, secure: true, sameSite: 'l
 const TEN_MINUTES = 600_000;
 
 type ErrorCode = 'auth0_disabled' | 'invalid_transaction' | 'state_mismatch' | 'token_exchange_failed'
-    | 'invalid_id_token' | 'email_unverified' | 'account_conflict' | 'session_failed' | 'auth0_failed';
+    | 'invalid_id_token' | 'email_unverified' | 'account_conflict' | 'session_failed' | 'auth0_failed'
+    /** A silent refresh for an embedded assignment answered for another account (`assignment/work-return`). */
+    | 'assignment_account';
 
 export class Auth0Error extends Error {
     constructor(readonly code: ErrorCode) { super(code); }

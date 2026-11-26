@@ -64,6 +64,17 @@ describe('EZiL ID is the only sign-in', () => {
         expect(await render({returnUrl:url})).toContain('/auth/auth0/login?'+new URLSearchParams({returnUrl:url}));
         expect(await render({returnUrl:url+'&next=https://other.example/'})).toContain('/auth/auth0/login?returnUrl=%2Fos');
     });
+    it('🔴 the wrong account for an embedded assignment is named, and Continue asks EZiL ID for the account', async () => {
+        const back = '/assignment/work-return?attempt=2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a&workspace=1&owner=0123456789abcdef';
+        const html = await render({ error: 'assignment_account', returnUrl: back });
+        expect(html).toContain('This assignment needs the EZiL ID you use on Universe.');
+        expect(html).toContain('href="/auth/auth0/login?' + new URLSearchParams({ prompt: 'login', returnUrl: back }).toString().replace(/&/g, '&amp;') + '"');
+        expect(html).toContain('Sign out and use another account');
+        // The explicit prompt belongs to that return only: the code alone, or any other error, keeps the plain link.
+        expect(await render({ error: 'assignment_account', returnUrl: '/os' })).toContain('href="/auth/auth0/login?returnUrl=%2Fos"');
+        expect(await render({ error: 'account_conflict', returnUrl: back })).toContain('href="/auth/auth0/login?' + new URLSearchParams({ returnUrl: back }) + '"');
+        expect(await render({ returnUrl: back })).not.toContain('prompt=login');
+    });
     it('carries a safe destination through EZiL ID', async () => {
         const html = await render({ returnUrl: '/os?computer=one' });
         expect(html).toContain('href="/auth/auth0/login?returnUrl=%2Fos%3Fcomputer%3Done"');

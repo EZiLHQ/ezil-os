@@ -344,3 +344,43 @@ describe('Auth0 callback carries a promoter Billing link (?coupon=<alias>) throu
         expect(response.headers.get('location')).toBe(`${origin}${billing}`);
     });
 });
+
+describe('Auth0 callback returning to an embedded assignment workspace', () => {
+    const attempt = 'ba4cf399-1f9b-43e5-be10-45e403bc0190';
+    const back = `/assignment/work-return?attempt=${attempt}&workspace=1&owner=0123456789abcdef`;
+    async function returning(returnUrl: string, prompt?: 'none') {
+        stub.set.mockClear();
+        const url = await buildAuthorizeUrl({ origin, returnUrl, ...(prompt ? { prompt } : {}) });
+        return new NextRequest(`${origin}/auth/auth0/callback?${new URLSearchParams({ state: url.searchParams.get('state')!, code: 'private-code' })}`,
+            { headers: { cookie: `${AUTH0_COOKIE}=${stub.set.mock.calls[0][1]}` } });
+    }
+    it('🔴 a silent answer for another account is refused and named as an account choice, still headed for the same return', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stub.refuseSwitch.mockRejectedValue(new Auth0Error('account_conflict'));
+        const response = await GET(await returning(back, 'none'));
+        expect(response.headers.get('location')).toBe(failed('assignment_account', back));
+        expect(stub.bridge).not.toHaveBeenCalled();
+        expect(stub.retain).not.toHaveBeenCalled();
+        expectCleared(response);
+    });
+    it('any other silent refusal, and a conflict anywhere else, keep their own code', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stub.refuseSwitch.mockRejectedValue(new Auth0Error('session_failed'));
+        expect((await GET(await returning(back, 'none'))).headers.get('location')).toBe(failed('session_failed', back));
+        stub.refuseSwitch.mockRejectedValue(new Auth0Error('account_conflict'));
+        const standalone = `/assignment/work-return?attempt=${attempt}`;
+        expect((await GET(await returning(standalone, 'none'))).headers.get('location')).toBe(failed('account_conflict', standalone));
+        // The bridge's own conflict (an email linked to another EZiL ID) is not an account choice.
+        stub.refuseSwitch.mockResolvedValue(undefined);
+        stub.bridge.mockRejectedValue(new Auth0Error('account_conflict'));
+        expect((await GET(await returning(back, 'none'))).headers.get('location')).toBe(failed('account_conflict', back));
+        expect((await GET(await returning(back))).headers.get('location')).toBe(failed('account_conflict', back));
+    });
+    it('a successful sign-in or refresh comes back to the same return, byte for byte', async () => {
+        for (const prompt of [undefined, 'none'] as const) {
+            const response = await GET(await returning(back, prompt));
+            expect(response.headers.get('location')).toBe(origin + back);
+            expect(stub.retain).toHaveBeenCalledWith('private-id-token');
+        }
+    });
+});
