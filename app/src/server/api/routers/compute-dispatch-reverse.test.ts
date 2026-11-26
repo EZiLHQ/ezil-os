@@ -557,6 +557,29 @@ describe('computer.move.start / retry (§5.9): nested, pinned order, every refus
         expect([...viaClick.moves, ...viaOpen.moves].map(r => r.started_by)).toEqual(['user', 'open']);
     });
 
+    it('the explicit Free override lane: startedBy cron writes a cron row, after the same pinned checks and its own confirmStart right before the create', async () => {
+        const viaCron = world([held()]);
+        const confirmStart = vi.fn(async () => true);
+        const started = await startReverseMove(viaCron.db, { userId: U, computerId: C }, 'start', { schedule: h.schedule, startedBy: 'cron', confirmStart });
+        expect(started).toMatchObject({ ok: true, move: { stage: 'saving' } });
+        expect(viaCron.moves.map(r => r.started_by)).toEqual(['cron']);
+        expect(confirmStart).toHaveBeenCalledTimes(1);
+        expect(h.schedule).toHaveBeenCalledTimes(1);
+    });
+
+    it('confirmStart refused (natural Free after the override expired) or throwing: move_not_held, no row; the pinned refusals come first', async () => {
+        const refused = world([held()]);
+        expect(await startReverseMove(refused.db, { userId: U, computerId: C }, 'start', { startedBy: 'cron', confirmStart: async () => false })).toEqual({ ok: false, reason: 'move_not_held' });
+        expect(refused.moves).toEqual([]);
+        const thrown = world([held()]);
+        expect(await startReverseMove(thrown.db, { userId: U, computerId: C }, 'start', { startedBy: 'cron', confirmStart: async () => { throw new Error('db'); } })).toEqual({ ok: false, reason: 'move_not_held' });
+        expect(thrown.moves).toEqual([]);
+        const confirmStart = vi.fn(async () => true);
+        const running = world([held({ state: 'RUNNING' })]);
+        expect(await startReverseMove(running.db, { userId: U, computerId: C }, 'start', { startedBy: 'cron', confirmStart })).toEqual({ ok: false, reason: 'move_computer_running' });
+        expect(confirmStart).not.toHaveBeenCalled();
+    });
+
     describe('refusals, in check order', () => {
         it('1. no 0012 → move_unsupported, before anything else', async () => {
             const w = world([held({ state: 'RUNNING' })], { present: false });

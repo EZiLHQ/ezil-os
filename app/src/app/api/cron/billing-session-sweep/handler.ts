@@ -1,5 +1,6 @@
 import { reconcilePaidCloudflareUsers } from '@/server/lib/compute/provider-migrate-reconcile';
 import { advanceStaleMigrations } from '@/server/lib/compute/provider-migrate-orchestrator';
+import { explicitFreeOverrideState, reconcileFreeOverrideMovesInSweep, type OverrideReconcileCounts } from '@/server/lib/compute/provider-reverse-override';
 import { advanceReverseMoves } from '@/server/lib/compute/provider-reverse-runtime';
 import { createProviderReverseStore, REVERSE_MOVE_IN_FLIGHT, reverseMovesTablePresent } from '@/server/lib/compute/provider-reverse-store';
 import type { PlacementExecutor } from '@/server/lib/compute/placement';
@@ -48,6 +49,8 @@ export interface BillingSessionSweepCounts {
     ai?: { drained: number; delivered: number; retried: number; failed: number };
     /** The AI plan refresh of this sweep (`refreshAiPlans`), when wired. */
     aiPlans?: AiPlanRefreshCounts;
+    /** The explicit Free override reconciliation of this sweep (provider-reverse-override.ts); absent when it did not run. */
+    overrideMoves?: OverrideReconcileCounts;
 }
 
 /** Placement evidence for a stale AWS epoch; `stoppedAt` is the provider-observed stop, when recorded. */
@@ -82,7 +85,14 @@ export function reverseMoveInFlightFor(executor: PlacementExecutor): ReverseMove
     };
 }
 
-export async function handleBillingSessionSweep({ deps, now, stop, isStillRunning, awsStopProof, runningAwsPlacements, reverseMoveInFlight, refreshAiPlans, limit = 50 }: {
+/**
+ * Whether the explicit Free override lane may own an owner's AWS stops this sweep: proven by the caller (`true`, or a
+ * probe such as `freeOverrideHandoffReady`), never assumed. Omitted = `false`: every stop is the sweep's own.
+ */
+export type OverrideLaneReadiness = boolean | (() => Promise<boolean>);
+
+export async function handleBillingSessionSweep({ deps, now, stop, isStillRunning, awsStopProof, runningAwsPlacements, reverseMoveInFlight, refreshAiPlans, limit = 50,
+    overrideLane = false }: {
     deps: BillingDeps;
     now: Date;
     stop: (computer: ComputerRef, reason: SweepReason) => Promise<StopOutcome>;
@@ -100,10 +110,20 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
      */
     refreshAiPlans?: () => Promise<AiPlanRefreshCounts>;
     limit?: number;
+    /**
+     * Whether the explicit Free override lane can run this sweep (`freeOverrideHandoffReady`: the AWS configuration AND
+     * its schema, 0019 and 0012, which production lacks). While it can (and billing is on: `tabEnabled`, the lane's own
+     * gate), an AWS session or host of an owner under an explicit Free override is that lane's to stop (a guarded stop):
+     * the policy, retry and held-overrun stops below leave it alone. A probe is resolved at most once per sweep, and only
+     * once such an owner is seen; a probe that throws is `false`. Not ready, not proven (omitted: tests, an older
+     * caller) or a read error: every stop and Free bound is the sweep's own, as before (the handoff fails closed).
+     */
+    overrideLane?: OverrideLaneReadiness;
 }): Promise<BillingSessionSweepCounts> {
     const startedAt = Date.now();
     const counts = { examined: 0, stopped: 0, closed: 0, stopFailed: 0, heartbeatClosed: 0, retried: 0, shadow: 0, awsStaleClosed: 0,
-        heldOverrun: 0, ai: { drained: 0, delivered: 0, retried: 0, failed: 0 }, aiPlans: undefined as AiPlanRefreshCounts | undefined };
+        heldOverrun: 0, ai: { drained: 0, delivered: 0, retried: 0, failed: 0 }, aiPlans: undefined as AiPlanRefreshCounts | undefined,
+        overrideMoves: undefined as OverrideReconcileCounts | undefined };
     const drain = async () => {
         try {
             const drained = await drainAiCreditOutbox(deps, { limit: 25, deadlineMs: startedAt + 40_000 });
@@ -187,6 +207,26 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
             return state;
         }
         const attempted = new Set<string>();
+        /**
+         * The lane's readiness, resolved once per sweep and only when an explicit-override owner's AWS host is in question
+         * (no probe for a sweep with none). A throw is `false`, once: the handoff fails closed to the ordinary stops.
+         */
+        let laneReady: Promise<boolean> | null = null;
+        const handoffReady = (): Promise<boolean> => laneReady ??= (async () => {
+            if (typeof overrideLane !== 'function') return overrideLane;
+            try { return await overrideLane(); } catch (error) {
+                console.warn('[billing.sweep] override lane readiness unavailable', { error: error instanceof Error ? error.name : 'unknown' });
+                return false;
+            }
+        })();
+        /**
+         * An AWS session (any size but free-cf) or host whose owner is under an explicit Free override is the override lane's
+         * (provider-reverse-override.ts: a guarded stop, then the move); its receipt closes the session. Never a Cloudflare
+         * one, and only while the lane can run (`handoffReady`): without 0012 (production) the sweep keeps its own stop.
+         */
+        const overrideOwned = async (userId: string, size: string | null) =>
+            overrideLane !== false && deps.config.tabEnabled && size !== 'free-cf'
+            && explicitFreeOverrideState(await stateFor(userId)) && await handoffReady();
         async function tryStop(computer: ComputerRef, reason: SweepReason) {
             attempted.add(computer.computerId);
             try {
@@ -217,6 +257,9 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
 
         for (const epoch of policyCandidates) {
             const state = await stateFor(epoch.userId);
+            // Explicit Free override on AWS: the override lane stops the host (guarded) and the receipt closes this session at
+            // its real end; no unfenced stop and no deadline close from here. Counted as examined only.
+            if (await overrideOwned(epoch.userId, epoch.size)) continue;
             const maximum = state.sessionMaxSeconds === null ? Infinity : Date.parse(epoch.readyAt) + state.sessionMaxSeconds * 1000;
             // Paid compute policy v1: a paid Standard/Premium session is never closed or stopped for hours (a stored
             // deadline from an older app or from fair use is no bound). Only its six-hour session cap ends it: saved and
@@ -273,6 +316,8 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
                 if (epoch.endReason === 'session_max' && (await stateFor(epoch.userId)).sessionMaxSeconds === null) continue;
                 // Paid compute policy v1: an hours close (an older app's) is never retried against a now-unmetered paid plan.
                 if (epoch.endReason === 'allowance_exhausted' && paidComputeUnmeteredState(await stateFor(epoch.userId))) continue;
+                // A retry is the same unfenced stop: an explicit-override owner's AWS host is the override lane's.
+                if (await overrideOwned(epoch.userId, epoch.size)) continue;
                 const computer = { userId: epoch.userId, computerId: epoch.computerId };
                 let running = false;
                 try { running = await isStillRunning(computer, new Date(epoch.endedAt!)); } catch { /* No blind retries on an unavailable status. */ }
@@ -308,6 +353,9 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
                         const state = await stateFor(computer.userId);
                         // The gate's hold test (compute-access.ts gateComputerStart): Free-effective with an AWS computer.
                         if (!state.v3 || state.provider === 'aws') continue;
+                        // An explicit Free override's RUNNING host is the override lane's guarded stop, not a held overrun: while
+                        // the lane can run (`overrideOwned`); otherwise the held bound keeps it, as before.
+                        if (await overrideOwned(computer.userId, null)) continue;
                         const closedSeconds = Math.floor((now.getTime() - candidate.closedAt.getTime()) / 1000);
                         if (candidate.state === 'UNCONFIRMED') {
                             console.warn(JSON.stringify({ event: 'held-unconfirmed', computer: computer.computerId.slice(0, 8), closedSeconds }));
@@ -330,6 +378,11 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
                 after = read.next;
             }
         }
+        // Explicit Free override reconciliation (provider-reverse-override.ts): a paid computer still on AWS whose owner an
+        // operator moved to Free gets the existing reverse move (a guarded stop first while RUNNING, a session open or not). Bounded,
+        // no-op without the feature or its schema, and never a throw into the sweep; the reverse pass below drives its rows.
+        try { counts.overrideMoves = await reconcileFreeOverrideMovesInSweep(startedAt) ?? undefined; }
+        catch { console.warn('[billing.sweep] override reconcile unavailable'); }
         await advanceStaleMigrations(startedAt);
         await reconcilePaidCloudflareUsers(startedAt);
         await drain();

@@ -16,6 +16,7 @@ import { runningAwsComputersAfterEpochs } from '@/server/billing/store';
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { readLastUsageStop, readPlacement, type ResolvedPlacement } from '@/server/lib/compute/placement';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
+import { freeOverrideHandoffReady } from '@/server/lib/compute/provider-reverse-override';
 import { advanceReverseMoves } from '@/server/lib/compute/provider-reverse-runtime';
 import { handleBillingSessionSweep, reverseMoveInFlightFor } from './handler';
 import { aiIncludedModelsFor } from '@/server/billing/v3/ai-models';
@@ -45,6 +46,7 @@ vi.mock('@/server/billing/ai-credits-pending', () => ({ aiCreditsPendingFor: vi.
 vi.mock('./handler', () => ({ handleBillingSessionSweep: vi.fn(), RUNNING_GRACE_MS: 120_000,
     reverseMoveInFlightFor: vi.fn((executor: unknown) => Object.assign(async () => false, { executor })) }));
 vi.mock('@/server/lib/compute/provider-reverse-runtime', () => ({ advanceReverseMoves: vi.fn() }));
+vi.mock('@/server/lib/compute/provider-reverse-override', () => ({ freeOverrideHandoffReady: vi.fn(async () => false) }));
 
 const now = new Date('2026-10-18T06:00:00Z');
 const computer = { userId: 'epoch-owner', computerId: 'computer' };
@@ -98,17 +100,27 @@ describe('GET /api/cron/billing-session-sweep', () => {
     });
     it('404s when CRON_SECRET is unset, before constructing any billing dependencies', async () => {
         mockEnv.CRON_SECRET = undefined;
+        vi.mocked(editorDelegationEnabled).mockReturnValue(true);
         const response = await GET(request('Bearer undefined'));
         expect(response.status).toBe(404);
         expect(await response.text()).toBe('');
         expect(getBillingDeps).not.toHaveBeenCalled();
         expect(handleBillingSessionSweep).not.toHaveBeenCalled();
+        expect(editorDelegationEnabled).not.toHaveBeenCalled();
+        expect(reconcileColdStarts).not.toHaveBeenCalled();
+        expect(observeAdmittedStart).not.toHaveBeenCalled();
+        expect(freeOverrideHandoffReady).not.toHaveBeenCalled();
     });
 
     it.each([undefined, 'Bearer wrong', 'Basic cron', 'bearer cron'])('404s a missing or wrong bearer (%s)', async auth => {
+        vi.mocked(editorDelegationEnabled).mockReturnValue(true);
         expect((await GET(request(auth))).status).toBe(404);
         expect(getBillingDeps).not.toHaveBeenCalled();
         expect(handleBillingSessionSweep).not.toHaveBeenCalled();
+        expect(editorDelegationEnabled).not.toHaveBeenCalled();
+        expect(reconcileColdStarts).not.toHaveBeenCalled();
+        expect(observeAdmittedStart).not.toHaveBeenCalled();
+        expect(freeOverrideHandoffReady).not.toHaveBeenCalled();
     });
 
     it('returns the sweep counts and injects the dependency clock with a duration budget', async () => {
@@ -117,12 +129,28 @@ describe('GET /api/cron/billing-session-sweep', () => {
         expect(await response.json()).toEqual(counts);
         expect(handleBillingSessionSweep).toHaveBeenCalledExactlyOnceWith({ deps, now, stop: expect.any(Function),
             isStillRunning: expect.any(Function), awsStopProof: expect.any(Function), runningAwsPlacements: expect.any(Function),
-            reverseMoveInFlight: expect.any(Function), refreshAiPlans: expect.any(Function) });
+            reverseMoveInFlight: expect.any(Function), refreshAiPlans: expect.any(Function), overrideLane: expect.any(Function) });
         expect(maxDuration).toBe(300);
         // Phase B (§5.4): the held pass's reverse-move read is built over the app database, once per sweep.
         expect(reverseMoveInFlightFor).toHaveBeenCalledExactlyOnceWith(db);
         // The handler runs the reverse pass itself; the route never runs a second one.
         expect(advanceReverseMoves).not.toHaveBeenCalled();
+    });
+
+    it('wires the override lane as a readiness PROBE (flags and schema, over the app database), not a flag: the handler decides when to run it', async () => {
+        vi.mocked(editorDelegationEnabled).mockReturnValue(true);
+        const { overrideLane } = await wiring();
+        expect(reconcileColdStarts).toHaveBeenCalledExactlyOnceWith(db, expect.any(Function));
+        expect(vi.mocked(reconcileColdStarts).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(handleBillingSessionSweep).mock.invocationCallOrder[0]!);
+        // Nothing is probed by the route itself: a sweep with no explicit-override owner never reads the schema.
+        expect(freeOverrideHandoffReady).not.toHaveBeenCalled();
+        expect(typeof overrideLane).toBe('function');
+        const probe = overrideLane as () => Promise<boolean>;
+        vi.mocked(freeOverrideHandoffReady).mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+        expect(await probe()).toBe(true);
+        expect(await probe()).toBe(false);
+        expect(freeOverrideHandoffReady).toHaveBeenCalledTimes(2);
+        expect(freeOverrideHandoffReady).toHaveBeenLastCalledWith(db, process.env);
     });
 
     it('wires the AI plan refresh: live computers opened in its window, counted and paged by id, this minute, the effective plan', async () => {

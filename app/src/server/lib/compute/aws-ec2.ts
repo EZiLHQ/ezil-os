@@ -131,8 +131,30 @@ export const AWS_RETIRE_AFTER_STOP = 'retire_after_stop';
 /** Outcomes after which `computer.delete` may soft-delete: a lifecycle job that ends the instance is durably recorded. */
 export const AWS_RETIREMENT_UNDERWAY: readonly string[] = [AWS_RETIRING, AWS_RETIRE_AFTER_STOP];
 
+/** A guarded stop: the placement is no longer exactly the one the caller read (owner, generation, lease, instance, fence, RUNNING, no job). */
+export const AWS_STOP_GUARD_MISMATCH = 'stop_guard_mismatch';
+/** A guarded stop: the caller's final confirmation refused (or threw) on the fresh row; nothing was written. */
+export const AWS_STOP_GUARD_REFUSED = 'stop_guard_refused';
+
+/**
+ * A guarded AUTOMATIC stop (the billing sweep's explicit Free override reconciliation, provider-reverse-override.ts).
+ * The ordinary `stop` deliberately cancels the owner's pending capacity demand first and then stops whatever RUNNING
+ * placement it reads next (a newer lease included), so a caller's precheck is no fence. With a guard the stop cancels
+ * nothing and acts only on EXACTLY the placement the caller read: the fresh row must carry the expected owner,
+ * generation, lease epoch, instance and fence token, be RUNNING with no lifecycle job, and `confirm` must accept that
+ * fresh row immediately before the draining compare-and-swap (which itself fences owner, generation, lease epoch, state
+ * and job: C-3). Any other row, a refusal or a throw stops nothing (`AWS_STOP_GUARD_MISMATCH` / `AWS_STOP_GUARD_REFUSED`).
+ * Only `stop` reads it; `ensure`, `terminate` and the receipts never do.
+ */
+export interface AwsStopGuard {
+    expected: Pick<Placement, 'ownerUserId' | 'generation' | 'leaseEpoch' | 'instanceId' | 'fenceToken'>;
+    confirm(fresh: Placement): Promise<boolean>;
+}
+
 export interface AwsProviderDeps {
     pool?: PoolDeps;
+    /** Present only for a guarded automatic stop (`AwsStopGuard`); the user's own stop never carries one. */
+    stopGuard?: AwsStopGuard;
     /** Background stall retries may only act on this failed epoch, never renew a ready session. */
     recoveryExpected?: Pick<Placement, 'generation' | 'leaseEpoch'>;
     db: PlacementDb;
@@ -464,6 +486,26 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         if (r !== 'started') return { ok: false, terminated: false, outcome: r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed' };
         await transitionPlacement(deps.db, { computerId: d.computerId, ownerUserId: c.userId, expected: d, to: 'STOPPING' });
         return { ok: false, terminated: false, outcome: 'stopping' };
+    };
+
+    /**
+     * `AwsStopGuard`: no demand cancellation, the fresh row must be exactly the expected RUNNING placement with no job,
+     * and the caller's confirmation runs on that fresh row right before `startStop`'s compare-and-swap. Fail closed.
+     */
+    const guardedStop = async (c: ComputerRef, guard: AwsStopGuard, deployments: Record<string, LifecycleDeployment>): Promise<StopResult> => {
+        const p = await ownPlacement(c);
+        if (!p || p.provider !== 'aws-ec2') return { ok: false, terminated: false, outcome: 'aws_placement_missing', error: 'aws_placement_missing' };
+        const x = guard.expected;
+        if (p.state !== 'RUNNING' || p.lifecycleJobId !== null || p.ownerUserId !== x.ownerUserId.toLowerCase() || p.generation !== x.generation
+            || p.leaseEpoch !== x.leaseEpoch || p.instanceId !== x.instanceId || p.fenceToken !== x.fenceToken) {
+            return { ok: false, terminated: false, outcome: AWS_STOP_GUARD_MISMATCH };
+        }
+        const deployment = deployments[p.region ?? ''];
+        if (!deployment) return { ok: false, terminated: false, outcome: 'region_not_configured', error: 'region_not_configured' };
+        let confirmed = false;
+        try { confirmed = await guard.confirm(p) === true; } catch { confirmed = false; }
+        if (!confirmed) return { ok: false, terminated: false, outcome: AWS_STOP_GUARD_REFUSED };
+        return startStop(c, p, deployment);
     };
 
     /**
@@ -879,6 +921,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             const cfg = configured();
             if (!cfg.ok) return { ok: false, terminated: false, outcome: cfg.code, error: cfg.code };
             if (!deps.starter) return { ok: false, terminated: false, outcome: 'aws_lifecycle_unconfigured', error: 'aws_lifecycle_unconfigured' };
+            if (deps.stopGuard) return guardedStop(c, deps.stopGuard, cfg.deployments);
             // A stop cancels the owner's pending capacity demand before any already-stopped answer. The placement is read only
             // AFTER the cancellation's locks: one admitted concurrently is stopped on its own terms, never reported stopped.
             const cancelled = await cancelComputerDemand(deps.db, c.computerId, c.userId);
