@@ -66,9 +66,12 @@ import {
  * procedure's own zod schema rejects anything malformed as a 400.
  */
 export const maxDuration = 300;
+const assignedEditor = {attemptId:uuid,captureSessionId:uuid,repoOpenProof:z.string().regex(/^[A-Za-z0-9_-]{48,1700}$/)};
 const assignmentPhase = z.discriminatedUnion('phase', [
     z.object({phase:z.literal('prepare'),attemptId:uuid}).strict(),
-    z.object({phase:z.literal('open'),attemptId:uuid,captureSessionId:uuid,repoOpenProof:z.string().regex(/^[A-Za-z0-9_-]{48,1700}$/)}).strict(),
+    z.object({phase:z.literal('open'),...assignedEditor}).strict(),
+    // The dock's re-mint of the original editor for an already-running capture: never a first open, never a clock start.
+    z.object({phase:z.literal('reopen'),...assignedEditor}).strict(),
 ]);
 const assignmentLocked = () => shellRefusal(409,'assignment_recording_required','Share the assignment tab and wait for the first recorded frame to open Code.');
 /**
@@ -408,6 +411,41 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
             ? universeCall(() => recordingAction(identity, { action: 'preflight', attemptId }, { signal: deadline }))
             : null;
     };
+    /**
+     * The exact capture a dock reopen rides on, read raw from Universe's recording status and classified like every other
+     * Universe call: no answer is retryable, a lapsed EZiL ID is a sign-in, anything else is the locked refusal. Null: live.
+     */
+    async function liveCaptureRefusal(attempt: string, captureSessionId: string, receiptId: string): Promise<Response | null> {
+        if (!identity) return assignmentLocked();
+        const status = await universeCall(() => recordingAction(identity, { action: 'status', attemptId: attempt, captureSessionId }, { signal: deadline }));
+        if (!status.ok) return status.kind === 'unavailable' ? assignmentUnavailable() : status.kind === 'identity' ? assignmentIdentity() : assignmentLocked();
+        const state = status.value;
+        return state.captureSessionId === captureSessionId && state.repositoryOpenReceiptId === receiptId
+            && state.phaseReady === true && state.workspaceUnlocked === true && state.status === 'recording'
+            && state.revoked === false && state.stopRequestedAt === null && typeof state.firstFrameAt === 'string'
+            && typeof state.startedAt === 'string' && typeof state.deadlineAt === 'string'
+            && Date.parse(state.deadlineAt) > Date.now() && await sameSession() ? null : assignmentLocked();
+    }
+    /**
+     * A dock reopen re-mints the exact assigned checkout an already-authorized, still-live capture opened. Its proof may be
+     * older than the five-minute opening window (`active-reopen`), so everything else must hold exactly: the same
+     * attempt, owner, session, repository, provider, workspace and manifest, and Universe's raw status naming that
+     * very capture and original receipt as active, first-frame-ready, unlocked and unrevoked. Checked BEFORE the
+     * computer is woken, so invalid input and a stale or stopped capture start nothing.
+     */
+    let reopening: ReturnType<typeof readOpen> | null = null;
+    if (reserved && phase.success && phase.data.phase === 'reopen') {
+        const original = enrolledId();
+        try {
+            if (!signer || !identity || !original) throw new Error('assignment_reopen_unbound');
+            reopening = readOpen(phase.data.repoOpenProof, identity, original, Date.now(), signer, 'active-reopen');
+        } catch { return assignmentLocked(); }
+        if (reopening.repositoryUrl !== parsed.canonicalURL || reopening.providerId !== privatePacket?.repository.id
+            || reopening.manifestSha256 !== makeChallenge(original, parsed.canonicalURL).manifestSha256
+            || reopening.workspaceId !== workspaceIdentity(identity.userId, computerId, selected.sandboxName)) return assignmentLocked();
+        const idle = await liveCaptureRefusal(original, phase.data.captureSessionId, reopening.eventId);
+        if (idle) return idle;
+    }
     const startedOnAws = isAws(selected);
     const migrationStore = () => createProviderMigrationStore(ctx.db as unknown as PlacementExecutor);
     /**
@@ -539,6 +577,23 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     if (operation.phase === 'prepare') {
         const assignmentOpen = sealOpen(identity,enrolled,computerId,controls.sandboxName,challenge.eventId,now,signer);
         return shellJson({ok:true,repository,assignmentOpen});
+    }
+    if (operation.phase === 'reopen') {
+        // The verified checkout is the original one (same manifest, repository, provider and workspace as the receipt). This
+        // is a reopen of a running assignment: it never calls `editor-ready`, never starts or marks the work clock, and
+        // never exposes a URL unless Universe's read-only clock already shows that hour started, unpaused and unexpired
+        // (the recording `status` below is the raw capture, a different fact from the work clock), and the same capture is
+        // still live after the checkout, which can take time.
+        if (!reopening || reopening.workspaceId !== workspaceIdentity(identity.userId,computerId,controls.sandboxName)
+            || reopening.repositoryUrl !== parsed.canonicalURL || reopening.providerId !== privatePacket.repository.id
+            || reopening.manifestSha256 !== enrolled.manifestSha256) return assignmentLocked();
+        const work = await universeCall(() => recordingAction(identity,{action:'clock',attemptId},{signal:deadline}));
+        if (!work.ok) return work.kind === 'unavailable' ? assignmentUnavailable() : work.kind === 'identity' ? assignmentIdentity() : assignmentLocked();
+        if (typeof work.value.startedAt !== 'string' || typeof work.value.deadlineAt !== 'string' || work.value.pausedAt !== null
+            || Date.parse(work.value.deadlineAt) <= Date.now()) return assignmentLocked();
+        const idle = await liveCaptureRefusal(attemptId,operation.captureSessionId,reopening.eventId);
+        if (idle) return idle;
+        return shellJson({...preview,codePreviewUrl:url,url,repository});
     }
     const proof = (() => { try { return readOpen(operation.repoOpenProof,identity,attemptId,now,signer); } catch { return null; } })();
     if (!proof || proof.workspaceId !== workspaceIdentity(identity.userId,computerId,controls.sandboxName) || proof.repositoryUrl !== parsed.canonicalURL
