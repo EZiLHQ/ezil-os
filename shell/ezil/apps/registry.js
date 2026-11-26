@@ -360,6 +360,9 @@ export const APPS = [
         // summary (a credit window opens none: no purchase lifts it). Code keeps its chat.
         open: ctx => openCodeWindow({
             ...ctx,
+            // An assignment this document holds after its Code window was closed asks for that window again when its
+            // share needs the editor (`../assignment-video/shell.js`): the dock's own projectless launch.
+            reopenCode: () => { void launch('code', gestureContext(launchContext(ctx))); },
             openBilling: request => launch('settings', { ...gestureContext(launchContext(ctx)), initialTab: 'billing',
                 billingRecovery: billing_recovery_context(request) }),
         }),
