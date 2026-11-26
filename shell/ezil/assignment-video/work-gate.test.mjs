@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {confirmAssignmentFolder,openWithAssignmentConsent} from './shell.js';
+import {createHash} from 'node:crypto';
+import {confirmAssignmentFolder,embeddedAssignmentWindow,openWithAssignmentConsent,refusalClass,stageDiagnostics} from './shell.js';
+import {createAssignmentVideoTransport} from './transport.js';
+import {assignmentWorkDesktop} from './work-protocol.js';
 const id='2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a';
 const repo='https://github.ezil.work/default/u-0123456789abcdef-a-'+id+'.git';
 class Element{
@@ -271,7 +274,10 @@ function embeddedWindow(url=entry,{ancestors}={}){
     const types=()=>posted.map(([data,origin])=>{assert.equal(origin,universe);assert.deepEqual(Object.keys(data).sort(),['attemptId','challenge','protocol','type']);
         assert.equal(data.attemptId,id);return data.type;});
     const shown=text=>elements.some(e=>e.textContent===text);
-    return {win,top,posted,assigned,opened,discover,bind,types,shown,listeners};
+    // The gate's own panel: hidden while the Code window's loader is the surface.
+    const panel=()=>elements.find(e=>e.className==='ezil-assignment-work-gate');
+    const screen=()=>panel().hidden?'loader':panel().children[0].children[0].textContent;
+    return {win,top,posted,assigned,opened,discover,bind,types,shown,listeners,screen};
 }
 // The parent's half of the port, as 994b90ac uses it: numbered requests, transferable segment bytes.
 function parentPort(){
@@ -284,14 +290,23 @@ function parentPort(){
         close(){channel.port1.close();channel.port2.close();}};
 }
 // The OS's own assignment-video route and the media bucket, as the transport sees them.
-function fakeServer({stopReason=null,readyBeforeSeed=false,holdSeed=null,failSeedOnce=false}={}){
-    const log=[],started=Date.now();let seeded=false,stopAt=null,serverNow=null;
+function fakeServer({stopReason=null,readyBeforeSeed=false,holdSeed=null,failSeedOnce=false,flag,ack={}}={}){
+    const log=[],asked=[],started=Date.now();let seeded=false,stopAt=null,serverNow=null,acknowledged=false;
+    // Universe's work clock (the `editor-ready` answer) and the media cutoff the broker moved after it: never the same value.
+    const work={startedAt:new Date(started+500).toISOString(),deadlineAt:new Date(started+3500500).toISOString(),serverNow:new Date(started+600).toISOString()};
+    const moved={deadlineAt:new Date(started+1980000).toISOString(),serverNow:new Date(started+700).toISOString()};
     const startedAt=new Date(started-1000).toISOString(),deadlineAt=new Date(started+1800000).toISOString(),firstFrameAt=new Date(started).toISOString();
     async function handler(path,options){
         if(String(path).startsWith(bucket)){log.push('put');return new Response(null,{status:200});}
         const body=JSON.parse(options.body);log.push(body.action==='begin'?['begin',body.consentVersion,body.captureSessionId,body.repoOpenProof]:body.action);
         const same={recordingId,captureSessionId:body.captureSessionId};
-        if(body.action==='preflight')return Response.json(eligibleBody({}));
+        if(body.action==='preflight')return Response.json(eligibleBody(flag===undefined?{}:{editorReadySupported:flag}));
+        if(body.action==='editor-ready'){
+            asked.push(body);
+            if(ack.hold)await ack.hold;
+            if(ack.failures?.length)return Response.json({error:{code:ack.failures.shift()}},{status:409});
+            acknowledged=true;return Response.json({ok:true,...work});
+        }
         if(body.action==='begin')return Response.json({...same,status:'awaiting_frame',nextSequence:0,startedAt:null,deadlineAt:null,stopRequestedAt:null,revoked:false,
             authorizationExpiresAt:new Date(Date.now()+600000).toISOString()});
         if(body.action==='prepare')return Response.json({expiresAt:new Date(Date.now()+60000).toISOString(),headers:{'content-type':'video/webm'},
@@ -304,17 +319,17 @@ function fakeServer({stopReason=null,readyBeforeSeed=false,holdSeed=null,failSee
                 serverNow:serverNow=new Date(Date.now()+2345).toISOString()}:{recordingId,sequence:body.sequence,confirmed:true});
         }
         if(body.action==='status')return Response.json({...same,status:'recording',phaseReady:seeded||readyBeforeSeed,workspaceUnlocked:seeded||readyBeforeSeed,startedAt,deadlineAt,firstFrameAt,
-            stopRequestedAt:stopAt,stopReason:stopAt?stopReason:null,revoked:false});
+            stopRequestedAt:stopAt,stopReason:stopAt?stopReason:null,revoked:false,...(acknowledged?moved:{})});
         return Response.json({...same,status:'paused',startedAt,deadlineAt,stopRequestedAt:null,revoked:false});
     }
-    return {log,handler,startedAt,deadlineAt,serverNow:()=>serverNow,stop(at){stopAt=at;}};
+    return {log,asked,work,moved,handler,startedAt,deadlineAt,serverNow:()=>serverNow,stop(at){stopAt=at;}};
 }
 function embeddedGate(w,{who='owner',prepare=()=>assert.fail('checkout must stay closed'),open=()=>assert.fail('editor must stay closed'),...rest}={}){
     return openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>who,computerId:'fixture',body:new Element(),park(){},prepare,open,...rest});
 }
 const seedPart=(fields={})=>({sequence:0,startMs:0,endMs:1,mimeType:'video/webm',bytes:new Uint8Array([26,69,223,163,1]).buffer,...fields});
 // Discover, bind and wait for port `ready`, as the parent does before it offers Share.
-async function bound(w,p){w.discover();w.bind([p.port]);await settle();assert.deepEqual(p.types(),['ready']);}
+async function bound(w,p){w.discover();w.bind([p.port]);await settle();assert.deepEqual(p.types(),['capture-ready','ready']);}
 function editorOpener(state,{root=checkoutFolder,folder=workspaceFolder}={}){
     const frame={isConnected:true,contentWindow:{postMessage(){}}};
     return ()=>{state.opened++;state.access=state.gate.access();
@@ -340,7 +355,7 @@ test('the paired Universe parent records, unlocks and ends the embedded assignme
         assert.match(server.serverNow(),/^\d{4}-\d\d-\d\dT/);
         assert.deepEqual(ready.value,{confirmed:true,phaseReady:true,captureSessionId:session,nextSequence:1,startedAt:server.startedAt,deadlineAt:server.deadlineAt,
             serverNow:server.serverNow()});
-        assert.deepEqual((await p.rpc('status',{captureSessionId:session})).value,{captureSessionId:session,status:'recording',stopRequestedAt:null});
+        assert.deepEqual((await p.rpc('status',{captureSessionId:session})).value,{captureSessionId:session,status:'recording',stopRequestedAt:null,deadlineAt:server.deadlineAt});
         assert.equal(gate.access(),null);
         const unlocked=await p.rpc('unlock',{captureSessionId:session});
         assert.deepEqual(unlocked.value,{status:'ready',captureSessionId:session,startedAt:server.startedAt,deadlineAt:server.deadlineAt});
@@ -360,7 +375,7 @@ test('the paired Universe parent records, unlocks and ends the embedded assignme
         assert.ok(!wire.includes(proof)&&!wire.includes(recordingId)&&!wire.includes(bucket),'the proof, recording and signed upload stay in the OS');
         assert.deepEqual([w.assigned,w.opened],[[],[]]);
     }finally{await gate.close();await settle();p.close();}
-    assert.deepEqual(p.types(),['ready','reopen']);
+    assert.deepEqual(p.types(),['capture-ready','ready','editor-usable','reopen']);
 });
 test('a bind is accepted only from the actual Universe parent, for the answered challenge, with exactly one port, once',async t=>{
     t.mock.method(globalThis,'fetch',async()=>Response.json(eligibleBody({})));
@@ -380,7 +395,7 @@ test('a bind is accepted only from the actual Universe parent, for the answered 
         assert.ok(wrong.every(p=>p.got.length===0),'no unbound port is ever answered');
         const good=parentPort(),second=parentPort();
         w.bind([good.port]);w.bind([second.port]);await settle();
-        assert.deepEqual(good.types(),['ready']);
+        assert.deepEqual(good.types(),['capture-ready','ready']);
         void second.rpc('status',{captureSessionId:session});await settle();
         assert.deepEqual(second.got,[]);
         good.close();second.close();
@@ -393,10 +408,10 @@ test('begin waits for eligibility, needs the parent consent version and a captur
     const gate=embeddedGate(w,{prepare:async()=>{prepares++;return new Promise(()=>{});}});
     try{
         w.discover();w.bind([p.port]);await settle();
-        assert.deepEqual(p.types(),[],'no port ready before eligibility');
+        assert.deepEqual(p.types(),['capture-ready'],'no port ready before eligibility');
         assert.deepEqual((await p.rpc('begin',{captureSessionId:session,consentVersion:4})).code,'assignment_not_ready');
         release();await settle();
-        assert.deepEqual(p.types(),['ready']);
+        assert.deepEqual(p.types(),['capture-ready','ready']);
         for(const fields of [{captureSessionId:session,consentVersion:3},{captureSessionId:session,consentVersion:'4'},{captureSessionId:session},
             {captureSessionId:'not-a-session',consentVersion:4},{consentVersion:4}])
             assert.equal((await p.rpc('begin',fields)).code,'assignment_not_ready',JSON.stringify(fields));
@@ -449,9 +464,9 @@ test('a missing parent heartbeat locks the editor and saves the phase as interru
         await p.rpc('begin',{captureSessionId:session,consentVersion:4});
         t.mock.timers.tick(11200);p.post('pulse',{captureSessionId:session});await settle();
         t.mock.timers.tick(11200);await settle();
-        assert.deepEqual(p.types(),['ready'],'a pulse inside 14 s keeps the phase');
+        assert.deepEqual(p.types(),['capture-ready','ready'],'a pulse inside 14 s keeps the phase');
         t.mock.timers.tick(5600);await settle(20);
-        assert.deepEqual(p.types(),['ready','pause']);
+        assert.deepEqual(p.types(),['capture-ready','ready','pause']);
         assert.deepEqual(p.got.at(-1),{protocol,attemptId:id,type:'pause',reason:'connection_lost',effectiveAt:null});
         assert.equal(server.log.at(-1),'checkpoint');assert.equal(gate.access(),null);
     }finally{await gate.close();p.close();}
@@ -485,7 +500,7 @@ test('closing the embedded Code window pauses the parent, lets it end the phase,
     assert.deepEqual(p.got.filter(d=>d.type==='pause').length,1);
     assert.deepEqual((await p.rpc('end',{captureSessionId:session,reason:'connection_lost',expectedSegments:0})).ok,true,'the parent\'s end is answered');
     await closing;await settle();
-    assert.deepEqual(p.types(),['ready','pause','reopen']);
+    assert.deepEqual(p.types(),['capture-ready','ready','pause','reopen']);
     assert.equal(server.log.at(-1),'checkpoint');
     w.discover();assert.deepEqual(w.types(),['preparing'],'a closed gate answers nothing');
     p.close();
@@ -511,7 +526,7 @@ test('an embedded eligibility sign-in requirement is reported to Universe and ne
         const gate=embeddedGate(w);
         try{
             w.discover();w.bind([p.port]);await settle();
-            assert.deepEqual(w.types(),['preparing','authentication_required']);assert.deepEqual(p.types(),[]);
+            assert.deepEqual(w.types(),['preparing','authentication_required']);assert.deepEqual(p.types(),['capture-ready']);
             assert.ok(w.shown('Sign in to EZiL OS'));
             assert.deepEqual([w.assigned,w.opened],[[],[]]);assert.equal(gate.access(),null);
         }finally{await gate.close();p.close();t.mock.restoreAll();}
@@ -543,7 +558,7 @@ test('an unlinked Creator or an unverified AWS computer is unavailable in the fr
         const gate=embeddedGate(w,{computerProvider:async()=>provider});
         try{
             w.discover();w.bind([p.port]);await settle();
-            assert.deepEqual(w.types(),['preparing','unavailable']);assert.ok(w.shown(title));assert.deepEqual(p.types(),[]);
+            assert.deepEqual(w.types(),['preparing','unavailable']);assert.ok(w.shown(title));assert.deepEqual(p.types(),['capture-ready']);
             assert.equal((await p.rpc('begin',{captureSessionId:session,consentVersion:4})).code,'workspace_unavailable');
             assert.deepEqual([w.assigned,w.opened],[[],[]]);
         }finally{await gate.close();p.close();t.mock.restoreAll();}
@@ -606,4 +621,311 @@ test('a first frame the broker refused is uploaded again for real, and no segmen
         assert.equal((await pending).value.phaseReady,true);
         assert.deepEqual(server.log.filter(x=>x==='confirm').length,2);
     }finally{await gate.close();p.close();}
+});
+
+// ── One loader, the acknowledged release, the ordinary wake and the diagnostics ────────────────────────────────────
+// The transport's own `editor-ready` (the broker lane's) when this tree has it, else its request as that lane sends it:
+// the attempt, the capture and the open proof, and no time.
+const withEditorReady=options=>{
+    const real=createAssignmentVideoTransport(options);
+    return {...real,editorReady:real.editorReady??(async()=>{
+        const response=await fetch('/api/shell/assignment-video',{method:'POST',body:JSON.stringify({action:'editor-ready',attemptId:options.attemptId,
+            captureSessionId:options.captureSessionId,repoOpenProof:options.repoOpenProof})});
+        const data=await response.json();
+        if(!response.ok)throw Object.assign(new Error(data.error.code),{code:data.error.code});
+        return {startedAt:data.startedAt,deadlineAt:data.deadlineAt,serverNow:data.serverNow};
+    })};
+};
+// The parent ends its phase before the frame goes away, so closing the gate has nothing left to wait for.
+const endShare=(p,captureSessionId=session)=>p.rpc('end',{captureSessionId,reason:'connection_lost',expectedSegments:1});
+const stageTag=createHash('sha256').update('ezil.assignment.stage.v1\0'+id).digest('hex').slice(0,16);
+const diagnosticLines=t=>{
+    const lines=[];t.mock.method(console,'info',line=>{if(String(line).startsWith('assignment.workspace.'))lines.push(String(line));});
+    return lines;
+};
+test('while the workspace prepares the gate draws nothing over the Code window loader, and one editor opens',async t=>{
+    const server=fakeServer();t.mock.method(globalThis,'fetch',server.handler);
+    const w=embeddedWindow(),p=parentPort(),state={opened:0},parks=[],screens=new Set();
+    const gate=state.gate=embeddedGate(w,{park:(...call)=>parks.push(call),prepare:async()=>checkout,open:editorOpener(state)});
+    const look=()=>{screens.add(w.screen());assert.equal(w.screen(),'loader');assert.equal(gate.locked(),true);};
+    try{
+        look();assert.deepEqual(parks,[[true,true]],'launch parks the editor under the window loader, with no screen of its own');
+        // A retransmitted discover, and a new challenge after a parent reload, start nothing twice.
+        w.discover({challenge:session});look();w.discover();w.discover();look();
+        w.bind([p.port]);look();await settle();look();
+        assert.deepEqual(server.log,['preflight']);assert.deepEqual(p.types(),['capture-ready','ready']);
+        await p.rpc('begin',{captureSessionId:session,consentVersion:4});look();
+        const seed=seedPart();await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);look();
+        assert.ok(parks.every(call=>call[0]===true&&call[1]===true),'every park before release keeps the loader: '+JSON.stringify(parks));
+        assert.equal((await p.rpc('unlock',{captureSessionId:session})).ok,true);
+        assert.deepEqual([...screens],['loader']);assert.equal(w.screen(),'loader','released: still no gate screen');
+        assert.equal(gate.locked(),false);assert.deepEqual(parks.at(-1),[false,false]);
+        assert.equal(parks.filter(call=>call[0]===false).length,1,'released once');assert.equal(state.opened,1,'one editor open');
+        // A stopped share is a state the person acts on: the gate says so, and the next share is the loader again.
+        p.post('lock',{captureSessionId:session,reason:'sharing_stopped'});await settle();
+        assert.equal(w.screen(),'Sharing paused');assert.deepEqual(parks.at(-1),[true,false]);assert.equal(gate.locked(),true);
+        await p.rpc('end',{captureSessionId:session,reason:'sharing_stopped',expectedSegments:1});
+        const again='11111111-1111-4111-8111-111111111111';
+        assert.equal((await p.rpc('begin',{captureSessionId:again,consentVersion:4})).ok,true);
+        assert.equal(w.screen(),'loader');assert.deepEqual(parks.at(-1),[true,true]);
+        assert.equal(state.opened,1,'a new share opens no editor before its own first frame');
+        assert.deepEqual(server.log.filter(x=>x==='preflight').length,3,'one eligibility check for the frame, then one per share');
+        await endShare(p,again);
+    }finally{await gate.close();p.close();}
+});
+test('a parent that never answers is named only after twenty seconds, and its first valid discover returns to the loader',async t=>{
+    t.mock.timers.enable({apis:['setTimeout']});
+    const fetch=t.mock.method(globalThis,'fetch',async()=>Response.json(eligibleBody({})));
+    const w=embeddedWindow();
+    const gate=embeddedGate(w);
+    try{
+        assert.equal(w.screen(),'loader');
+        // Nothing but the exact parent counts as an answer.
+        w.discover({},w.top,'https://universe.ezil.work');w.discover({},{postMessage(){}});w.discover({challenge:'not-a-challenge'});w.discover({attemptId:session});
+        t.mock.timers.tick(19999);assert.equal(w.screen(),'loader');
+        t.mock.timers.tick(1);assert.equal(w.screen(),'Open this assignment from Universe');
+        assert.equal(gate.locked(),true);assert.equal(gate.access(),null);assert.equal(fetch.mock.callCount(),0);assert.deepEqual(w.posted,[]);
+        w.discover();assert.equal(w.screen(),'loader');assert.deepEqual(w.types(),['preparing']);
+    }finally{t.mock.timers.reset();await gate.close();}
+    // An answered frame never shows it.
+    t.mock.timers.enable({apis:['setTimeout']});
+    const answered=embeddedWindow(),second=embeddedGate(answered);
+    try{answered.discover();t.mock.timers.tick(60000);assert.equal(answered.screen(),'loader');}
+    finally{t.mock.timers.reset();await second.close();}
+});
+test('capture-ready reaches only the accepted parent port, once, before the eligibility answer and never a refused frame',async t=>{
+    let release;const held=new Promise(r=>release=r);
+    t.mock.method(globalThis,'fetch',async()=>{await held;return Response.json(eligibleBody({}));});
+    const w=embeddedWindow(),forged=[parentPort(),parentPort(),parentPort(),parentPort()],p=parentPort(),late=parentPort();
+    const gate=embeddedGate(w);
+    try{
+        w.bind([forged[0].port]);
+        w.discover();
+        w.bind([forged[1].port],{},w.top,'https://universe.ezil.work');w.bind([forged[2].port],{challenge:session});w.bind([forged[3].port],{},{postMessage(){}});
+        await settle();
+        assert.ok(forged.every(port=>port.got.length===0),'a forged or early bind hears nothing');
+        w.bind([p.port]);await settle();
+        assert.deepEqual(p.got,[{protocol,attemptId:id,type:'capture-ready'}],'the picker may be offered while eligibility is still being verified');
+        assert.equal((await p.rpc('begin',{captureSessionId:session,consentVersion:4})).code,'assignment_not_ready','capture-ready opens no RPC');
+        w.discover();w.bind([late.port]);await settle();
+        assert.deepEqual(late.got,[]);assert.deepEqual(p.types(),['capture-ready']);
+        release();await settle();
+        assert.deepEqual(p.types(),['capture-ready','ready']);assert.deepEqual(w.types(),['preparing','preparing']);
+    }finally{await gate.close();[...forged,p,late].forEach(port=>port.close());}
+    for(const who of [null,'']){
+        const out=embeddedWindow(),port=parentPort(),closed=embeddedGate(out,{who});
+        try{out.discover();out.bind([port.port]);await settle();assert.deepEqual(port.got,[],'a signed-out frame offers no picker');}
+        finally{await closed.close();port.close();}
+    }
+});
+test('when Universe signs editorReadySupported the verified editor stays parked until it acknowledges editor-ready',async t=>{
+    let release;const hold=new Promise(r=>release=r);
+    const server=fakeServer({flag:true,ack:{hold}});t.mock.method(globalThis,'fetch',server.handler);
+    const lines=diagnosticLines(t);
+    const w=embeddedWindow(),p=parentPort(),state={opened:0},parks=[];
+    const gate=state.gate=embeddedGate(w,{park:(...call)=>parks.push(call),prepare:async()=>checkout,open:editorOpener(state),transport:withEditorReady});
+    try{
+        await bound(w,p);
+        await p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        const seed=seedPart();await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
+        const unlocking=p.rpc('unlock',{captureSessionId:session});
+        await settle(30);
+        // The editor document is loaded on the verified folder, and nobody can use it yet.
+        assert.equal(state.opened,1);assert.equal(gate.locked(),true);assert.equal(w.screen(),'loader');
+        assert.ok(parks.every(call=>call[0]===true),'still parked');assert.deepEqual(w.types(),['preparing']);
+        assert.deepEqual(p.types(),['capture-ready','ready']);
+        assert.deepEqual(server.asked,[{action:'editor-ready',attemptId:id,captureSessionId:session,repoOpenProof:proof}],'no time is sent');
+        release();
+        const unlocked=await unlocking;
+        // Released in order: the editor, the port event, the unlock reply, the window state.
+        assert.equal(gate.locked(),false);assert.deepEqual(parks.at(-1),[false,false]);
+        const usable=p.got.findIndex(d=>d.type==='editor-usable');
+        assert.ok(usable>0&&usable<p.got.indexOf(unlocked),'editor-usable precedes the unlock reply');
+        // The work clock travels only in editor-usable; unlock keeps the seed's start and the broker's latest media cutoff.
+        assert.deepEqual(p.got[usable],{protocol,attemptId:id,type:'editor-usable',captureSessionId:session,deadlineAt:server.work.deadlineAt,serverNow:server.work.serverNow});
+        assert.deepEqual(unlocked.value,{status:'ready',captureSessionId:session,startedAt:server.startedAt,deadlineAt:server.moved.deadlineAt,serverNow:server.moved.serverNow});
+        assert.notEqual(server.work.deadlineAt,server.moved.deadlineAt);
+        assert.deepEqual((await p.rpc('status',{captureSessionId:session})).value,
+            {captureSessionId:session,status:'recording',stopRequestedAt:null,deadlineAt:server.moved.deadlineAt,serverNow:server.moved.serverNow});
+        assert.deepEqual(w.types(),['preparing','ready']);
+        await settle();
+        assert.deepEqual(lines,['discover.accepted','bind.accepted','prepare.start','prepare.ready','editor_ready.reported','editor.usable']
+            .map(event=>'assignment.workspace.'+event+' stage='+stageTag));
+        const wire=JSON.stringify([...p.got,...w.posted,...lines]);
+        assert.ok(!wire.includes(proof)&&!wire.includes(recordingId)&&!wire.includes(server.work.startedAt),'the proof, the recording and the work start stay in the OS');
+        assert.ok(lines.every(line=>![id,session,challenge,repo,'owner'].some(value=>line.includes(value))),'a diagnostic names no identifier');
+        await endShare(p);
+    }finally{await gate.close();p.close();}
+});
+test('a refused editor-ready keeps the editor parked and fails unlock; a transient one is asked again',async t=>{
+    for(const [failures,transport,code,released,klass] of [
+        [['recording_closed'],withEditorReady,'recording_closed',false,'phase'],
+        [['media_unavailable'],withEditorReady,null,true,null],
+        [['media_unavailable','media_unavailable','media_unavailable'],withEditorReady,'media_unavailable',false,'media'],
+        [['identity_refresh_required'],withEditorReady,'identity_refresh_required',false,'identity'],
+        // The flag without a transport that can say it: closed, never released on the old rule.
+        [[],options=>({...createAssignmentVideoTransport(options),editorReady:undefined}),'editor_ready_unsupported',false,'protocol'],
+    ]){
+        const server=fakeServer({flag:true,ack:{failures:[...failures]}});t.mock.method(globalThis,'fetch',server.handler);
+        const lines=diagnosticLines(t);
+        const w=embeddedWindow(),p=parentPort(),state={opened:0};
+        const gate=state.gate=embeddedGate(w,{prepare:async()=>checkout,open:editorOpener(state),transport});
+        try{
+            await bound(w,p);
+            await p.rpc('begin',{captureSessionId:session,consentVersion:4});
+            const seed=seedPart();await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
+            const unlocked=await p.rpc('unlock',{captureSessionId:session});await settle();
+            const label=JSON.stringify(failures)+' '+code;
+            assert.equal(unlocked.ok,released,label);assert.equal(gate.locked(),!released,label);
+            assert.equal(p.types().includes('editor-usable'),released,label);
+            assert.equal(w.types().includes('ready'),released,label);
+            assert.equal(server.asked.length,transport===withEditorReady?Math.min(3,failures.length+(released?1:0)):0,label);
+            if(released){assert.equal(lines.at(-1),'assignment.workspace.editor.usable stage='+stageTag);await endShare(p);continue;}
+            assert.equal(unlocked.code,code,label);assert.equal(gate.access(),null,label);
+            assert.ok(lines.includes('assignment.workspace.editor_ready.refused stage='+stageTag+' refusal='+klass),label+' '+lines.join('|'));
+            assert.ok(!lines.some(line=>line.includes('editor.usable')||line.includes(code)),label);
+            assert.equal(w.screen(),code==='identity_refresh_required'?'Sign in to EZiL OS':'Sharing paused',label);
+            if(code==='identity_refresh_required')assert.equal(w.types().at(-1),'authentication_required');
+            else await endShare(p);
+        }finally{await gate.close();p.close();t.mock.restoreAll();}
+    }
+});
+test('a stage that does not sign the flag releases the editor as before and never asks editor-ready',async t=>{
+    for(const flag of [undefined,false,'true',1]){
+        const server=fakeServer({flag});t.mock.method(globalThis,'fetch',server.handler);
+        const w=embeddedWindow(),p=parentPort(),state={opened:0};
+        const gate=state.gate=embeddedGate(w,{prepare:async()=>checkout,open:editorOpener(state),
+            transport:options=>({...createAssignmentVideoTransport(options),editorReady(){assert.fail('editor-ready is not this stage\'s rule');}})});
+        try{
+            await bound(w,p);
+            await p.rpc('begin',{captureSessionId:session,consentVersion:4});
+            const seed=seedPart();await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
+            const unlocked=await p.rpc('unlock',{captureSessionId:session});
+            assert.deepEqual(unlocked.value,{status:'ready',captureSessionId:session,startedAt:server.startedAt,deadlineAt:server.deadlineAt},String(flag));
+            assert.deepEqual(p.got.find(d=>d.type==='editor-usable'),{protocol,attemptId:id,type:'editor-usable',captureSessionId:session},'no work clock without an acknowledgement');
+            assert.deepEqual(w.types(),['preparing','ready']);assert.equal(gate.locked(),false);
+            assert.deepEqual(server.asked,[]);assert.ok(!server.log.includes('editor-ready'));
+            await endShare(p);
+        }finally{await gate.close();p.close();t.mock.restoreAll();}
+    }
+});
+test('a media cutoff the broker moves is relayed only for the same start and inside the signed bound',async t=>{
+    const now=Date.now(),iso=ms=>new Date(now+ms).toISOString(),startedAt=iso(-1000);
+    for(const [flag,status,expected] of [
+        [true,{deadlineAt:iso(3838000)},{deadlineAt:iso(3838000)}],
+        [true,{deadlineAt:iso(3839001)},null],
+        [true,{startedAt:iso(-999),deadlineAt:iso(1900000)},null],
+        [true,{deadlineAt:startedAt},null],
+        [true,{deadlineAt:'soon'},null],
+        [undefined,{deadlineAt:iso(3838000)},null],
+    ]){
+        let seeded=false;
+        t.mock.method(globalThis,'fetch',async(path,options)=>{
+            if(String(path).startsWith(bucket))return new Response(null,{status:200});
+            const body=JSON.parse(options.body),same={recordingId,captureSessionId:session};
+            if(body.action==='preflight')return Response.json(eligibleBody(flag?{editorReadySupported:true}:{}));
+            if(body.action==='begin')return Response.json({...same,status:'awaiting_frame',nextSequence:0,authorizationExpiresAt:iso(600000)});
+            if(body.action==='prepare')return Response.json({headers:{},putUrl:`${bucket}/universe-staging/assignment-media/v1/o/${id}/${recordingId}/segments/0/${body.sha256}.webm`});
+            if(body.action==='confirm'){seeded=true;return Response.json({...same,sequence:0,confirmed:true,phaseReady:true,nextSequence:1,firstFrameAt:iso(0),startedAt,deadlineAt:iso(1800000),serverNow:iso(0)});}
+            return Response.json({...same,status:'recording',phaseReady:seeded,workspaceUnlocked:seeded,firstFrameAt:iso(0),startedAt,stopRequestedAt:null,...status});
+        });
+        const w=embeddedWindow(),p=parentPort();
+        const gate=embeddedGate(w,{prepare:async()=>checkout});
+        try{
+            await bound(w,p);
+            await p.rpc('begin',{captureSessionId:session,consentVersion:4});
+            const seed=seedPart();await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
+            const answer=(await p.rpc('status',{captureSessionId:session})).value;
+            assert.deepEqual(answer,{captureSessionId:session,status:'recording',stopRequestedAt:null,...(expected??{})},JSON.stringify([flag,status]));
+            await endShare(p);
+        }finally{await gate.close();p.close();t.mock.restoreAll();}
+    }
+});
+test('the ordinary wake is asked once, only after the signed eligibility answer, and never for a refused frame',async t=>{
+    let release;const held=new Promise(r=>release=r);
+    const server=fakeServer();
+    t.mock.method(globalThis,'fetch',async(path,options)=>{if(JSON.parse(options.body??'{}').action==='preflight')await held;return server.handler(path,options);});
+    const w=embeddedWindow(),p=parentPort(),state={opened:0};let wakes=0;
+    const gate=state.gate=embeddedGate(w,{prepare:async()=>checkout,open:editorOpener(state),wake(){wakes++;throw Error('a failed wake is the wake\'s own');}});
+    try{
+        w.discover();w.bind([p.port]);await settle();
+        assert.equal(wakes,0,'no wake before Universe answered for this signed-in person');
+        release();await settle();
+        assert.equal(wakes,1);assert.deepEqual(p.types(),['capture-ready','ready'],'a wake that throws changes nothing');
+        assert.ok(!server.log.includes('begin')&&state.opened===0,'the wake precedes any share, checkout or editor');
+        // Retransmits, a whole share, a stop and a second share: the same one wake.
+        w.discover();w.discover({challenge:session});w.discover();
+        await p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        const seed=seedPart();await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes]);
+        await p.rpc('unlock',{captureSessionId:session});
+        p.post('lock',{captureSessionId:session,reason:'sharing_stopped'});
+        await p.rpc('end',{captureSessionId:session,reason:'sharing_stopped',expectedSegments:1});
+        await p.rpc('begin',{captureSessionId:'11111111-1111-4111-8111-111111111111',consentVersion:4});
+        assert.equal(wakes,1);
+        await endShare(p,'11111111-1111-4111-8111-111111111111');
+    }finally{await gate.close();p.close();t.mock.restoreAll();}
+    for(const [response,who,provider] of [
+        [()=>Response.json({error:{code:'identity_refresh_required'}},{status:409}),'owner',null],
+        [()=>Response.json({error:{code:'assignment_identity_mismatch'}},{status:409}),'owner',null],
+        [()=>Response.json({error:{code:'assignment_video_creator_unlinked'}},{status:409}),'owner',null],
+        [()=>Response.json(eligibleBody({})),'owner','aws-ec2'],
+        [()=>Response.json(eligibleBody({})),null,null],
+    ]){
+        t.mock.method(globalThis,'fetch',async()=>response());
+        const out=embeddedWindow(),port=parentPort();let asked=0;
+        const closed=embeddedGate(out,{who,wake(){asked++;},computerProvider:async()=>provider});
+        try{out.discover();out.bind([port.port]);await settle();assert.equal(asked,0,'no wake for a refused, unverified or signed-out frame');}
+        finally{await closed.close();port.close();t.mock.restoreAll();}
+    }
+});
+test('stage diagnostics carry only the attempt tag and a coarse refusal class, and do nothing without Web Crypto',async()=>{
+    const lines=[],note=stageDiagnostics(id,{log:{info:line=>lines.push(line)}});
+    note('discover.accepted');note('prepare.refused',Object.assign(new Error('x'),{code:'assigned_checkout_unverified'}));note('editor_ready.refused',new Error('Something private'));
+    await settle();
+    assert.deepEqual(lines,['assignment.workspace.discover.accepted stage='+stageTag,'assignment.workspace.prepare.refused stage='+stageTag+' refusal=checkout',
+        'assignment.workspace.editor_ready.refused stage='+stageTag+' refusal=other']);
+    assert.match(stageTag,/^[0-9a-f]{16}$/);assert.ok(!lines.join().includes(id));
+    for(const subtle of [null,{},{digest(){throw Error('blocked');}},{digest:async()=>{throw Error('blocked');}}]){
+        const quiet=[],silent=stageDiagnostics(id,{subtle,log:{info:line=>quiet.push(line)}});
+        silent('bind.accepted');silent('prepare.refused',new Error('x'));await settle();
+        assert.deepEqual(quiet,[]);
+    }
+    stageDiagnostics(id,{log:{info(){throw Error('no console');}}})('bind.accepted');await settle();
+    for(const [code,klass] of [['identity_refresh_required','identity'],['IDENTITY_REFRESH_REQUIRED','identity'],['assignment_identity_mismatch','identity'],
+        ['assigned_checkout_unverified','checkout'],['sandbox_starting','checkout'],['recording_phase_changed','phase'],['seed_not_confirmed','phase'],
+        ['media_unavailable','media'],['upload_failed','media'],['workspace_timeout','timeout'],['invalid_request','protocol'],['editor_ready_unsupported','protocol'],
+        ['anything else','other'],[undefined,'other']])
+        assert.equal(refusalClass(code===undefined?undefined:Object.assign(new Error(code),{code})),klass,String(code));
+    assert.equal(refusalClass(Object.assign(new Error('The operation timed out'),{name:'TimeoutError'})),'timeout');
+});
+test('only the assignment framed by Universe is the window that keeps its controls',()=>{
+    const frame=(url,{ancestors,top={}}={})=>({location:Object.assign(new URL(url),ancestors?{ancestorOrigins:ancestors}:{}),top,parent:top});
+    assert.equal(embeddedAssignmentWindow({repoUrl:repo},frame(entry,{ancestors:[universe]})),true);
+    assert.equal(embeddedAssignmentWindow({repoUrl:repo},frame(entry)),true,'a browser that names no ancestors');
+    const own=frame(entry);own.top=own.parent=own;
+    const nested=frame(entry);nested.parent={};
+    const ordinary='https://github.ezil.work/default/ordinary.git';
+    for(const [project,win,why] of [
+        [{repoUrl:repo},own,'the standalone OS tab'],
+        [{repoUrl:repo},frame(entry,{ancestors:['https://evil.example']}),'another framing origin'],
+        [{repoUrl:repo},frame(entry,{ancestors:[universe,universe]}),'a nested frame'],
+        [{repoUrl:repo},nested,'not the direct child of the top page'],
+        [{repoUrl:repo},frame(entry.replace('os-staging','os'),{ancestors:[universe]}),'production'],
+        [{repoUrl:ordinary},frame('https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(ordinary),{ancestors:[universe]}),'an ordinary repository'],
+        [{repoUrl:repo},frame(entry.replace('assignment='+id,'assignment='+session),{ancestors:[universe]}),'another attempt in the link'],
+        [null,frame(entry,{ancestors:[universe]}),'no project'],
+        [{repoUrl:repo},null,'no window'],
+    ])assert.equal(embeddedAssignmentWindow(project,win),false,why);
+    // The dock is kept by the same frame, known from the frame and its address alone (the shell's globals precede any project).
+    assert.equal(assignmentWorkDesktop(frame(entry,{ancestors:[universe]})),true);
+    for(const [win,why] of [
+        [own,'the standalone OS tab'],[frame(entry,{ancestors:['https://evil.example']}),'another framing origin'],[nested,'not the direct child of the top page'],
+        [frame(entry.replace('os-staging','os'),{ancestors:[universe]}),'production'],
+        [frame('https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(ordinary),{ancestors:[universe]}),'an ordinary repository'],
+        [frame('https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(repo),{ancestors:[universe]}),'no attempt in the link'],
+        [frame(entry.replace('assignment='+id,'assignment='+session),{ancestors:[universe]}),'another attempt in the link'],
+        [frame(entry+'&assignment='+id,{ancestors:[universe]}),'two attempts'],
+        [frame(entry.replace('/app/code','/app/files'),{ancestors:[universe]}),'another app'],
+        [frame('https://os-staging.ezil.work/',{ancestors:[universe]}),'the desktop root'],[null,'no window'],
+    ])assert.equal(assignmentWorkDesktop(win),false,why);
 });

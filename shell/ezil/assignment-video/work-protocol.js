@@ -17,6 +17,20 @@ export function embeddedWorkFrame(win) {
         && (ancestors == null || (ancestors.length === 1 && ancestors[0] === WORK_HOST));
 }
 
+const assignedRepo = /^https:\/\/github\.ezil\.work\/default\/u-[0-9a-f]{16}-a-([0-9a-f-]{36})\.git$/;
+/**
+ * The framed document is an assignment's own Code entry, `/app/code?repo=<canonical>&assignment=<the same attempt>`:
+ * the one entry the server lets Universe frame. That frame is a working desktop, so the shell keeps its dock there.
+ */
+export function assignmentWorkDesktop(win) {
+    try {
+        if (!embeddedWorkFrame(win)) return false;
+        const url = new URL(win.location.href), repo = url.searchParams.getAll('repo'), attempt = url.searchParams.getAll('assignment');
+        return url.pathname === '/app/code' && repo.length === 1 && attempt.length === 1 && uuid.test(attempt[0])
+            && assignedRepo.exec(repo[0])?.[1] === attempt[0];
+    } catch { return false; }
+}
+
 /**
  * Answers only the actual parent window at the exact Universe origin, only for this attempt, echoing that discover's
  * challenge, and posts only to that origin, never `*`. `push` re-sends the current state against the latest accepted

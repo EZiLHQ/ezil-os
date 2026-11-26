@@ -1,4 +1,5 @@
-import {openWithAssignmentConsent, confirmAssignmentFolder} from '../assignment-video/shell.js';
+import {openWithAssignmentConsent, confirmAssignmentFolder, embeddedAssignmentWindow} from '../assignment-video/shell.js';
+import { warm as warmComputer } from '../warm.js';
 import { ai_trace_collector } from '../ui/ai-traces.js';
 import { attachCodeAuthRecovery, resetOriginRecovery } from './code-auth-recovery.js';
 import { createGitAccessRenewal } from './code-git-access.js';
@@ -659,6 +660,19 @@ export async function openCodeWindow (ctx = {}) {
         return null;
     }
 
+    /**
+     * An assignment framed by its own Universe work page (`../assignment-video/shell.js`): a working desktop inside
+     * that page. Its Code window opens as an ordinary window and keeps minimise; expand and restore stay the person's.
+     */
+    const embedded_assignment = embeddedAssignmentWindow(project);
+    // The frame is whatever size Universe gives it: the window opens inside it, above the dock, never cut off by either.
+    const framed_box = (() => {
+        if ( ! embedded_assignment ) return null;
+        const desk_w = window.innerWidth, desk_h = window.innerHeight - (window.toolbar_height || 0) - (window.taskbar_height || 0);
+        const width = Math.max(320, Math.min(980, desk_w - 24)), height = Math.max(240, Math.min(680, desk_h - 24));
+        return { width, height, left: `${Math.max(0, Math.round((desk_w - width) / 2))}px`,
+            top: `${(window.toolbar_height || 0) + Math.max(0, Math.round((desk_h - height) / 2))}px` };
+    })();
     const el_window = await UIWindow({
         title,
         // The machine, on hover. See the `title` assignment above.
@@ -677,6 +691,7 @@ export async function openCodeWindow (ctx = {}) {
         // moved it), never a guess.
         width: 980,
         height: 680,
+        ...(framed_box ?? {}),
         is_resizable: true,
         show_maximize_button: true,
         stay_on_top: false,
@@ -685,6 +700,8 @@ export async function openCodeWindow (ctx = {}) {
         is_droppable: false,
         window_class: 'ezil-code-window',
         selectable_body: false,
+        // A framed shell drops minimise (`UIWindow.js`); this one window asks for it by name.
+        minimize_when_embedded: embedded_assignment,
     });
 
     if ( ! el_window ) {
@@ -713,6 +730,10 @@ export async function openCodeWindow (ctx = {}) {
     let disposed = false;
     let assignmentGate;
     let assignmentGeneration=0;
+    /** An embedded assignment is preparing: this window's own loader is the one surface until its gate releases the editor. */
+    let gate_loading = false;
+    /** The confirmed frame's reveal, held while that gate still parks the editor (`park(false)` runs it). */
+    let gate_reveal = null;
     const lifecycleOwner = session.payload()?.user?.id;
     const lifecycle = nativeSurface ? null : watchCodeLifecycle({
         scope: { userId: lifecycleOwner, computerId: computer.id }, iframe: el_iframe,
@@ -1013,6 +1034,7 @@ export async function openCodeWindow (ctx = {}) {
     async function start_boot () {
         const assignment = assignmentGate?.access();
         if (assignmentGate && !assignment) return;
+        gate_reveal = null;
         last_failure = null;
         last_progress = null; generic_timeout = null;
         if ( disposed ) return;
@@ -1260,9 +1282,14 @@ export async function openCodeWindow (ctx = {}) {
                 lifecycle?.record('frame_confirmed');
                 // The real ready signal concludes this open on the one surface (bar to 100), so a
                 // later start_boot (restart, switch, reboot) is a fresh open with its own clock.
-                progress.render(computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: true }));
-                progress.el.hidden = true;
-                el_unavailable.hidden = true;
+                const reveal = () => {
+                    progress.render(computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: true }));
+                    progress.el.hidden = true;
+                    el_unavailable.hidden = true;
+                };
+                // An embedded assignment's editor is still parked by its gate (the verified folder, then Universe's
+                // answer): the loader stays as it is until that gate releases the editor, so nothing blank is shown.
+                if ( gate_loading ) gate_reveal = reveal; else reveal();
                 stop_monitor = watchNativeSurface(nativeSurface, reason => {
                     if (disposed || my_attempt !== attempt) return;
                     if (nativeFailureCopy) Object.assign(nativeFailureCopy, editorFailureCopy(reason || 'editor_connection_lost'));
@@ -1628,7 +1655,8 @@ export async function openCodeWindow (ctx = {}) {
     function set_view (view, { remember = false } = {}) {
         if ( disposed ) return;
         if ( view === 'full' ) full_view.enter(); else full_view.exit();
-        if ( remember ) remember_view(view);
+        // The framed assignment's view is its own: the choice remembered for standalone Code is never written from it.
+        if ( remember && ! embedded_assignment ) remember_view(view);
         const next = current_view();
         if ( next === view_now ) return;
         view_now = next;
@@ -1693,7 +1721,8 @@ export async function openCodeWindow (ctx = {}) {
     if ( ! nativeSurface ) el_window._ezil_restore_frame_viewport = restore_frame_viewport;
     const restore_observer = nativeSurface ? full_view.watch_restore(restore_frame_viewport) : null;
 
-    const launch_view = ctx.view === 'full' || ctx.view === 'window' ? ctx.view : remembered_view();
+    // The framed assignment opens windowed (head, minimise, dock) whatever the route's default or the remembered choice.
+    const launch_view = embedded_assignment ? 'window' : ctx.view === 'full' || ctx.view === 'window' ? ctx.view : remembered_view();
     if ( launch_view === 'full' ) full_view.enter();
     view_now = current_view();
 
@@ -1760,7 +1789,8 @@ export async function openCodeWindow (ctx = {}) {
         assignmentGate = null;
         assignmentGate = openWithAssignmentConsent({project:requestedProject, computerId:computer.id, actor:()=>session.payload()?.user?.id,
             body:el_body,
-            park(locked) {
+            // `loading` (the embedded gate only): the workspace is preparing, and this window's own loader is what shows.
+            park(locked, loading) {
                 if(!stillHere())return;
                 el_body.classList.toggle('ezil-assignment-work-locked',locked);
                 el_iframe.inert = locked;
@@ -1768,6 +1798,26 @@ export async function openCodeWindow (ctx = {}) {
                     if (document.activeElement === el_iframe) el_iframe.blur();
                     el_iframe.setAttribute('aria-hidden','true');
                 } else el_iframe.removeAttribute('aria-hidden');
+                gate_loading = locked && loading === true;
+                // The embedded gate's state, for a verification lane: preparing (this window's loader), held (the
+                // gate's own message) or open (the editor). The standalone gate passes no `loading` and sets nothing.
+                if (loading !== undefined) el_body.dataset.ezilAssignmentWork = ! locked ? 'open' : gate_loading ? 'preparing' : 'held';
+                const reveal = gate_reveal; gate_reveal = null;
+                if (!locked) { reveal?.(); return; }
+                // No open in flight and no computer state to say: the neutral loader, never a concluded, failed or
+                // hidden one. An open in flight keeps painting its own progress on the same surface.
+                if (gate_loading && tick_timer === null && el_state.hidden) {
+                    progress.el.hidden = false; el_unavailable.hidden = true;
+                    progress.waiting();
+                }
+            },
+            // The ordinary warm of this window's own computer, under the Browser icon's own rules (`../boot.js`
+            // `maybe_warm_desktop`, `../warm.js`: one per computer, never one its owner stopped, and the server boots
+            // no held computer for a warm). It opens no editor and no checkout, and its answer is not used here.
+            wake() {
+                if (!stillHere() || nativeSurface || desktop_state.provider === 'native-macos' || desktop_state.configured !== true
+                    || !session.payload()?.apps?.some?.(app => app?.id === 'desktop')) return;
+                warmComputer(computer.id);
             },
             async computerProvider() {
                 const path = desktop_state.endpoints?.system;
@@ -1798,6 +1848,8 @@ export async function openCodeWindow (ctx = {}) {
             open:()=>{if (stillHere()) void start_boot();}});
         if (!assignmentGate) {
             el_body.classList.remove('ezil-assignment-work-locked');
+            delete el_body.dataset.ezilAssignmentWork;
+            gate_loading = false; gate_reveal = null;
             el_iframe.inert=false; el_iframe.removeAttribute('aria-hidden');
         }
     }
