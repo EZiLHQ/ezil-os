@@ -137,8 +137,28 @@
       "kind": "snapshot"
     },
     {
+      "path": "app/drizzle/0035_editor_agent_sessions.sql",
+      "sha256": "1ae73e8865f488b2736608a88dd0767aebd04dfe49c43db69751db78dc8cc80d",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0036_editor_control_operations.sql",
+      "sha256": "0ab5ff43439b281ea6ff8eaa56efb7b166e0cdcb6e283029c2a216baf7c8da59",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0037_editor_protocol_2.sql",
+      "sha256": "134e14daa769de62f5ac25298569fd7b5e0a26697cf7e98963c650cd28f08c16",
+      "kind": "snapshot"
+    },
+    {
       "path": "app/drizzle/0038_operator_access_overrides.sql",
       "sha256": "04ae74d9fe1b34cd26a72bec5d85ee5213cfcfc7389c3560268acab06901d0d0",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0039_named_computer_creation.sql",
+      "sha256": "5203f0603cda73801f16784ecbf745a32772bce700f00c8cf708caaad78299aa",
       "kind": "snapshot"
     }
   ],

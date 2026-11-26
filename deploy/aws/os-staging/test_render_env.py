@@ -609,5 +609,64 @@ class DelegationEnvironmentTests(unittest.TestCase):
         self.assertEqual(rendered[DELEGATION_GATE], "enabled")
 
 
+class ProductionEditorEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        self.base = {key: "synthetic-value-never-log-1234567890" for key in renderer.REQUIRED}
+        self.base.update(NEXT_PUBLIC_SUPABASE_URL="https://db.ezil.work", SUPABASE_DATABASE_URL=PRODUCTION_DB,
+                         STRIPE_PUBLISHABLE_KEY="pk_live_synthetic", STRIPE_SECRET="sk_live_synthetic")
+        self.enabled = {**self.base, **delegation(EZIL_DELEGATION_ISSUER="https://connect.ezil.work",
+                         EZIL_DELEGATION_AUDIENCE="https://os.ezil.work"),
+                        **{key: "enabled" for key in renderer.EDITOR_SWITCHES},
+                        renderer.ONBOARDING_GATE: "enabled",
+                        renderer.MCP_BOOTSTRAP_CLIENT: "synthetic_auth0_client_id",
+                        renderer.OS_PUBLIC_ORIGIN: "https://os.ezil.work",
+                        "EZIL_EDITOR_WORKER_ORIGIN": "https://api-desktop.ezil.org",
+                        "EZIL_EDITOR_WORKER_PROTOCOL": "2",
+                        renderer.PREVIEW_TOKEN_V2: "1",
+                        "CLOUDFLARE_GUACAMOLE_WORKER_URL": "https://api-desktop.ezil.org",
+                        "CLOUDFLARE_GUACAMOLE_HMAC_SECRET": "synthetic-worker-secret"}
+
+    def test_old_production_defaults_stay_absent_and_disabled_is_valid(self):
+        self.assertEqual(renderer.validate(self.base, "production"), self.base)
+        disabled = {**self.base, **{k: "disabled" for k in (*renderer.EDITOR_SWITCHES, renderer.ONBOARDING_GATE)}}
+        self.assertEqual(renderer.validate(disabled, "production"), disabled)
+
+    def test_candidate_render_preserves_exact_switches_without_printing_values(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as output:
+            renderer.render(self.enabled, Path(tmp), "production")
+            rendered = dict(line.split("=", 1) for line in (Path(tmp) / "app.env").read_text().splitlines())
+            self.assertEqual(rendered, self.enabled)
+            self.assertEqual(output.getvalue().splitlines(), sorted(self.enabled))
+            self.assertNotIn(renderer.MCP_BOOTSTRAP_CLIENT, (Path(tmp) / "cron.env").read_text())
+
+    def test_refuses_partial_gates_wrong_producer_and_cross_environment_pins(self):
+        for key, value in [(renderer.EDITOR_SWITCHES[0], "disabled"), (renderer.EDITOR_SWITCHES[1], "disabled"),
+                           (renderer.DELEGATION_GATE, "disabled"), (renderer.ONBOARDING_GATE, "true"),
+                           ("CLOUDFLARE_GUACAMOLE_WORKER_URL", "https://api-desktop-staging.ezil.work"),
+                           ("CLOUDFLARE_GUACAMOLE_WORKER_URL", "https://worker.example.invalid"),
+                           ("EZIL_DELEGATION_ISSUER", "https://connect-staging.ezil.work"),
+                           ("EZIL_DELEGATION_AUDIENCE", "https://os-prod.ezil.work"),
+                           ("EZIL_EDITOR_WORKER_ORIGIN", "https://api-desktop-staging.ezil.work"),
+                           ("EZIL_EDITOR_WORKER_PROTOCOL", "1"),
+                           (renderer.PREVIEW_TOKEN_V2, "true"),
+                           (renderer.OS_PUBLIC_ORIGIN, "https://os-staging.ezil.work"),
+                           (renderer.MCP_BOOTSTRAP_CLIENT, "*")]:
+            with self.subTest(key=key, value=value), self.assertRaises(renderer.RenderError):
+                renderer.validate({**self.enabled, key: value}, "production")
+        for key in ("CLOUDFLARE_GUACAMOLE_HMAC_SECRET", "EZIL_DELEGATION_PUBLIC_JWKS", renderer.OS_PUBLIC_ORIGIN,
+                    "EZIL_EDITOR_WORKER_ORIGIN", "EZIL_EDITOR_WORKER_PROTOCOL"):
+            with self.subTest(missing=key), self.assertRaises(renderer.RenderError):
+                renderer.validate({k: v for k, v in self.enabled.items() if k != key}, "production")
+
+    def test_bootstrap_is_optional_and_requires_enabled_onboarding(self):
+        renderer.validate({k: v for k, v in self.enabled.items() if k != renderer.MCP_BOOTSTRAP_CLIENT}, "production")
+        with self.assertRaises(renderer.RenderError):
+            renderer.validate({**self.enabled, renderer.ONBOARDING_GATE: "disabled"}, "production")
+
+    def test_does_not_admit_new_production_keys_to_staging(self):
+        with self.assertRaises(renderer.RenderError):
+            renderer.validate(self.enabled, "staging")
+
+
 if __name__ == "__main__":
     unittest.main()

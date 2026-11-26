@@ -1,3 +1,6 @@
+import { editorDelegationEnabled } from '@/server/api/editor-delegation';
+import { reconcileColdStarts } from '@/server/computer-start/start';
+import { observeAdmittedStart } from '@/server/computer-start/port';
 import { drainFeedbackNotifications } from '@/server/feedback/notifications';
 import { drainIncidentAlerts } from '@/server/telemetry/incident-alerts';
 import type { SQL } from 'drizzle-orm';
@@ -22,6 +25,9 @@ import { GET, maxDuration } from './route';
 
 const mockEnv = vi.hoisted(() => ({ CRON_SECRET: undefined as string | undefined, CLOUDFLARE_GUACAMOLE_HMAC_SECRET: undefined as string | undefined }));
 vi.mock('@/server/feedback/notifications', () => ({ drainFeedbackNotifications: vi.fn() }));
+vi.mock('@/server/api/editor-delegation', () => ({ editorDelegationEnabled: vi.fn() }));
+vi.mock('@/server/computer-start/start', () => ({ reconcileColdStarts: vi.fn() }));
+vi.mock('@/server/computer-start/port', () => ({ observeAdmittedStart: vi.fn() }));
 vi.mock('@/server/telemetry/incident-alerts', () => ({ drainIncidentAlerts: vi.fn() }));
 vi.mock('@/env', () => ({ env: mockEnv }));
 vi.mock('@/server/db', () => ({ db: {} }));
@@ -68,6 +74,28 @@ async function wiring() {
 }
 
 describe('GET /api/cron/billing-session-sweep', () => {
+    it('only observes admitted starts behind the feature gate and authenticated cron, without client polling', async () => {
+        await GET(request('Bearer cron'));
+        expect(reconcileColdStarts).not.toHaveBeenCalled();
+        vi.mocked(editorDelegationEnabled).mockReturnValue(true);
+        await GET(request('Bearer wrong'));
+        expect(reconcileColdStarts).not.toHaveBeenCalled();
+        await GET(request('Bearer cron'));
+        expect(reconcileColdStarts).toHaveBeenCalledExactlyOnceWith(db, expect.any(Function));
+        const observer = vi.mocked(reconcileColdStarts).mock.calls[0]![1];
+        const admitted = { ...computer, admittedRoute: { kind: 'cloudflare' as const, instanceType: null, moving: false } };
+        await observer(admitted);
+        expect(observeAdmittedStart).toHaveBeenCalledExactlyOnceWith(db, admitted);
+    });
+
+    it('preserves the normal billing sweep if an admitted-start observation fails', async () => {
+        vi.mocked(editorDelegationEnabled).mockReturnValue(true);
+        vi.mocked(reconcileColdStarts).mockRejectedValue(new Error('synthetic unavailable'));
+        const response = await GET(request('Bearer cron'));
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual(counts);
+        expect(handleBillingSessionSweep).toHaveBeenCalledTimes(1);
+    });
     it('404s when CRON_SECRET is unset, before constructing any billing dependencies', async () => {
         mockEnv.CRON_SECRET = undefined;
         const response = await GET(request('Bearer undefined'));

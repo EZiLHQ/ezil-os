@@ -1,0 +1,523 @@
+{
+  "observedAt": "2026-11-26T21:36:53.783057+00:00",
+  "readOnly": true,
+  "secretsRead": false,
+  "account": "452630323510",
+  "roles": [
+    {
+      "name": "ezil-os-prod-host-InstanceRole-uJIGAhHeIYOr",
+      "arn": "arn:aws:iam::452630323510:role/ezil-os-prod-host-InstanceRole-uJIGAhHeIYOr",
+      "trust": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "ec2.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      },
+      "tags": [
+        {
+          "Key": "ezil:purpose",
+          "Value": "os"
+        },
+        {
+          "Key": "ezil:env",
+          "Value": "production"
+        }
+      ],
+      "boundary": null,
+      "inlinePolicies": {
+        "OsProductionRuntime": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::ezil-main-prod-artifacts-452630323510-aps1/os/images/*",
+              "Effect": "Allow"
+            },
+            {
+              "Action": "secretsmanager:GetSecretValue",
+              "Resource": "arn:aws:secretsmanager:ap-south-1:452630323510:secret:ezil-os/production/app-*",
+              "Effect": "Allow"
+            },
+            {
+              "Action": "sts:AssumeRole",
+              "Resource": "arn:aws:iam::452630323510:role/ezil/prd/ezil-prd-app-caller",
+              "Effect": "Allow"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "ezil-prd-app-caller",
+      "arn": "arn:aws:iam::452630323510:role/ezil/prd/ezil-prd-app-caller",
+      "trust": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::452630323510:role/ezil-os-prod-host-InstanceRole-uJIGAhHeIYOr"
+            },
+            "Action": "sts:AssumeRole",
+            "Condition": {
+              "StringEquals": {
+                "aws:PrincipalTag/ezil:env": "production"
+              }
+            }
+          }
+        ]
+      },
+      "tags": [
+        {
+          "Key": "ezil:namespace",
+          "Value": "prd"
+        }
+      ],
+      "boundary": {
+        "PermissionsBoundaryType": "Policy",
+        "PermissionsBoundaryArn": "arn:aws:iam::452630323510:policy/ezil/identity/ezil-prd-boundary"
+      },
+      "inlinePolicies": {
+        "AppCallerRoleDefaultPolicy61BE57D2": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "states:StartExecution",
+              "Resource": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle",
+              "Effect": "Allow"
+            },
+            {
+              "Action": "states:DescribeExecution",
+              "Resource": "arn:aws:states:ap-south-1:452630323510:execution:ezil-prd-lifecycle:computer-*",
+              "Effect": "Allow"
+            },
+            {
+              "Action": "states:GetExecutionHistory",
+              "Resource": "arn:aws:states:ap-south-1:452630323510:execution:ezil-prd-lifecycle:computer-*",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestedRegion": "ap-south-1"
+                }
+              },
+              "Action": [
+                "ec2:DescribeInstances",
+                "ec2:DescribeVolumes",
+                "ec2:DescribeAvailabilityZones"
+              ],
+              "Resource": "*",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle:7"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Action": "states:StartExecution",
+              "Resource": [
+                "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation",
+                "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery"
+              ],
+              "Effect": "Allow"
+            },
+            {
+              "Action": "states:DescribeExecution",
+              "Resource": [
+                "arn:aws:states:ap-south-1:452630323510:execution:ezil-prd-rebase-preparation:computer-*",
+                "arn:aws:states:ap-south-1:452630323510:execution:ezil-prd-recovery:computer-*"
+              ],
+              "Effect": "Allow"
+            },
+            {
+              "Action": "states:GetExecutionHistory",
+              "Resource": "arn:aws:states:ap-south-1:452630323510:execution:ezil-prd-rebase-preparation:computer-*",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation:6"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery:7"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/0d6e64a7-6c0e-4e03-a339-2b74521b3727",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestedRegion": "ap-south-1"
+                }
+              },
+              "Action": "ec2:DescribeSnapshots",
+              "Resource": "*",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle:6"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation:5"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery:6"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/0d6e64a7-6c0e-4e03-a339-2b74521b3727",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle:5"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation:4"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery:5"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/0d6e64a7-6c0e-4e03-a339-2b74521b3727",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle:4"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation:3"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery:4"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/0d6e64a7-6c0e-4e03-a339-2b74521b3727",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle:3"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle:2"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation:2"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery:3"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/0d6e64a7-6c0e-4e03-a339-2b74521b3727",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle:1"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation:1"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery:2"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/0d6e64a7-6c0e-4e03-a339-2b74521b3727",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": [
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle:8",
+                    "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-rebase-preparation:7"
+                  ],
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/09734c73-2536-498b-b8ec-b39665462911",
+              "Effect": "Allow"
+            },
+            {
+              "Condition": {
+                "StringEquals": {
+                  "kms:EncryptionContext:aws:states:stateMachineArn": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery:8",
+                  "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                }
+              },
+              "Action": "kms:Decrypt",
+              "Resource": "arn:aws:kms:ap-south-1:452630323510:key/0d6e64a7-6c0e-4e03-a339-2b74521b3727",
+              "Effect": "Allow"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "ezil-mcp-test-editor-20261108-Role-5yJb3l31yJXI",
+      "arn": "arn:aws:iam::452630323510:role/ezil-mcp-test-editor-20261108-Role-5yJb3l31yJXI",
+      "trust": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "ec2.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      },
+      "tags": [
+        {
+          "Key": "ezil:owner",
+          "Value": "ezil-mcp-test"
+        },
+        {
+          "Key": "Name",
+          "Value": "ezil-mcp-test-editor-20261108"
+        }
+      ],
+      "boundary": null,
+      "inlinePolicies": {
+        "EZiLConnectSecretRead": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": "secretsmanager:GetSecretValue",
+              "Resource": "arn:aws:secretsmanager:us-east-1:452630323510:secret:ezil/mcp/connect/config-xV8kXZ"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "simulations": [
+    {
+      "role": "arn:aws:iam::452630323510:role/ezil-os-prod-host-InstanceRole-uJIGAhHeIYOr",
+      "action": "sts:AssumeRole",
+      "resource": "arn:aws:iam::452630323510:role/ezil/prd/ezil-prd-app-caller",
+      "results": [
+        {
+          "EvalDecision": "allowed",
+          "MissingContextValues": []
+        }
+      ]
+    },
+    {
+      "role": "arn:aws:iam::452630323510:role/ezil-os-prod-host-InstanceRole-uJIGAhHeIYOr",
+      "action": "secretsmanager:GetSecretValue",
+      "resource": "arn:aws:secretsmanager:ap-south-1:452630323510:secret:ezil-os/production/app-ESRqd9",
+      "results": [
+        {
+          "EvalDecision": "allowed",
+          "MissingContextValues": []
+        }
+      ]
+    },
+    {
+      "role": "arn:aws:iam::452630323510:role/ezil/prd/ezil-prd-app-caller",
+      "action": "states:StartExecution",
+      "resource": "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle",
+      "results": [
+        {
+          "EvalDecision": "allowed",
+          "MissingContextValues": [],
+          "PermissionsBoundaryDecisionDetail": {
+            "AllowedByPermissionsBoundary": true
+          }
+        }
+      ]
+    }
+  ]
+}

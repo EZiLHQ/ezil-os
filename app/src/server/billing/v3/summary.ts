@@ -35,7 +35,7 @@ const iso = (date: Date) => isoSeconds(epochSeconds(date));
  * Gateway has not acknowledged, that have not expired and whose delivery has not failed terminally.
  * null when nothing waits or receipts are unreadable.
  */
-function waitingCredits(receipts: readonly AiCreditReceipt[] | null, now: Date): { credits: number } | null {
+export function waitingCredits(receipts: readonly AiCreditReceipt[] | null, now: Date): { credits: number } | null {
     const credits = (receipts ?? []).reduce((sum, receipt) => receipt.deliveredAt === null && !receipt.failed
         && Date.parse(receipt.expiresAt) > now.getTime() ? sum + receipt.credits : sum, 0);
     return credits > 0 ? { credits } : null;
