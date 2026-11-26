@@ -29,7 +29,7 @@ function claim(win: Window, attemptId: string): boolean {
  * Nothing happens until the actual Universe parent has asked (`respondToWorkDiscover`: this document is that tab's
  * direct child, the message came from that window at that exact origin, for this attempt). Then, once per assignment
  * per tab, ONE hidden same-origin child tries a silent EZiL ID sign-in (`@/server/auth/work-auth`) while this frame
- * answers `preparing`. The child's answer counts only from that child's own window at this origin, carrying this
+ * answers `preparing` with `identityPending: true`, so Universe binds nothing to a document about to reload. The child's answer counts only from that child's own window at this origin, carrying this
  * attempt's random request id and one of the fixed outcomes.
  *
  * - `signed_in` for this attempt: only THIS frame reloads. The Universe tab, and its screen capture, stay as they are.
@@ -93,6 +93,7 @@ export function silentWorkSignIn(attemptId: string, win: Window, onPending?: (pe
         }
     }
     // `begin` runs inside the accepted discover, before its reply is sent, so that reply already says `preparing`.
-    const responder = respondToWorkDiscover(attemptId, win, () => state, begin);
+    // This document only ever prepares for its own reload, so each of its `preparing` replies says `identityPending`.
+    const responder = respondToWorkDiscover(attemptId, win, () => state, begin, () => state === 'preparing');
     return () => { done = true; cleanup(); responder.dispose(); };
 }

@@ -72,14 +72,20 @@ function embeddedWorkFrame(win: Window): boolean {
  * against the latest accepted challenge, which `onDiscover` receives before the reply. Replies carry no proof,
  * repository, computer or recording identifier.
  * 🔴 `shell/ezil/assignment-video/work-protocol.js` is the shell's copy; `assignment-work-auth.test.ts` runs both on one fixture.
+ *
+ * `identityPending` is this copy's one addition, for the sign-in document only (`silent-sign-in.ts`): while it is
+ * exactly true, a `preparing` reply also carries `identityPending: true`. It tells Universe this document is about to
+ * reload itself, so nothing should be bound to it yet. No other state carries the field, and the shell, which never
+ * passes the argument, never sends it.
  */
-export function respondToWorkDiscover(attemptId: string, win: Window, current: () => WorkState, onDiscover?: (challenge: string) => void):
-    { dispose: () => void; push: () => void } {
+export function respondToWorkDiscover(attemptId: string, win: Window, current: () => WorkState, onDiscover?: (challenge: string) => void,
+    identityPending?: () => boolean): { dispose: () => void; push: () => void } {
     if (!uuid.test(attemptId) || !embeddedWorkFrame(win)) return { dispose: () => {}, push: () => {} };
     let challenge: string | null = null;
     const push = () => {
         const type = current();
-        if (challenge && workStates.includes(type)) win.parent.postMessage({protocol:workProtocol, type, attemptId, challenge}, workHost);
+        if (challenge && workStates.includes(type)) win.parent.postMessage({protocol:workProtocol, type, attemptId, challenge,
+            ...(type === 'preparing' && identityPending?.() === true ? {identityPending: true} : {})}, workHost);
     };
     const receive = (event: MessageEvent) => {
         const data = event.data;
