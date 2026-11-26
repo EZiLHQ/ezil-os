@@ -3,7 +3,7 @@ import TabAccount from './account.js';
 import { payload as bootPayload, currentComputer } from '../../../session.js';
 import { isNative } from '../../../native-runtime.js';
 import trpc from '../trpc.js';
-import { openUpgradeSheet } from '../upgrade-sheet.js';
+import { openUpgradeSheet, TOPUP_REVIEW_COPY, TOPUP_TIMEOUT_COPY } from '../upgrade-sheet.js';
 import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
 import { openConfirmSheet } from '../sheet-frame.js';
 import { billingRecoveryAction, openTopupSheet, topupOffer } from '../topup-sheet.js';
@@ -19,12 +19,16 @@ const STATES = new Set(['ok', 'low', 'exhausted', 'over_cap', 'unavailable']);
 const ATTENTION = new Set(['low', 'exhausted', 'over_cap']);
 const windows = new WeakMap();
 const FOCUS_RELOAD_MS = 5 * 60 * 1000;
+const TOPUP_WATCH_DELAYS = [3000, 5000, 8000, 13000, 21000, 30000];
+const TOPUP_PENDING_COPY = 'Payment received. Your AI credits are being added. This page updates when they arrive.';
+let topupWatchClock = { later: (fn, ms) => window.setTimeout(fn, ms), cancel: id => window.clearTimeout(id), now: () => Date.now() };
 let upgradeSheetOpener = openUpgradeSheet;
 let sheetOpeners = { upgrade: openComputeUpgradeSheet, downgrade: openDowngradeSheet, cancel: openCancelSheet, overage: openOverageSheet, choose: openPlanPickerSheet,
     topup: openTopupSheet };
 
 export function setUpgradeSheetOpener (fn) { upgradeSheetOpener = fn; }
 export function setBillingSheetOpeners (openers) { sheetOpeners = { ...sheetOpeners, ...openers }; }
+export function setTopupWatchClock ({ later, cancel, now }) { topupWatchClock = { later, cancel, now }; }
 
 const encode = value => html_encode(String(value));
 const sizeFor = (summary, code) => summary.catalog.sizes.find(size => size.code === code);
@@ -773,8 +777,13 @@ function couponStatus (result, alias) {
     return { trial_offer_invalid: 'invalid', trial_offer_unavailable: 'unavailable', trial_unavailable: 'refused' }[result?.message] ?? 'error';
 }
 
-async function load ($win, state) {
-    if ( state.loading || state.pending || state.sheet || state.closed ) return;
+function load ($win, state) {
+    if ( state.loading || state.pending || state.sheet || state.closed ) return state.loadPromise;
+    state.loadPromise = loadBilling($win, state);
+    return state.loadPromise;
+}
+
+async function loadBilling ($win, state) {
     stopCountdown(state);
     state.loading = true;
     state.summary = null;
@@ -814,6 +823,9 @@ async function load ($win, state) {
                 view = withCouponView(result.data, { alias, status, invalid: link.invalid === true });
             }
             $body.html(result.data.version === 3 ? summaryV3Html(view, null, { lastAccount: state.lastAccount, userId }) : summaryHtml(result.data));
+            // Only a top-up watch's status outlives the pane it was written on; every other status is of its moment.
+            if ( state.actionStatusOwner ) actionStatus($win, state.actionStatus ?? '', state.actionStatusOwner);
+            else state.actionStatus = '';
             state.summary = view;
             state.loadedAt = Date.now();
             startCountdown($win, state);
@@ -891,7 +903,94 @@ async function loadUsage ($win, state, request) {
 
 function actionError ($win, copy) { $win.find('[data-role="billing-action-error"]').text(copy); }
 /** A neutral outcome (not an error) beside the actions, e.g. a checkout closed before payment finished. */
-function actionStatus ($win, copy) { $win.find('[data-role="billing-action-status"]').text(copy); }
+function actionStatus ($win, copy, owner = null) {
+    const state = windows.get($win.get(0));
+    if ( ! state || state.closed || ! $win.get(0).isConnected ) return;
+    state.actionStatus = copy;
+    state.actionStatusOwner = owner;
+    $win.find('[data-role="billing-action-status"]').text(copy);
+}
+
+/** The sheet hands off an unresolved session; one bounded watch belongs to this Settings window. */
+function watchTopup ($win, state, pending) {
+    state.topupWatch?.stop();
+    if ( state.closed || ! $win.get(0).isConnected || ! pending?.sessionId ) return;
+    const { later, cancel, now } = topupWatchClock;
+    let paid = pending.paid === true;
+    let deadline = now() + (paid ? 10 * 60 * 1000 : 60000);
+    let timer = null, deadlineTimer = null, step = 0, checking = false;
+    const watch = { active: true, check, stop };
+    state.topupWatch = watch;
+    const current = () => state.topupWatch === watch && ! state.closed && $win.get(0).isConnected;
+    const running = () => watch.active && current();
+    const write = copy => { if ( current() ) actionStatus($win, copy, watch); };
+    function stop () {
+        watch.active = false;
+        if ( timer !== null ) cancel(timer);
+        if ( deadlineTimer !== null ) cancel(deadlineTimer);
+        timer = deadlineTimer = null;
+    }
+    function expire () {
+        if ( running() && paid ) write(TOPUP_TIMEOUT_COPY);
+        stop();
+    }
+    function armDeadline () {
+        if ( deadlineTimer !== null ) cancel(deadlineTimer);
+        // A stalled read cannot extend either bound.
+        deadlineTimer = later(expire, Math.max(0, deadline - now()));
+    }
+    function schedule () {
+        if ( ! running() ) return;
+        timer = later(() => { timer = null; void check(); }, TOPUP_WATCH_DELAYS[Math.min(step++, TOPUP_WATCH_DELAYS.length - 1)]);
+    }
+    async function check () {
+        if ( ! running() ) { stop(); return; }
+        if ( now() >= deadline ) { expire(); return; }
+        if ( checking ) return;
+        if ( timer !== null ) cancel(timer);
+        timer = null;
+        checking = true;
+        try {
+            const result = await trpc.query('billing.topupStatus', { sessionId: pending.sessionId });
+            if ( ! running() ) return;
+            if ( now() >= deadline ) { expire(); return; }
+            if ( ! result?.ok ) return;
+            const data = result.data;
+            if ( data?.fulfillment === 'credited' ) {
+                stop();
+                // Only the count the server confirmed; the quoted pack is never shown as delivered.
+                const credits = Number.isSafeInteger(data.credits) && data.credits > 0 ? data.credits : null;
+                if ( state.active ) {
+                    // A read already in flight may predate the credit. Let it finish, then ask for the new balance.
+                    if ( state.loading ) await state.loadPromise;
+                    if ( ! current() ) return;
+                    // A dialog open right now blocks the read (`load`): its close makes it instead (`openSheet` onClose).
+                    if ( state.sheet || state.pending ) state.reloadAfterSheet = true;
+                    else if ( state.active ) await load($win, state);
+                }
+                write(credits === null ? 'AI credits added.' : `${credits.toLocaleString('en-US')} AI credits added.`);
+                return;
+            }
+            if ( data?.fulfillment === 'review' ) { write(TOPUP_REVIEW_COPY); stop(); return; }
+            if ( data?.status === 'expired' ) {
+                if ( state.actionStatusOwner === watch ) write('');
+                stop();
+                return;
+            }
+            // Once the server confirms payment, later failures cannot make it unpaid again.
+            if ( ! paid && data?.status === 'complete' && data.paymentStatus === 'paid' ) {
+                paid = true;
+                deadline = now() + 10 * 60 * 1000;
+                armDeadline();
+            }
+            if ( paid ) write(TOPUP_PENDING_COPY);
+        } catch { /* A failed read is transient and says nothing about payment. */ }
+        finally { checking = false; schedule(); }
+    }
+    if ( paid ) write(TOPUP_PENDING_COPY);
+    armDeadline();
+    schedule();
+}
 
 /**
  * `topup` opens the Add AI credits dialog (`sku` preselects a preset; `intent.reason` frames exhaustion);
@@ -983,6 +1082,8 @@ function openSheet ($win, state, action, sku, intent = null) {
     const onClose = () => {
         observer?.disconnect();
         if ( state.sheet === token ) state.sheet = null;
+        // A top-up was credited while this dialog was open: show its balance now.
+        if ( state.reloadAfterSheet && ! state.sheet ) { state.reloadAfterSheet = false; void load($win, state); }
     };
     const onDone = () => { onClose(); void load($win, state); };
     actionError($win, '');
@@ -1001,6 +1102,7 @@ function openSheet ($win, state, action, sku, intent = null) {
             checkout: params => openSheet($win, state, 'topup-checkout', null, params),
             upgrade: choice => openSheet($win, state, choice.action, choice.sku) })
             : action === 'topup-checkout' ? upgradeSheetOpener({ ...options, sku: pack.sku, pack, summary, userId: state.userId,
+                onUnconfirmed: pending => watchTopup($win, state, pending),
                 onCancel: () => actionStatus($win, 'Checkout closed before payment finished. If you did pay, your credits appear here once the payment is confirmed.') })
             : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes, summary, ...(trial ? { trial: true, ...(typeof summary.trialOffer?.coupon === 'string' ? { coupon: summary.trialOffer.coupon } : {}) } : {}) })
             : sheetOpeners[action]({ ...options, summary });
@@ -1113,12 +1215,13 @@ export default {
     },
     init ($win, ctx = {}) {
         const state = { loading: false, pending: false, summary: null, history: [], sheet: null, request: 0, autoOpened: false, openUpgrade: false, openTopup: null, timer: null, active: false, closed: false,
-            lastAccount: null, loadedAt: undefined, userId: null,
+            lastAccount: null, loadedAt: undefined, userId: null, topupWatch: null, actionStatus: '',
             // Code's request (credit refusal or locked model) that opened this window, consumed by the first summary.
             openRecovery: recoveryRequest(ctx?.billingRecovery) };
         windows.set($win.get(0), state);
         // Back from another window or tab (a hosted checkout, a top-up) with a pane older than five minutes: read it again.
         state.focus = () => {
+            if ( state.topupWatch?.active ) void state.topupWatch.check();
             if ( state.active && ! state.closed && ! state.loading && ! state.pending && ! state.sheet
                 && Date.now() - (state.loadedAt ?? 0) > FOCUS_RELOAD_MS ) void load($win, state);
         };
@@ -1160,6 +1263,7 @@ export default {
             $win.off('ezil:billing-topup');
             window.removeEventListener?.('focus', state.focus);
             state.closed = true;
+            state.topupWatch?.stop();
             state.request++;
             stopCountdown(state);
             state.sheet?.handle?.close();
