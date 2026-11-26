@@ -4,6 +4,9 @@ import React, { useEffect, useState } from 'react';
 
 const checking = 'Checking your payment…';
 const unconfirmed = 'Payment confirmation is pending. Your plan updates after payment is confirmed.';
+// Before the server has said what this session bought, and for a top-up, nothing here may mention a plan.
+const unclassified = 'Payment confirmation is pending.';
+const topupUnconfirmed = 'Payment confirmation is pending. Your AI credits update after payment is confirmed.';
 type View = { sessionId: string; message: string; canCheckAgain: boolean };
 type TopupRead = {
     status: 'pending' | 'complete' | 'expired';
@@ -84,7 +87,7 @@ function CheckoutStatusForSession({ sessionId }: { sessionId: string }) {
     useEffect(() => {
         const controller = new AbortController();
         let stopped = false;
-        let lastMessage = unconfirmed;
+        let lastMessage = unclassified;
         let kind: 'unknown' | 'topup' | 'subscription' = 'unknown';
         let topupPaid = false;
         let creditsAdded: string | null = null;
@@ -137,14 +140,14 @@ function CheckoutStatusForSession({ sessionId }: { sessionId: string }) {
                 finish('This checkout expired before payment, so you were not charged. Return to Billing to try again.');
                 return;
             }
-            if (topup.status !== 'complete') lastMessage = unconfirmed;
+            if (topup.status !== 'complete') lastMessage = topupUnconfirmed;
             else if (topup.paymentStatus !== 'paid') {
                 lastMessage = 'Your payment is processing. Bank payments can take a few days. Your AI credits update after payment is confirmed.';
             } else if (topup.fulfillment === 'review') {
                 finish("Payment received, but your credits couldn't be added automatically. You don't need to pay again. Contact support if they don't appear soon.");
                 return;
             } else if (topup.fulfillment === 'credited') {
-                creditsAdded = typeof topup.credits === 'number' && Number.isSafeInteger(topup.credits)
+                creditsAdded = typeof topup.credits === 'number' && Number.isSafeInteger(topup.credits) && topup.credits > 0
                     ? `${topup.credits.toLocaleString('en-US')} AI credits added.` : 'Your AI credits were added.';
                 setView({ sessionId, message: creditsAdded, canCheckAgain: false });
                 let balance = balanceUnavailable;
@@ -168,7 +171,10 @@ function CheckoutStatusForSession({ sessionId }: { sessionId: string }) {
                     const topup = await query('topupStatus');
                     if (stopped) return;
                     // Only the server's explicit refusal selects the existing plan flow for this attempt.
-                    if (kind === 'unknown' && topup === null) kind = 'subscription';
+                    if (kind === 'unknown' && topup === null) {
+                        kind = 'subscription';
+                        lastMessage = unconfirmed;
+                    }
                     else {
                         if (!isTopupRead(topup)) throw new Error('Could not check billing.');
                         kind = 'topup';
