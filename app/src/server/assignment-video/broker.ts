@@ -30,6 +30,10 @@ const storage = globalThis as typeof globalThis & { ezilAssignmentMediaLeases?: 
 // The same process already holds the verified OS session identity. A process loss requires a new authenticated begin.
 // No Works capability, retained ID token, signature, signed URL or storage key is persisted.
 const defaults = storage.ezilAssignmentMediaLeases ??= new Map<string, Capability>();
+// Order successful capabilities only within the exact lease key. An older HTTP response
+// can arrive after its successor already obtained a capability from Universe.
+const leaseOrders = new WeakMap<Capability, number>();
+let beginOrder = 0;
 
 function syncLeaseClock(entry: Capability, report: ClockWindow) {
     if (report.startedAt === null || report.deadlineAt === null) {
@@ -150,6 +154,7 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
     if (input.action === 'begin') {
         if (authority === productionAssignment && (!input.captureSessionId || input.consentVersion !== 4))
             return refuse('video_consent_required', 409);
+        const order = ++beginOrder;
         const requestedPhase = input.captureSessionId;
         const result = started.safeParse(await openControl('begin', input.repoOpenProof, {
             consentAccepted:true, consentVersion:input.consentVersion,
@@ -179,6 +184,12 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
             preparedEnds:same ? previous.preparedEnds : new Map()};
         if (validWindow) syncLeaseClock(entry, receipt);
         if (same && previous.startedAt !== undefined) syncLeaseClock({...previous}, receipt);
+        if (previous && (leaseOrders.get(previous) ?? 0) > order) {
+            // A repeat of that same phase may return its receipt without replacing the current capability.
+            if (same) return receipt;
+            return refuse('recording_phase_changed', 409);
+        }
+        leaseOrders.set(entry, order);
         leases.set(key, entry);
         return receipt;
     }

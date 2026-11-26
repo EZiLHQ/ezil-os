@@ -611,7 +611,14 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
     // Standalone EZiL Git clones have a child named after the repo. Keep the verified parent as the workbench folder.
     const repositoryFocus = project?.repoUrl?.startsWith('https://github.ezil.work/') && repository && repositoryFolder
         ? { name: repository, folder: repositoryFolder } : undefined;
-    const url = tagFolderMint(data.codePreviewUrl, { asked: folder_ask, answer: data.codeFolder, repositoryFocus });
+    // A verified assignment preview alone names the server's folder pair to the bridge, and only when this mint opens
+    // one of the two (`opensRepository` checked the folder; `./code-folder.js` "Managed checkout").
+    const pair = assignment && project?.repoUrl ? data.repository : null;
+    const checkout = typeof pair?.workspaceFolder === 'string' && pair.workspaceFolder.endsWith(`/projects/${pair.id}`)
+        && pair.checkoutFolder === `${pair.workspaceFolder}/${project.repoUrl.split('/').at(-1).replace(/\.git$/, '')}`
+        && [pair.workspaceFolder, pair.checkoutFolder].includes(repositoryFolder)
+        ? { workspaceFolder: pair.workspaceFolder, checkoutFolder: pair.checkoutFolder } : undefined;
+    const url = tagFolderMint(data.codePreviewUrl, { asked: folder_ask, answer: data.codeFolder, repositoryFocus, checkout });
     return { ok: true, url, expiresAt: data.expiresAt, assignmentOpen: data.assignmentOpen, ...(project ? { repository, repositoryFolder } : {}) };
 }
 
