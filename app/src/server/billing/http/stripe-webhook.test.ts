@@ -3,9 +3,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { readBillingConfig } from '../config';
 import type { BillingDeps, BillingStore, StripeApi } from '../ports';
-import { handleStripeWebhook } from './stripe-webhook';
+import { handleStripeWebhook, paidTopupIntent } from './stripe-webhook';
 
 const wiring = vi.hoisted(() => ({ getDeps: vi.fn(), process: vi.fn() }));
+// The scoped delivery itself is proven against Postgres (ai-credit-outbox.pg.test.ts); here only when the handler asks for it.
+const topupDelivery = vi.hoisted(() => ({ deliver: vi.fn<typeof import('../ai-topup-delivery').deliverPaidTopup>(async () => 'skipped') }));
+vi.mock('../ai-topup-delivery', () => ({ deliverPaidTopup: topupDelivery.deliver }));
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: wiring.getDeps }));
 vi.mock('@/server/billing/processor', () => ({ processStripeEvent: wiring.process }));
 
@@ -263,5 +266,117 @@ describe('retryable processor outcomes', () => {
         f.process.mockResolvedValue(outcome);
         expect((await handleStripeWebhook(request(), f.deps, f.process)).status).toBe(200);
         expect(f.store.markEventProcessed).toHaveBeenCalledWith(event.id, outcome);
+    });
+});
+
+describe('a paid top-up is delivered from its own verified webhook (no sweep needed)', () => {
+    const paid = (overrides: Record<string, unknown> = {}, type = 'checkout.session.completed') => ({ id: 'evt_topup', type, created: timestamp, livemode: false,
+        data: { object: { id: 'cs_fixture', mode: 'payment', payment_status: 'paid', payment_intent: 'pi_fixture', customer: 'cus_fixture', ...overrides } } });
+    const send = (f: ReturnType<typeof fixture>, value: unknown) => handleStripeWebhook(request(JSON.stringify(value)), f.deps, f.process);
+    const reset = (outcome: 'delivered' | 'queued' | 'review' | 'skipped' = 'delivered') => topupDelivery.deliver.mockReset().mockResolvedValue(outcome);
+
+    it('names the payment a verified event itself reports paid, and nothing else', () => {
+        expect(paidTopupIntent(paid())).toBe('pi_fixture');
+        expect(paidTopupIntent(paid({}, 'checkout.session.async_payment_succeeded'))).toBe('pi_fixture');
+        expect(paidTopupIntent(paid({ payment_intent: { id: 'pi_expanded', amount: 5000 } }))).toBe('pi_expanded');
+        // A completed checkout whose bank payment is still pending, or with no payment state at all, is not paid.
+        for (const payment_status of ['unpaid', 'no_payment_required', undefined, null, 'PAID']) expect(paidTopupIntent(paid({ payment_status }))).toBeNull();
+        expect(paidTopupIntent(paid({ mode: 'subscription' }))).toBeNull();
+        expect(paidTopupIntent(paid({ mode: 'setup' }))).toBeNull();
+        for (const payment_intent of [null, undefined, '', 'cs_fixture', 'pi_bad id', { id: 7 }, 42]) expect(paidTopupIntent(paid({ payment_intent }))).toBeNull();
+        for (const type of ['checkout.session.expired', 'checkout.session.async_payment_failed', 'payment_intent.succeeded', 'invoice.paid', 'charge.refunded']) {
+            expect(paidTopupIntent(paid({}, type))).toBeNull();
+        }
+    });
+
+    it.each([
+        ['delivered', 200, { received: true }],
+        // Nothing a redelivery could change: nothing deliverable, or a terminal refusal already alerted for an operator.
+        ['skipped', 200, { received: true }],
+        ['review', 200, { received: true }],
+        // Committed but not funded, and no browser may be polling: ask Stripe for this same signed event again.
+        ['queued', 503, { error: 'delivery_pending' }],
+    ] as const)('after the receipt is committed and the event marked processed, one attempt for exactly that payment: %s answers %i', async (outcome, status, body) => {
+        reset(outcome);
+        const f = fixture();
+        const order: string[] = [];
+        f.store.markEventProcessed.mockImplementation(async () => { order.push('marked'); });
+        topupDelivery.deliver.mockImplementation(async () => { order.push('delivery'); return outcome; });
+        const response = await send(f, paid());
+        expect(response.status).toBe(status);
+        expect(await response.json()).toEqual(body);
+        expect(order).toEqual(['marked', 'delivery']);
+        expect(f.store.markEventProcessed).toHaveBeenCalledTimes(1);
+        expect(f.store.markEventProcessed).toHaveBeenCalledWith('evt_topup', 'applied');
+        expect(topupDelivery.deliver).toHaveBeenCalledTimes(1);
+        // The payment only: the owner is the stored receipt's, never taken from the event.
+        expect(topupDelivery.deliver).toHaveBeenCalledWith(f.deps, { paymentIntentId: 'pi_fixture' });
+    });
+
+    it.each(['ignored', 'review:invalid_custom_amount', 'review:customer_mismatch', 'unattributed:customer', 'failed:ai_topup_receipts_unavailable'])(
+        'a first delivery the processor did not apply (%s) attempts nothing', async outcome => {
+            reset();
+            const f = fixture();
+            f.process.mockResolvedValue(outcome);
+            await send(f, paid());
+            expect(topupDelivery.deliver).not.toHaveBeenCalled();
+        });
+
+    it('an applied event that is not a paid top-up attempts nothing: unpaid checkout, subscription, invoice', async () => {
+        reset();
+        for (const value of [paid({ payment_status: 'unpaid' }), paid({ mode: 'subscription', payment_intent: null }), event]) {
+            const f = fixture();
+            expect((await send(f, value)).status).toBe(200);
+            expect(f.process).toHaveBeenCalledTimes(1);
+        }
+        expect(topupDelivery.deliver).not.toHaveBeenCalled();
+    });
+
+    it('a verified redelivery of the processed event retries only the receipt: 503 while it is pending, then a final 2xx; the charge and ledger are never rerun', async () => {
+        reset('queued');
+        const f = fixture();
+        f.store.recordEvent.mockResolvedValue('processed');
+        const pending = await send(f, paid());
+        expect(pending.status).toBe(503);
+        expect(await pending.json()).toEqual({ error: 'delivery_pending' });
+        for (const outcome of ['delivered', 'skipped', 'review'] as const) {
+            topupDelivery.deliver.mockResolvedValueOnce(outcome);
+            const done = await send(f, paid());
+            expect(done.status).toBe(200);
+            expect(await done.json()).toEqual({ received: true, duplicate: true });
+        }
+        expect(f.process).not.toHaveBeenCalled();
+        expect(f.store.markEventProcessed).not.toHaveBeenCalled();
+        expect(topupDelivery.deliver).toHaveBeenCalledTimes(4);
+        expect(topupDelivery.deliver).toHaveBeenLastCalledWith(f.deps, { paymentIntentId: 'pi_fixture' });
+    });
+
+    it('every other acknowledgement is unchanged while a top-up is pending: unpaid, subscription and invoice replays and first deliveries stay 2xx with no attempt', async () => {
+        reset('queued');
+        const f = fixture();
+        for (const value of [paid({ payment_status: 'unpaid' }), paid({ mode: 'subscription', payment_intent: null }), event]) {
+            f.store.recordEvent.mockResolvedValueOnce('new');
+            const first = await send(f, value);
+            expect([first.status, await first.json()]).toEqual([200, { received: true }]);
+            f.store.recordEvent.mockResolvedValueOnce('processed');
+            const replay = await send(f, value);
+            expect([replay.status, await replay.json()]).toEqual([200, { received: true, duplicate: true }]);
+        }
+        expect(topupDelivery.deliver).not.toHaveBeenCalled();
+    });
+
+    it('nothing unverified, mismatched or conflicting reaches delivery: bad signature, live event on test keys, payload conflict, store failure', async () => {
+        reset();
+        const f = fixture();
+        const body = JSON.stringify(paid());
+        expect((await handleStripeWebhook(request(body, `t=${timestamp},v1=${'0'.repeat(64)}`), f.deps, f.process)).status).toBe(400);
+        expect((await send(f, { ...paid(), livemode: true })).status).toBe(400);
+        f.store.recordEvent.mockResolvedValueOnce('conflict');
+        expect((await send(f, paid())).status).toBe(409);
+        f.store.recordEvent.mockRejectedValueOnce(new Error('db down'));
+        expect((await send(f, paid())).status).toBe(500);
+        f.store.markEventProcessed.mockRejectedValueOnce(new Error('db down'));
+        expect((await send(f, paid())).status).toBe(500);
+        expect(topupDelivery.deliver).not.toHaveBeenCalled();
     });
 });
