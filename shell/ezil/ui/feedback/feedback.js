@@ -555,7 +555,7 @@ export function open_feedback_dialog (_opts) {
         && typeof trusted.appSession === 'string' && trusted.appSession.length > 0;
     const computer = hasAppContext ? trusted.computerId : currentComputer()?.id;
     let computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
-    const appContext = Object.freeze({ computerId, ...(hasAppContext ? { appSession: trusted.appSession } : {}),
+    const appContext = Object.freeze({ userId: ownerAccount, computerId, ...(hasAppContext ? { appSession: trusted.appSession } : {}),
         ...(hasAppContext && typeof trusted.traceId === 'string' && UUID.test(trusted.traceId) ? { traceId: trusted.traceId } : {}) });
     const queuedEntry = draft ? read_outbox().find(entry => entry.clientRequestId === clientRequestId) : null;
     const screenshotsAvailable = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshots === true;

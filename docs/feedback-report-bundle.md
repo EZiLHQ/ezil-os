@@ -40,6 +40,13 @@ and at most 24 current/latest app-open phases. Trace ID, built-in app identity a
 phases come from the same detached snapshot, including completed app opens.
 Validated request trace IDs are preserved; reporter/computer IDs are excluded.
 
+Code also keeps up to 20 platform lifecycle markers for the last 30 minutes in
+the current tab. They distinguish visibility changes, frame navigation and
+confirmation, runtime checks, and auth recovery. A same-account reload keeps
+the recent markers for the same computer. A consented report includes their
+codes and ages in the existing event list. This list carries no prompts,
+filenames, URLs, or input events.
+
 Optional failure reason/server correlation annotations are limited to ten events.
 Their validation/consumption is adapted from main; this staging base still lacks
 upstream annotation producers, so those fields can be absent. No privileged device

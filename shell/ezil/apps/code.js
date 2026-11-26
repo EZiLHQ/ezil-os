@@ -145,6 +145,7 @@ import telemetry from '../telemetry.js';
 import { failureFields } from '../failure-diagnostics.js';
 import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
+import { watchCodeLifecycle } from './code-lifecycle.js';
 import { attachFolderBridge, createFolderNotice, detachFolderBridge, editorDocumentUrl, folderAskFor, forgetFolder, tagFolderMint } from './code-folder.js';
 import { register_app_frame } from '../ui/feedback/app-failures.js';
 import { register_billing_frame } from '../ui/Settings/billing-recovery.js';
@@ -756,6 +757,11 @@ export async function openCodeWindow (ctx = {}) {
     let gate_loading = false;
     /** The confirmed frame's reveal, held while that gate still parks the editor (`park(false)` runs it). */
     let gate_reveal = null;
+    const lifecycleOwner = session.payload()?.user?.id;
+    const lifecycle = nativeSurface ? null : watchCodeLifecycle({
+        scope: { userId: lifecycleOwner, computerId: computer.id }, iframe: el_iframe,
+        current: () => !disposed && session.payload()?.user?.id === lifecycleOwner,
+    });
     let git_access = null;
     let git_access_notice = null;
     /** The current attempt's mint loop: aborted by the next attempt and by close (hotfix r5). */
@@ -828,6 +834,7 @@ export async function openCodeWindow (ctx = {}) {
         announce_root('push', next);
     };
     const on_leaving = () => {
+        lifecycle?.record('frame_leaving');
         editor_moving = true;
         clearTimeout(route_timer); route_timer = null;
         clearTimeout(leaving_timer);
@@ -1226,6 +1233,7 @@ export async function openCodeWindow (ctx = {}) {
             desktopRunning: () => session.desktopRunning(computer.id),
             onStopped: () => show_state('stopped'),
             onUnknown: (retry) => { show_state('unknown'); return_probe_retry = retry; },
+            onAction: lifecycle?.record,
             // S13: the editor document says the computer's origin is not up (the Worker's 502 recovery page,
             // never raw JSON). A running computer gets ONE automatic reopen through the mint, whose own wake
             // clock waits for the origin truthfully; a second such document inside the guard window becomes
@@ -1234,6 +1242,7 @@ export async function openCodeWindow (ctx = {}) {
             // Terminal for this attempt: a confirmation still in flight must not hide the panel again.
             onUnreachable: () => { stop_timers(); show_unavailable(); },
         });
+        lifecycle?.record('frame_navigation');
         el_iframe.src = code_preview_url;
         // Bind at mint handoff, before confirmation, so startup failures can answer the hello too.
         // The folder bridge below binds the same frame after the server confirms it.
@@ -1281,6 +1290,7 @@ export async function openCodeWindow (ctx = {}) {
             stop_timers();
 
             if ( seen === true ) {
+                lifecycle?.record('frame_confirmed');
                 // The real ready signal concludes this open on the one surface (bar to 100), so a
                 // later start_boot (restart, switch, reboot) is a fresh open with its own clock.
                 const reveal = () => {
@@ -1405,6 +1415,7 @@ export async function openCodeWindow (ctx = {}) {
                 if ( asks >= max_asks ) { finish(undefined); return; }
                 needs_reload = false;
                 awaiting_reload = true;
+                lifecycle?.record('frame_recovery');
                 el_iframe.src = frame_url;
                 trace.step('frame_recover');
                 return;
@@ -1505,7 +1516,7 @@ export async function openCodeWindow (ctx = {}) {
     const stop_runtime_recheck = heartbeat_timer === null ? null : watchRuntimeOnReturn({
         computerId: computer.id,
         isLive: () => !! el_iframe.getAttribute('src'),
-        reboot: () => { show_state('stopped'); },
+        reboot: () => { lifecycle?.record('runtime_stopped'); show_state('stopped'); },
         desktopRunning: (id) => session.desktopRunning(id),
         retryUnknownMs: 1000,
         generation: () => `${session.payload()?.user?.id ?? ''}:${attempt}`,
@@ -1516,6 +1527,7 @@ export async function openCodeWindow (ctx = {}) {
                 if (['checking', 'unknown'].includes(el_state.dataset.state)) hide_state();
             } else if (el_state.dataset.state !== 'reconnecting') {
                 // A return check cannot retire an in-progress restart/switch cover.
+                lifecycle?.record(state === 'checking' ? 'runtime_return_check' : 'runtime_unknown');
                 show_state(state);
                 return_probe_retry = retry;
             }
@@ -1743,6 +1755,7 @@ export async function openCodeWindow (ctx = {}) {
     const dispose = (window_closed) => {
         progress.dispose();
         if (disposed) return;
+        lifecycle?.stop();
         disposed = true;
         if ( window_closed === true && assignmentGate?.detach ) assignmentGate.detach();
         else void assignmentGate?.close();
