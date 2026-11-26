@@ -23,6 +23,7 @@ for(const file of ['icons.js','bundle.min.js','bundle.min.css'])
 const universe='https://universe-staging.ezil.work', origin='https://os-staging.ezil.work', editor='https://isolated-editor.invalid';
 const storage='https://ezil-universe-staging-assignment-media-452630323510-aps1.s3.ap-south-1.amazonaws.com';
 const protocol='ezil.assignment.work/v2';
+const prepClock=process.env.EZIL_EMBED_PREP_CLOCK==='1';
 const attemptId='2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a', recordingId='01111111-2222-4333-8444-555555555555';
 const repoId='12222222-3333-4444-8555-666666666666', session='7c1a2f0e-58d4-4d0b-9b54-6f1e6f3f9a10';
 const repo='https://github.ezil.work/default/u-0482ba160482ba16-a-'+attemptId+'.git';
@@ -93,7 +94,7 @@ const parentPage='<!doctype html><html><head><title>Universe assignment</title><
 
 const browser=await chromium.launch({headless:process.env.EZIL_CHROME_HEADED!=='1',
     executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||'/usr/bin/google-chrome',args:['--disable-dev-shm-usage','--host-resolver-rules=MAP * ~NOTFOUND']});
-const events=[],errors=[],consoleLines=[],controls={};let seeded=false,os,page,released=()=>{};
+const events=[],errors=[],consoleLines=[],controls={};let seeded=false,editorClock,os,page,released=()=>{};
 const held=new Promise(r=>released=r);
 try{
     const context=await browser.newContext({viewport:{width:1200,height:780}});
@@ -125,14 +126,22 @@ try{
             const d=post();events.push(d.action);
             const now=Date.now(),same={recordingId,captureSessionId:d.captureSessionId??session};
             const startedAt=new Date(now-1000).toISOString(),deadlineAt=new Date(now+1800000).toISOString();
-            if(d.action==='preflight'){await wait(400);return json({status:'eligible',attemptId,repositoryUrl:repo,expiresAt:deadlineAt,windowStartedAt:null,deadlineAt:null});}
+            if(d.action==='preflight'){await wait(400);return json({status:'eligible',attemptId,repositoryUrl:repo,expiresAt:deadlineAt,windowStartedAt:null,deadlineAt:null,...(prepClock?{editorReadySupported:true}:{})});}
             if(d.action==='begin')return json({...same,status:'awaiting_frame',nextSequence:0,startedAt:null,deadlineAt:null,stopRequestedAt:null,revoked:false,
                 authorizationExpiresAt:new Date(now+600000).toISOString()});
             if(d.action==='prepare')return json({expiresAt:deadlineAt,headers:{'content-type':'video/webm'},
                 putUrl:storage+'/universe-staging/assignment-media/v1/o/'+attemptId+'/'+recordingId+'/segments/'+d.sequence+'/'+d.sha256+'.webm'});
             if(d.action==='confirm'){seeded=true;return json({...same,sequence:d.sequence,confirmed:true,phaseReady:true,nextSequence:d.sequence+1,
                 firstFrameAt:startedAt,startedAt:fixed.startedAt,deadlineAt:fixed.deadlineAt,serverNow:new Date(now).toISOString()});}
-            if(d.action==='status')return json({...same,status:'recording',phaseReady:seeded,workspaceUnlocked:seeded,startedAt:fixed.startedAt,deadlineAt:fixed.deadlineAt,
+            if (d.action==='editor-ready') {
+                assert.ok(prepClock && seeded);
+                assert.equal(d.repoOpenProof,proof);
+                assert.equal(d.captureSessionId,session);
+                editorClock={startedAt:new Date(now).toISOString(),serverNow:new Date(now).toISOString(),deadlineAt:new Date(now+3600000).toISOString()};
+                return json(editorClock);
+            }
+            if(d.action==='status')return json({...same,status:'recording',phaseReady:seeded,workspaceUnlocked:seeded,startedAt:fixed.startedAt,
+                deadlineAt:editorClock?fixed.acceptedMediaCutoff:fixed.deadlineAt,serverNow:new Date(now).toISOString(),
                 firstFrameAt:fixed.startedAt,stopRequestedAt:null,stopReason:null,revoked:false});
             return json({...same,status:'paused',startedAt:fixed.startedAt,deadlineAt:fixed.deadlineAt,stopRequestedAt:null,revoked:false});
         }
@@ -147,7 +156,8 @@ try{
         if(u.pathname.startsWith('/api/'))return json({ok:true,reports:[]});
         return route.fulfill({status:404,body:''});
     });
-    const fixed={startedAt:new Date(Date.now()-1000).toISOString(),deadlineAt:new Date(Date.now()+1800000).toISOString()};
+    const fixed={startedAt:new Date(Date.now()-1000).toISOString(),deadlineAt:new Date(Date.now()+1800000).toISOString(),
+        acceptedMediaCutoff:new Date(Date.now()+3800000).toISOString()};
     page=await context.newPage();page.setDefaultTimeout(25000);
     page.on('pageerror',e=>errors.push(e.message.slice(0,160)));
     page.on('console',m=>{if(m.text().startsWith('assignment.workspace.'))consoleLines.push(m.text());});
@@ -214,14 +224,18 @@ try{
     // The wire: window states unchanged, the old port `ready`, and the two additive port events around it.
     assert.deepEqual(states,['preparing','ready']);
     assert.deepEqual(port.map(m=>m.type),['capture-ready','ready','editor-usable']);
-    assert.deepEqual(port.at(-1),{protocol,attemptId,type:'editor-usable',captureSessionId:session});
+    const expectedClock=prepClock?{deadlineAt:editorClock?.deadlineAt,serverNow:editorClock?.serverNow}:{};
+    assert.deepEqual(port.at(-1),{protocol,attemptId,type:'editor-usable',captureSessionId:session,...expectedClock});
+    assert.equal(events.filter(e=>e==='editor-ready').length,prepClock?1:0);
+    assert.equal(unlocked.value.startedAt,fixed.startedAt);
+    assert.equal(unlocked.value.deadlineAt,prepClock?fixed.acceptedMediaCutoff:fixed.deadlineAt);
     assert.deepEqual(events.filter(e=>e.startsWith('mint:')),['mint:prepare','mint:open'],'one checkout and one editor open');
     assert.deepEqual(events.filter(e=>e.startsWith('desktop:')),['desktop:warm'],'one wake across share, minimise, restore, expand and the editor open');
     assert.deepEqual(controls,{windowedAtLaunch:true,head:true,minimize:1,state:'preparing',geometry:{inside:true,dock:true,clear:true},dockItem:1,expands:true,restores:true});
     assert.equal(await codeWindow.locator('.window-body').getAttribute('data-ezil-assignment-work'),'open');
     for(const line of consoleLines)assert.ok(![attemptId,session,repo,proof,boot.user.id,recordingId].some(secret=>line.includes(secret)),'a diagnostic names no identifier: '+line);
     assert.deepEqual(errors,[]);
-    console.log(JSON.stringify({result:'pass',surfaces:timeline.length,port:port.map(m=>m.type),states,controls,diagnostics:consoleLines.length}));
+    console.log(JSON.stringify({result:'pass',prepClock,surfaces:timeline.length,port:port.map(m=>m.type),states,controls,diagnostics:consoleLines.length}));
 }catch(error){
     console.error(JSON.stringify({failure:String(error?.message).slice(0,600),controls,events,errors,consoleLines,timeline:await os?.evaluate(()=>window.__seen).catch(()=>null),
         drive:await page?.evaluate(()=>({states:window.drive?.states,port:window.drive?.port})).catch(()=>null)}));
