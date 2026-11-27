@@ -13,6 +13,24 @@ vi.mock('./admission', () => ({ decideAdmission: fake.admission }));
 vi.mock('@/server/db', () => ({ db: { execute: fake.execute } }));
 afterEach(() => { vi.restoreAllMocks(); for (const mock of Object.values(fake)) mock.mockReset(); });
 const candidate = { userId: 'u', computerId: 'c', toSize: 'standard' as const };
+const dialect = new PgDialect();
+const operatorSchemaProbe = "SELECT to_regclass('public.ezil_operator_entitlements') IS NOT NULL AS present";
+// Candidate rows are not a schema probe response. Default to verified absence for the Stripe-only fixtures.
+const candidateResults = (rows: unknown, probe: unknown = [{ present: false }]) => async (query: SQL) => {
+    if (dialect.sqlToQuery(query).sql === operatorSchemaProbe) {
+        if (probe instanceof Error) throw probe;
+        return probe;
+    }
+    return rows;
+};
+const unknownOperatorSchema = [
+    { name: 'empty', result: [] },
+    { name: 'null', result: [{ present: null }] },
+    { name: 'string boolean', result: [{ present: 'false' }] },
+    { name: 'ambiguous', result: [{ present: false }, { present: true }] },
+    { name: 'malformed rows', result: { rows: null } },
+    { name: 'unavailable', result: new Error('probe offline') },
+];
 const setup = () => ({ enabled: true, startedAt: 0, now: vi.fn(() => 0),
     candidates: vi.fn(async () => [candidate]), admitted: vi.fn(async () => true),
     create: vi.fn(async () => ({ id: 'migration' })), advance: vi.fn(async () => {}) });
@@ -61,15 +79,16 @@ describe('paid Cloudflare reconciliation', () => {
     it.each([null, { status: 'past_due' }, { paymentIssue: true }, { provider: 'cloudflare' },
         { planId: 'standard_monthly_v2' }, { size: 'free-cf' }, { size: undefined }])(
         'rechecks entitlement %j before creating or fencing', async patch => {
-            fake.execute.mockResolvedValue([{ user_id: 'u', computer_id: 'c', sku: 'standard_monthly_v3' }]);
+            fake.execute.mockImplementation(candidateResults([{ user_id: 'u', computer_id: 'c', sku: 'standard_monthly_v3' }]));
             fake.entitlement.mockResolvedValue(patch === null ? null : { status: 'active', paymentIssue: false,
                 provider: 'aws', planId: 'standard_monthly_v3', size: 'std-2', ...patch });
             fake.admission.mockReturnValue({ admit: true }); fake.create.mockResolvedValue({ id: 'm' });
             await reconcilePaidCloudflareUsers(Date.now(), env);
+            expect(fake.entitlement).toHaveBeenCalledExactlyOnceWith('u');
             expect(fake.create).not.toHaveBeenCalled(); expect(fake.advance).not.toHaveBeenCalled();
         });
     it.each([false, true])('production wiring respects admission %s and advances the existing runtime', async admit => {
-        fake.execute.mockResolvedValue([{ user_id: 'u', computer_id: 'c', sku: 'premium_monthly_v3' }]);
+        fake.execute.mockImplementation(candidateResults([{ user_id: 'u', computer_id: 'c', sku: 'premium_monthly_v3' }]));
         fake.entitlement.mockResolvedValue({ source: 'billing_v2', status: 'active', provider: 'aws', planId: 'premium_monthly_v3', size: 'cmp-8' });
         fake.admission.mockReturnValue({ admit }); fake.create.mockResolvedValue({ id: 'm' });
         await reconcilePaidCloudflareUsers(Date.now(), env);
@@ -77,6 +96,16 @@ describe('paid Cloudflare reconciliation', () => {
         expect(fake.admission).toHaveBeenCalledWith(expect.objectContaining({ instanceType: 'm6i.2xlarge', userHoursExempt: true }));
         expect(fake.create).toHaveBeenCalledTimes(Number(admit)); expect(fake.advance).toHaveBeenCalledTimes(Number(admit));
         if (admit) expect(fake.create).toHaveBeenCalledWith({ userId: 'u', computerId: 'c', toSize: 'premium' });
+    });
+    it.each(unknownOperatorSchema)('unknown operator schema ($name) stops discovery before entitlement, admission or fencing', async ({ result }) => {
+        fake.execute.mockImplementation(candidateResults([{ user_id: 'u', computer_id: 'c', sku: 'standard_monthly_v3' }], result));
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        await reconcilePaidCloudflareUsers(Date.now(), env);
+        expect(fake.execute).toHaveBeenCalledTimes(1);
+        expect(dialect.sqlToQuery(fake.execute.mock.calls[0]![0]).sql).toBe(operatorSchemaProbe);
+        expect(fake.entitlement).not.toHaveBeenCalled(); expect(fake.admission).not.toHaveBeenCalled();
+        expect(fake.create).not.toHaveBeenCalled(); expect(fake.advance).not.toHaveBeenCalled();
+        expect(warn).toHaveBeenCalledExactlyOnceWith('[compute.migration.reconcile] unavailable');
     });
     it.each([{ EZIL_AWS_COMPUTERS_ENABLED: '0' }, { EZIL_AWS_KILL_SWITCH: '1' }, { AWS_MAX_RUNNING: '' }])(
         'production wrapper refuses disabled/kill/invalid config %j before touching storage', async patch => {
@@ -87,7 +116,6 @@ describe('paid Cloudflare reconciliation', () => {
 });
 
 describe('paid candidate SQL guards', () => {
-    const dialect = new PgDialect();
     it.each([
         "s.sku IN ('standard_monthly_v3', 'premium_monthly_v3')", "s.status IN ('active', 'trialing')", 's.covers', 'funding.amount > 0', 's.source_priority',
         's.current_period_start <=', 's.current_period_end >', 'c.deleted_at IS NULL',
@@ -95,12 +123,29 @@ describe('paid candidate SQL guards', () => {
         'SELECT DISTINCT ON (s.user_id)', 'm.user_id = s.user_id',
         "m.state NOT IN ('committed', 'failed_reopened', 'failed_needs_operator')", 'OR m.updated_at >=',
     ])('requires %s', async guard => {
-        const execute = vi.fn(async (_query: SQL) => []);
+        const execute = vi.fn(candidateResults([]));
         await paidCloudflareCandidates({ execute }, new Date('2026-10-20T12:00:00Z'));
         const query = execute.mock.calls.map(([q]) => dialect.sqlToQuery(q)).find(q => q.sql.includes('FROM eligible s'))!;
         expect(query.sql).toContain(guard);
         expect(query.params).toContain('2026-10-20T11:50:00.000Z');
         expect(query.params.at(-1)).toBe(10);
+    });
+    it.each([false, true])('candidate discovery honors the verified operator schema result %s', async present => {
+        for (const probe of [[{ present }], { rows: [{ present }] }]) {
+            const execute = vi.fn(candidateResults([], probe));
+            await paidCloudflareCandidates({ execute }, new Date());
+            const queries = execute.mock.calls.map(([q]) => dialect.sqlToQuery(q).sql);
+            expect(queries).toHaveLength(2);
+            expect(queries[0]).toBe(operatorSchemaProbe);
+            expect(queries[1]!.includes('public.ezil_operator_entitlements')).toBe(present);
+        }
+    });
+    it.each(unknownOperatorSchema)('unknown operator schema ($name) is not an empty candidate set', async ({ result }) => {
+        const execute = vi.fn(candidateResults([], result));
+        await expect(paidCloudflareCandidates({ execute }, new Date()))
+            .rejects.toThrow(result instanceof Error ? 'probe offline' : 'operator_schema_probe_unavailable');
+        expect(execute).toHaveBeenCalledTimes(1);
+        expect(dialect.sqlToQuery(execute.mock.calls[0]![0]).sql).toBe(operatorSchemaProbe);
     });
     it.each([0, -1, NaN, Infinity])('does not query for an invalid/empty limit %s', async limit => {
         const execute = vi.fn(async (_query: SQL) => []);
@@ -110,7 +155,7 @@ describe('paid candidate SQL guards', () => {
     it('caps requested limits and maps both paid tiers from array and rows results', async () => {
         for (const wrap of [false, true]) {
             const rows = [{ user_id: 's', computer_id: 'c1', sku: 'standard_monthly_v3' }, { user_id: 'p', computer_id: 'c2', sku: 'premium_monthly_v3' }];
-            const execute = vi.fn(async (_query: SQL) => wrap ? { rows } : rows);
+            const execute = vi.fn(candidateResults(wrap ? { rows } : rows));
             expect(await paidCloudflareCandidates({ execute }, new Date(), 20)).toEqual([
                 { userId: 's', computerId: 'c1', toSize: 'standard' }, { userId: 'p', computerId: 'c2', toSize: 'premium' }]);
             expect(execute.mock.calls.map(([q]) => dialect.sqlToQuery(q)).find(q => q.sql.includes('FROM eligible s'))!.params.at(-1)).toBe(10);

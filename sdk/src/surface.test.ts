@@ -44,8 +44,8 @@ const serverSurface = (): Set<string> => {
 
 /**
  * Server procedures this SDK deliberately does not expose, and why.
- * These are the shell's own plumbing: they exist to serve the in-browser
- * desktop, and a third-party client has no coherent use for them.
+ * These belong to the shell or to separate delegated/control contracts;
+ * they are not part of this SDK's Supabase-bearer computer/desktop API.
  */
 const KNOWN_UNCOVERED: Record<string, string> = {
     'cloudflareGuacamole.confirmFrame': 'the shell confirming its own iframe painted',
@@ -59,6 +59,8 @@ const KNOWN_UNCOVERED: Record<string, string> = {
     'cloudflareGuacamole.resetCapacityAttempt': 'the shell\'s explicit Retry of its own expired capacity attempt (RETRY-118); never an SDK action',
     'computer.switchConfiguration': 'round-3 one-computer configuration switch driven from Settings (docs/aws-computers/SWITCH-CONTRACT.md); an SDK action only once the contract is frozen',
     'computer.restartComputer': 'round-3 whole-computer restart from Troubleshoot; same contract, same deferral',
+    'computer.createNamed': 'delegated onboarding only: requireOnboardingCaller (app/src/server/api/onboarding-delegation.ts) requires a bound ezil:computers:create assertion; this SDK sends a Supabase bearer, not delegation assertions',
+    'computer.start': 'feature-gated MCP/editor control (app/src/server/computer-start/start.ts): an idempotent start receipt, polled via agentSession.control, never a desktop URL; deliberately outside this SDK until it exposes that control lifecycle, including for own-session callers',
 };
 
 describe('SDK surface vs. the real routers', () => {

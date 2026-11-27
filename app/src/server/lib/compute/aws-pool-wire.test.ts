@@ -22,6 +22,7 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 // paid standing/funding now precede `effective`. Keep fault injection on this same query.
 const isPoolDemandQuery = (query: string) => /\bAS opens,/.test(query)
     && /\bAS idle_ready,/.test(query) && /\bAS booting,/.test(query);
+const operatorSchemaProbe = "SELECT to_regclass('public.ezil_operator_entitlements') IS NOT NULL AS present";
 const unboundPoolFields = ['instance_id', 'enrolled_at', 'ready_at', 'editor_ready_at', 'session_ready_at', 'leased_computer_id', 'leased_generation',
     'lease_token', 'leased_at', 'claim_generation', 'claim_lease_epoch', 'claim_fence', 'claim_volume_serial'];
 function harness() {
@@ -31,9 +32,15 @@ function harness() {
         instance_type: c.instanceType, instance_id: null, state: 'booting', leased_computer_id: null,
         claim_generation: null, claim_lease_epoch: null, claim_fence: null, claim_volume_serial: null,
         lifecycle_job_id: null, dispatch_status: null };
-    const trace: string[] = []; const state = { subscribers: 1, vcpu: 0, migrations: 0, insert: true, save: true };
+    // This Stripe-only fixture models verified schema absence, not a missing probe response.
+    const trace: string[] = []; const state = { subscribers: 1, vcpu: 0, migrations: 0, insert: true, save: true,
+        operatorSchema: [{ present: false }] as unknown };
     const db: PlacementDb = { execute: vi.fn(async query => {
         const q = new PgDialect().sqlToQuery(query); trace.push(q.sql); const p = q.params;
+        if (q.sql === operatorSchemaProbe) {
+            if (state.operatorSchema instanceof Error) throw state.operatorSchema;
+            return state.operatorSchema;
+        }
         if (isPoolDemandQuery(q.sql)) return [{ opens: 0, standard: state.subscribers, premium: 0, spares: 0, vcpu: state.vcpu,
             boot_minutes: null, idle_ready: [], booting: [] }];
         if (q.sql.includes('SELECT count(*) AS count')) return [{ count: state.migrations }];
@@ -109,6 +116,47 @@ function harness() {
         output: JSON.stringify(receipt(w)), executionArn: lifecycleExecutionArn(f.deployment, w.intent.jobId), stateMachineVersionArn: w.stateMachineArn });
     return { f, c, db, row, state, trace, sdk, store, env, prepare, receipt, execution };
 }
+it.each([false, true])('pool demand honors the verified operator schema result %s', async present => {
+    const h = harness();
+    for (const result of [[{ present }], { rows: [{ present }] }]) {
+        h.state.operatorSchema = result;
+        h.trace.length = 0;
+        await data.readPoolDemand(h.db, h.c, NOW);
+        expect(h.trace[0]).toBe(operatorSchemaProbe);
+        expect(h.trace.find(isPoolDemandQuery)!.includes('public.ezil_operator_entitlements')).toBe(present);
+    }
+});
+const unknownOperatorSchema = [
+    { name: 'empty', result: [] },
+    { name: 'null', result: [{ present: null }] },
+    { name: 'string boolean', result: [{ present: 'false' }] },
+    { name: 'ambiguous', result: [{ present: false }, { present: true }] },
+    { name: 'malformed rows', result: { rows: null } },
+    { name: 'unavailable', result: new Error('probe offline') },
+];
+it.each(unknownOperatorSchema)('unknown operator schema ($name) cannot reserve pool capacity', async ({ result }) => {
+    const h = harness(), before = { ...h.row };
+    h.state.operatorSchema = result;
+    await expect(h.prepare()).rejects.toThrow(result instanceof Error ? 'probe offline' : 'operator_schema_probe_unavailable');
+    expect(h.trace).toContain(operatorSchemaProbe);
+    expect(h.trace.some(isPoolDemandQuery)).toBe(false);
+    expect(h.trace.some(q => /\b(?:INSERT INTO|UPDATE|DELETE FROM)\b/.test(q))).toBe(false);
+    expect(h.row).toEqual(before);
+    expect(h.sdk.starter.start).not.toHaveBeenCalled();
+});
+it.each(unknownOperatorSchema)('unknown operator schema ($name) holds an existing reservation without replay', async ({ result }) => {
+    const h = harness();
+    await h.prepare();
+    const before = { ...h.row };
+    h.state.operatorSchema = result;
+    h.trace.length = 0;
+    h.sdk.executions.describe.mockRejectedValue(new AwsClientError('aws_config', false, 'ExecutionDoesNotExist'));
+    await h.store.reconcile!();
+    expect(h.trace).toContain(operatorSchemaProbe);
+    expect(h.trace.some(isPoolDemandQuery)).toBe(false);
+    expect(h.row).toEqual(before);
+    expect(h.sdk.starter.start).not.toHaveBeenCalled();
+});
 const failedWith = (error: string, ...names: string[]) => [{ type: 'ExecutionStarted' },
     ...names.map(name => ({ type: 'TaskStateEntered', stateEnteredEventDetails: { name } })),
     { type: 'ExecutionFailed', executionFailedEventDetails: { error, cause: 'VcpuLimitExceeded' } }];
