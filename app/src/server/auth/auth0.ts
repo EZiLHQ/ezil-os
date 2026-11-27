@@ -15,7 +15,9 @@ export const AUTH0_COOKIE_OPTIONS = { httpOnly: true, secure: true, sameSite: 'l
 const TEN_MINUTES = 600_000;
 
 type ErrorCode = 'auth0_disabled' | 'invalid_transaction' | 'state_mismatch' | 'token_exchange_failed'
-    | 'invalid_id_token' | 'email_unverified' | 'account_conflict' | 'session_failed' | 'auth0_failed';
+    | 'invalid_id_token' | 'email_unverified' | 'account_conflict' | 'session_failed' | 'auth0_failed'
+    /** A silent refresh for an embedded assignment answered for another account (`assignment/work-return`). */
+    | 'assignment_account';
 
 export class Auth0Error extends Error {
     constructor(readonly code: ErrorCode) { super(code); }
@@ -59,7 +61,7 @@ export const SILENT_LOGIN_FALLBACK_ERRORS: ReadonlySet<string> = new Set(['login
  * `prompt: 'none'` is the silent re-auth that refreshes the retained ID token (`./retained-identity.ts`) after it
  * expired or a restart emptied the vault. It rides on the id.ezil.work single sign-on session and shows no UI.
  */
-export async function buildAuthorizeUrl({ origin, returnUrl, prompt }: { origin: string; returnUrl?: string | null; prompt?: 'none' }) {
+export async function buildAuthorizeUrl({ origin, returnUrl, prompt }: { origin: string; returnUrl?: string | null; prompt?: 'none' | 'login' }) {
     const { clientId } = config();
     const transaction: Transaction = {
         state: randomBytes(32).toString('base64url'),
@@ -80,7 +82,7 @@ export async function buildAuthorizeUrl({ origin, returnUrl, prompt }: { origin:
         redirect_uri: `${new URL(origin).origin}/auth/auth0/callback`,
         state: transaction.state, nonce: transaction.nonce,
         code_challenge: Buffer.from(challenge).toString('base64url'), code_challenge_method: 'S256',
-        ...(transaction.silent ? { prompt: 'none' } : {}),
+        ...(prompt ? { prompt } : {}),
     }).toString();
     return url;
 }

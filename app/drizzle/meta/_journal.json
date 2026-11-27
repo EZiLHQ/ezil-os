@@ -71,6 +71,13 @@
       "when": 1793877000000,
       "tag": "0021_standard_trial",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1795510800000,
+      "tag": "0034_assignment_migration_clock",
+      "breakpoints": true
     }
   ]
 }

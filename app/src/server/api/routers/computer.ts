@@ -213,14 +213,14 @@ export const computerRouter = createTRPCRouter({
      * NOT_FOUND, never FORBIDDEN.
      */
     systemInfo: protectedProcedure
-        .input(z.object({ computerId: z.string().uuid() }))
+        .input(z.object({ computerId: z.string().uuid(), assignmentSession: z.literal(true).optional() }))
         .query(async ({ ctx, input }) => {
             const owned = await ctx.db.query.computers.findFirst({
                 where: liveOwnedComputer(ctx.user.id, input.computerId),
                 columns: { id: true },
             });
             if (!owned) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
-            const info = await readSystemInfo(ctx.db as unknown as PlacementExecutor, { computerId: input.computerId, userId: ctx.user.id });
+            const info = await readSystemInfo(ctx.db as unknown as PlacementExecutor, { ...input, userId: ctx.user.id });
             if (!info) throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
             return info;
         }),

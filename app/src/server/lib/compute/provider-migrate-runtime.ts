@@ -19,6 +19,7 @@ import { createProviderMigrationStore, type ComputeMigration } from './provider-
 import { provisionFor } from './provider-migrate-provision';
 import { restoreFetchBase, restoreLeaseFor } from './provider-migrate';
 import { utcMonthStart } from './usage';
+import { assignmentMigrationClock } from './assignment-migration-clock';
 
 const rows = (r: unknown) => (Array.isArray(r) ? r : (r as { rows?: Record<string, unknown>[] })?.rows) as Record<string, unknown>[] ?? [];
 export async function migrationStore() {
@@ -40,6 +41,7 @@ export function createMigrationRuntime(db: PlacementDb, options: {
     const sdk = () => options.collaborators ?? sharedAwsSdkCollaborators(options.env ?? process.env);
     const deps: MigrationDeps & { store: typeof store } = {
         store,
+        assignmentClock: assignmentMigrationClock(db, options.env),
         async exclusive(id, run) {
             await db.transaction(async tx => {
                 const lock = rows(await tx.execute(sql`SELECT pg_try_advisory_xact_lock(1163554093, hashtext(${id})) AS acquired`))[0];

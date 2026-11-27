@@ -46,6 +46,8 @@ export type SystemProvider = 'cloudflare' | 'aws-ec2' | 'unassigned' | 'unknown'
 
 export interface SystemInfo {
     provider: SystemProvider;
+    /** Present only for an observed running legacy host with a compatible replacement. */
+    assignmentSession?: 'stop_then_reopen';
     /**
      * - `placement`: the recorded placement row says so.
      * - `reads_off`: placement reads are disabled; nothing recorded was read, so the provider is
@@ -221,7 +223,7 @@ export function describePlacement(placement: ResolvedPlacement): SystemInfo {
  */
 export async function readSystemInfo(
     db: PlacementExecutor,
-    computer: { computerId: string; userId: string },
+    computer: { computerId: string; userId: string; assignmentSession?: true },
     env: Env = process.env,
 ): Promise<SystemInfo | null> {
     if (!isPlacementReadEnabled(env)) {
@@ -249,6 +251,10 @@ export async function readSystemInfo(
     }
     if (placement.record && placement.record.ownerUserId !== computer.userId.toLowerCase()) return null;
     const info = describePlacement(placement);
+    if (computer.assignmentSession && placement.record?.provider === 'aws-ec2' && placement.record.state === 'RUNNING') {
+        const { assignmentHostNeedsStop } = await import('./assignment-host-recovery');
+        if (await assignmentHostNeedsStop(db, placement.record, env)) info.assignmentSession = 'stop_then_reopen';
+    }
     if (info.provider === 'cloudflare') {
         try {
             // Read only, bounded by the signed system helper's 10-second timeout.

@@ -3,11 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
 vi.mock('server-only', () => ({}));
-const stub = vi.hoisted(() => ({ set: vi.fn(), exchangeCode: vi.fn(), verifyIdToken: vi.fn(), bridge: vi.fn(), refuseSwitch: vi.fn(), retain: vi.fn(), getUser: vi.fn() }));
+const stub = vi.hoisted(() => ({ stage: vi.fn(), set: vi.fn(), exchangeCode: vi.fn(), verifyIdToken: vi.fn(), bridge: vi.fn(), refuseSwitch: vi.fn(), retain: vi.fn(), getUser: vi.fn() }));
 vi.mock('next/headers', () => ({ cookies: async () => ({ set: stub.set }) }));
 vi.mock('@/server/auth/auth0', async importOriginal => ({ ...await importOriginal<typeof import('@/server/auth/auth0')>(), exchangeCode: stub.exchangeCode, verifyIdToken: stub.verifyIdToken }));
 vi.mock('@/server/auth/bridge', () => ({ bridgeAuth0Identity: stub.bridge, refuseSilentAccountSwitch: stub.refuseSwitch }));
 vi.mock('@/server/auth/retained-identity', () => ({ retainProjectIdentity: stub.retain }));
+// Off by default, as everywhere but staging: the embedded assignment's silent child (`@/server/auth/work-auth`).
+vi.mock('@/server/git/assignment-enrollment', async original => ({
+    ...await original<typeof import('@/server/git/assignment-enrollment')>(), assignmentEnrollmentEnabled: stub.stage }));
 // The OS session, asked only on a replayed or lost transaction. None by default.
 vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: { getUser: stub.getUser } }) }));
 
@@ -211,6 +214,12 @@ describe('Auth0 callback failure keeps only a vouched-for destination (auth reco
         expect(response.headers.get('location')).not.toContain('private');
         expectCleared(response);
     });
+    it.each(['/app/assignment-enrollment?attempt=2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a',
+        '/app/code?repo=https%3A%2F%2Fgithub.ezil.work%2Fdefault%2Fu-0123456789abcdef-a-2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a.git&assignment=2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a'
+    ])('returns a verified participant to their exact original OS assignment URL %s',async path=>{
+        await transactionFor(path);
+        expect((await GET(request())).headers.get('location')).toBe(origin+path);
+    });
     it('a verified retry of the same page lands on it', async () => {
         await transactionFor('/app/browser');
         const response = await GET(request());
@@ -336,5 +345,103 @@ describe('Auth0 callback carries a promoter Billing link (?coupon=<alias>) throu
         await transactionFor(billing);
         const response = await GET(request({ returnUrl: 'https://evil.example/?coupon=midhun' }));
         expect(response.headers.get('location')).toBe(`${origin}${billing}`);
+    });
+});
+
+describe('Auth0 callback returning to an embedded assignment workspace', () => {
+    const attempt = 'ba4cf399-1f9b-43e5-be10-45e403bc0190';
+    const back = `/assignment/work-return?attempt=${attempt}&workspace=1&owner=0123456789abcdef`;
+    async function returning(returnUrl: string, prompt?: 'none') {
+        stub.set.mockClear();
+        const url = await buildAuthorizeUrl({ origin, returnUrl, ...(prompt ? { prompt } : {}) });
+        return new NextRequest(`${origin}/auth/auth0/callback?${new URLSearchParams({ state: url.searchParams.get('state')!, code: 'private-code' })}`,
+            { headers: { cookie: `${AUTH0_COOKIE}=${stub.set.mock.calls[0][1]}` } });
+    }
+    it('🔴 a silent answer for another account is refused and named as an account choice, still headed for the same return', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stub.refuseSwitch.mockRejectedValue(new Auth0Error('account_conflict'));
+        const response = await GET(await returning(back, 'none'));
+        expect(response.headers.get('location')).toBe(failed('assignment_account', back));
+        expect(stub.bridge).not.toHaveBeenCalled();
+        expect(stub.retain).not.toHaveBeenCalled();
+        expectCleared(response);
+    });
+    it('any other silent refusal, and a conflict anywhere else, keep their own code', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stub.refuseSwitch.mockRejectedValue(new Auth0Error('session_failed'));
+        expect((await GET(await returning(back, 'none'))).headers.get('location')).toBe(failed('session_failed', back));
+        stub.refuseSwitch.mockRejectedValue(new Auth0Error('account_conflict'));
+        const standalone = `/assignment/work-return?attempt=${attempt}`;
+        expect((await GET(await returning(standalone, 'none'))).headers.get('location')).toBe(failed('account_conflict', standalone));
+        // The bridge's own conflict (an email linked to another EZiL ID) is not an account choice.
+        stub.refuseSwitch.mockResolvedValue(undefined);
+        stub.bridge.mockRejectedValue(new Auth0Error('account_conflict'));
+        expect((await GET(await returning(back, 'none'))).headers.get('location')).toBe(failed('account_conflict', back));
+        expect((await GET(await returning(back))).headers.get('location')).toBe(failed('account_conflict', back));
+    });
+    it('a successful sign-in or refresh comes back to the same return, byte for byte', async () => {
+        for (const prompt of [undefined, 'none'] as const) {
+            const response = await GET(await returning(back, prompt));
+            expect(response.headers.get('location')).toBe(origin + back);
+            expect(stub.retain).toHaveBeenCalledWith('private-id-token');
+        }
+    });
+});
+
+describe('Auth0 callback inside a frame, or for the embedded assignment child, never takes the interactive path', () => {
+    // The selected deployment is staging: os-staging pairs with universe-staging (`assignment-video/authority`).
+    beforeEach(() => { vi.stubEnv('BILLING_FUNDING_URL', 'https://ai-staging.ezil.work'); vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED', '');
+        vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', 'https://universe-staging.ezil.work'); });
+    const framed = (query: Record<string, string>, cookieValue: string | null = cookie) => new NextRequest(
+        `${origin}/auth/auth0/callback?${new URLSearchParams(query)}`,
+        { headers: { 'sec-fetch-dest': 'iframe', ...(cookieValue === null ? {} : { cookie: `${AUTH0_COOKIE}=${cookieValue}` }) } });
+    async function inert(response: Awaited<ReturnType<typeof GET>>) {
+        expect(response.status).toBe(200);
+        expect(response.headers.get('location')).toBeNull();
+        const html = await response.text();
+        expect(html).toContain('data-outcome="unavailable"');
+        expect(html).not.toMatch(/\/login|authorize|private-code/);
+        // The interactive sign-in's transaction, possibly another tab's, is neither spent nor cleared.
+        expect(response.cookies.get(AUTH0_COOKIE)).toBeUndefined();
+        for (const call of [stub.exchangeCode, stub.verifyIdToken, stub.bridge, stub.retain]) expect(call).not.toHaveBeenCalled();
+    }
+    it('🔴 on the stage, a framed callback with a valid interactive transaction is the inert document: no sign-in, no lock screen', async () => {
+        stub.stage.mockReturnValue(true);
+        await inert(await GET(framed({ state, code: 'private-code' })));
+    });
+    it.each(['login_required', 'no state', 'a lost cookie'])('🔴 on the stage, a framed callback with %s is the inert document too', async name => {
+        stub.stage.mockReturnValue(true);
+        const query: Record<string, string> = name === 'login_required' ? { state, error: 'login_required' }
+            : name === 'no state' ? { code: 'private-code' } : { state, code: 'private-code' };
+        await inert(await GET(framed(query, name === 'a lost cookie' ? null : cookie)));
+    });
+    it('a marked state is never an interactive transaction, in a frame or not, on the stage or not', async () => {
+        const marked = 'ezw1.6f0c1d2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f.' + 'A'.repeat(43);
+        stub.stage.mockReturnValue(true);
+        await inert(await GET(new NextRequest(`${origin}/auth/auth0/callback?${new URLSearchParams({ state: marked, code: 'private-code' })}`, { headers: { cookie: `${AUTH0_COOKIE}=${cookie}` } })));
+        stub.stage.mockReturnValue(false);
+        const away = await GET(framed({ state: marked, code: 'private-code' }));
+        expect(away.status).toBe(404);
+        expect(away.headers.get('location')).toBeNull();
+        expect(stub.exchangeCode).not.toHaveBeenCalled();
+    });
+    it('🔴 on production a framed callback on os.ezil.work is the inert document, and no other host is that deployment', async () => {
+        vi.stubEnv('BILLING_FUNDING_URL', 'https://ai.ezil.work'); vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED', '1');
+        vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', 'https://universe.ezil.work');
+        stub.stage.mockReturnValue(true);
+        const at = (host: string) => new NextRequest(`${host}/auth/auth0/callback?${new URLSearchParams({ state, code: 'private-code' })}`,
+            { headers: { 'sec-fetch-dest': 'iframe', cookie: `${AUTH0_COOKIE}=${cookie}` } });
+        const answer = await GET(at('https://os.ezil.work'));
+        expect(answer.headers.get('content-security-policy')).toContain('frame-ancestors https://os.ezil.work https://universe.ezil.work');
+        await inert(answer);
+        // The staging host is another deployment here: its framed callback is not this flow's to answer.
+        const { isWorkAuthCallback } = await import('@/server/auth/work-auth');
+        for (const host of [origin, 'https://os-prod.ezil.work', 'https://os.ezil.org', 'https://evil.example']) expect(isWorkAuthCallback(at(host))).toBe(false);
+    });
+    it('the ordinary top-level callback is unchanged on the stage, and a framed one is unchanged away from it', async () => {
+        stub.stage.mockReturnValue(true);
+        expect((await GET(request())).headers.get('location')).toBe(`${origin}/os?computer=one`);
+        stub.stage.mockReturnValue(false);
+        expect((await GET(framed({ state, code: 'private-code' }))).headers.get('location')).toBe(`${origin}/os?computer=one`);
     });
 });
