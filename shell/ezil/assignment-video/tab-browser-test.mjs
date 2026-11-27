@@ -114,7 +114,7 @@ try {
     const page=await context.newPage(); pages.push(page); page.setDefaultTimeout(18000);
     page.on('pageerror',e=>errorDetails.push(e.message.slice(0,90)));
     await page.goto(origin+'/app/code?repo='+encodeURIComponent(repo)+'&assignment='+attemptId);
-    await page.evaluate(()=>window.ezil.boot());
+    await page.evaluate(()=>{window.ezil.boot();});
     const share=page.getByRole('button',{name:'Share this OS tab and open assignment'});
     const control=page.getByRole('group',{name:'Assignment recording'});
     const shown=state=>page.waitForFunction(s=>document.querySelector('.ezil-assignment-recording-status')?.getAttribute('data-state')===s,state);
@@ -170,7 +170,7 @@ try {
     const ordinary = await context.newPage();
     const previousCalls=events.length;
     await ordinary.goto(origin+'/app/code?repo='+encodeURIComponent('https://github.ezil.work/default/ordinary.git'));
-    await ordinary.evaluate(()=>window.ezil.boot());
+    await ordinary.evaluate(()=>{window.ezil.boot();});
     await ordinary.locator('.window[data-app="code"]').waitFor();
     await ordinary.waitForTimeout(700);
     assert.equal(await ordinary.locator('.ezil-assignment-work-gate, .ezil-assignment-recording-status').count(),0);
