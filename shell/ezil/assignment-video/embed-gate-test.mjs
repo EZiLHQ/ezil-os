@@ -949,6 +949,33 @@ test('a parent that goes silent, and the page going away, end a phase under its 
         assert.deepEqual(p.all(),['capture-ready','ready','pause','reopen']);
     }finally{await gate.close();await settle();p.close();}
 });
+test('the page going away with no Code window open sends the live capture\'s checkpoint from pagehide itself, as keepalive',async t=>{
+    const server=fakeServer(),sent=[];
+    t.mock.method(globalThis,'fetch',(path,options)=>{
+        if(!String(path).startsWith(PROD.bucket))sent.push({path,options,body:JSON.parse(options.body)});
+        return server.handler(path,options);
+    });
+    const w=embeddedWindow(),p=parentPort(),state={opened:0};
+    const gate=state.gate=embeddedGate(w,{prepare:async()=>checkout,open:editorOpener(state)});
+    try{
+        await bound(w,p);
+        await shareToEditor(p);
+        gate.detach();
+        assert.equal(gate.windowless(),true,'the Code window is closed and the capture is still live');
+        await settle(20);
+        assert.equal(server.count('checkpoint'),0);
+        const before=sent.length;
+        for(const fn of [...w.listeners.get('pagehide')])fn();
+        // Counted before any await: a closing document gets no later turn, so the request must leave inside the handler.
+        const exits=sent.slice(before).filter(r=>r.body.action==='checkpoint');
+        assert.equal(exits.length,1);
+        assert.equal(exits[0].path,'/api/shell/assignment-video');
+        assert.deepEqual(exits[0].body,{action:'checkpoint',attemptId:id,captureSessionId:session,reason:'connection_lost'});
+        assert.deepEqual([exits[0].options.method,exits[0].options.keepalive,exits[0].options.credentials],['POST',true,'same-origin']);
+        await settle(20);
+        assert.ok(p.all().includes('pause'));
+    }finally{await gate.close();await settle();p.close();}
+});
 test('a share stopped during the transport\'s own preflight sends no begin, so there is nothing to checkpoint',async t=>{
     const server=fakeServer();let release,seen,preflights=0;const sent=new Promise(r=>seen=r),held=new Promise(r=>release=r),checkpoints=[];
     t.mock.method(globalThis,'fetch',async(path,options)=>{
