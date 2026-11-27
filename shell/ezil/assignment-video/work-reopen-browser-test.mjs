@@ -105,6 +105,15 @@ async function run({signed,ending}){
     const events=[],mints=[],errors=[],consoleLines=[];let seeded=false,released=false,editorClock,pausedAt=null,revision=0,os,page,minted=0,release=()=>{};
     let reopenHeld=new Promise(r=>release=r);
     const context=await browser.newContext({viewport:{width:1200,height:780}});
+    // What the browser itself reports for the assignment-video route, beside what the route fixture answered: a keepalive
+    // request sent while the OS frame unloads may leave without reaching the fixture. Diagnostics only; nothing asserts it.
+    const reported=[];
+    const note=(kind,request)=>{try{
+        const u=new URL(request.url()),body=request.postDataJSON()||{};
+        if(u.origin===origin&&u.pathname==='/api/shell/assignment-video'&&['checkpoint','finalize'].includes(body.action))
+            reported.push({kind,action:body.action,reason:body.reason,failure:request.failure()?.errorText??null});
+    }catch{/* not a JSON request */}};
+    for(const kind of ['request','requestfailed','requestfinished'])context.on(kind,request=>note(kind,request));
     await context.addInitScript(()=>{
         window.assignmentCueLeases=0;
         window.assignmentNativeEvents={click:0,contextmenu:0};
@@ -350,7 +359,7 @@ async function run({signed,ending}){
         assert.deepEqual(errors,[]);
         return {signed,ending,mints:events.filter(e=>e.startsWith('mint:')),port:before.port,states:before.states,begin:count('begin'),editorReady:count('editor-ready'),checkpoint:count('checkpoint')};
     }catch(error){
-        console.error(JSON.stringify({failure:String(error?.message).slice(0,700),signed,ending,events,errors,consoleLines,
+        console.error(JSON.stringify({failure:String(error?.message).slice(0,700),signed,ending,events,errors,consoleLines,reported,browser:browser.version(),
             drive:await page?.evaluate(()=>({states:window.drive?.states,port:window.drive?.port})).catch(()=>null)}));
         throw error;
     }finally{release();await context.close();}
