@@ -17,6 +17,10 @@ import { isWorkAuthCallback, settleWorkAuth, startWorkAuth, WORK_AUTH_COOKIE, wo
 const os = 'https://os-staging.ezil.work', universe = 'https://universe-staging.ezil.work';
 const prodOs = 'https://os.ezil.work', prodUniverse = 'https://universe.ezil.work';
 const WORK_AUTH_SCRIPT = workAuthScript({ os, universe });
+/** The page's one inline script, read by position: the page is ours and carries exactly one. */
+const inlineScript = (html: string) => { const open = '<script>', start = html.indexOf(open), end = html.lastIndexOf('</script>');
+    expect(start).toBeGreaterThan(-1); expect(end).toBeGreaterThan(start); expect(html.indexOf(open, start + 1)).toBe(-1);
+    return html.slice(start + open.length, end); };
 const stageEnv = () => { vi.stubEnv('BILLING_FUNDING_URL', 'https://ai-staging.ezil.work'); vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED', '');
     vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', universe); };
 const productionEnv = () => { vi.stubEnv('BILLING_FUNDING_URL', 'https://ai.ezil.work'); vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED', '1');
@@ -162,7 +166,7 @@ describe('the callback answer: success', () => {
         const response = await callback({ state, code: 'private-code' }, jar);
         const policy = response.headers.get('content-security-policy')!;
         const html = await response.text();
-        const script = /<script>([\s\S]*)<\/script>/.exec(html)![1]!;
+        const script = inlineScript(html);
         expect(script).toBe(WORK_AUTH_SCRIPT);
         expect(policy).toBe(`default-src 'none'; script-src 'sha256-${createHash('sha256').update(script).digest('base64')}'; base-uri 'none'; form-action 'none'; frame-ancestors ${os} ${universe}`);
         expect(policy).not.toContain('*');
@@ -398,7 +402,7 @@ describe('production: the same flow on os.ezil.work inside universe.ezil.work, a
         const html = await inert(response);
         expect(outcomeOf(html)).toBe('signed_in');
         expect(stub.exchangeCode).toHaveBeenCalledWith('private-code', { origin: prodOs, codeVerifier: tx.codeVerifier });
-        const script = /<script>([\s\S]*)<\/script>/.exec(html)![1]!;
+        const script = inlineScript(html);
         expect(script).toBe(workAuthScript({ os: prodOs, universe: prodUniverse }));
         expect(script).not.toContain('staging');
         expect(policy).toBe(`default-src 'none'; script-src 'sha256-${createHash('sha256').update(script).digest('base64')}'; base-uri 'none'; form-action 'none'; frame-ancestors ${prodOs} ${prodUniverse}`);
