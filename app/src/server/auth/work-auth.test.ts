@@ -54,6 +54,15 @@ afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(
 function begin(path = query(), headers: Record<string, string> = frame, host = os) {
     return startWorkAuth(new Request(host + path, { headers }));
 }
+/** Extract the single canonical inline script from our generated response, for exact content/CSP assertions. */
+function inlineScript(html: string) {
+    const opening = html.split('<script>');
+    expect(opening).toHaveLength(2);
+    const closing = opening[1]!.split('</script>');
+    expect(closing).toHaveLength(2);
+    expect(closing[1]).toBe('</body></html>');
+    return closing[0]!;
+}
 /** A started transaction: its cookie pair, its state and the decoded payload. */
 function started(path = query()) {
     const response = begin(path);

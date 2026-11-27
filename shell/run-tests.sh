@@ -274,6 +274,13 @@ while IFS= read -r abs; do
     fi
 done < <(find "$HERE" \( -name node_modules -type d \) -prune -o -type f -name '*-test.mjs' -print | sort)
 
+# Assignment protocol suites use the .test.mjs spelling and are not discovered above.
+NODE_SUITES+=(
+    "shell/ezil/assignment-video/transport.test.mjs"
+    "shell/ezil/assignment-video/transport-editor-ready.test.mjs"
+    "shell/ezil/assignment-video/work-gate.test.mjs"
+)
+
 # ── per-suite time budgets ──────────────────────────────────────────────────
 # bash 3.2 has no `declare -A` (this script runs on macOS too), so a `case` on
 # the suite's basename is the associative-map substitute. Anything not listed
@@ -330,12 +337,18 @@ GEOMETRY_SUITES=(
     "shell/ezil/display-notice-browser-test.mjs"
     "shell/ezil/apps/resize-test.mjs"
     "shell/ezil/apps/code-full-view-browser-test.mjs"
+    "shell/ezil/assignment-video/status-control-browser-test.mjs"
 )
 PORTABLE_SUITES=(
     "shell/touch-focus-browser-test.mjs"
     "shell/ezil/context-menu-stack-browser-test.mjs"
     "shell/ezil/app-link-browser-test.mjs"
     "shell/ezil/browser-route-browser-test.mjs"
+    "shell/ezil/assignment-video/tab-browser-test.mjs"
+    "shell/ezil/assignment-video/wrong-tab-browser-test.mjs"
+    "shell/ezil/assignment-video/work-reopen-browser-test.mjs"
+    "shell/ezil/assignment-video/upgrade-browser-test.mjs"
+    "shell/ezil/assignment-video/work-embed-browser-test.mjs"
     "shell/ezil/apps/code-history-browser-test.mjs"
     "shell/ezil/apps/code-auth-recovery-browser-test.mjs"
     "shell/ezil/launcher-toggle-browser-test.mjs"
