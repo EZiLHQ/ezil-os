@@ -295,6 +295,14 @@ jobs:
             # strips by default and accepts the flag; .mjs suites ignore it.
             node --experimental-strip-types "$t"
           done
+      # tab-browser-test.mjs decodes the real tab capture and its reference
+      # screenshots with FFmpeg, which the runner image does not ship.
+      - name: Install FFmpeg for the assignment capture decode
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version
       # PLAYWRIGHT_REQUIRE_DIR is exported to $GITHUB_ENV by the Setup
       # Playwright step above — no env: block needed here.
       # Keep both local browser-suite families covered on Ubuntu.
