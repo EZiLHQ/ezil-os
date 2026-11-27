@@ -108,12 +108,29 @@ async function run({signed,ending}){
     // What the browser itself reports for the assignment-video route, beside what the route fixture answered: a keepalive
     // request sent while the OS frame unloads may leave without reaching the fixture. Diagnostics only; nothing asserts it.
     const reported=[];
+    // A request whose body the browser does not report is kept too (action null).
     const note=(kind,request)=>{try{
-        const u=new URL(request.url()),body=request.postDataJSON()||{};
-        if(u.origin===origin&&u.pathname==='/api/shell/assignment-video'&&['checkpoint','finalize'].includes(body.action))
-            reported.push({kind,action:body.action,reason:body.reason,failure:request.failure()?.errorText??null});
-    }catch{/* not a JSON request */}};
+        const u=new URL(request.url());
+        if(u.origin!==origin||u.pathname!=='/api/shell/assignment-video')return;
+        let action=null;try{action=request.postDataJSON()?.action??null;}catch{/* body not reported */}
+        if(action===null||['checkpoint','finalize'].includes(action))
+            reported.push({kind,action,method:request.method(),failure:request.failure()?.errorText??null});
+    }catch{/* not this route */}};
     for(const kind of ['request','requestfailed','requestfinished'])context.on(kind,request=>note(kind,request));
+    // The OS document's own record, in its origin's storage so it outlives the document: whether its pagehide fired and
+    // whether it asked fetch for a checkpoint (and with keepalive). Passes every call through unchanged; read on failure only.
+    await context.addInitScript(os=>{
+        if(location.origin!==os)return;
+        const record=entry=>{try{const all=JSON.parse(localStorage.getItem('ezil-probe')||'[]');
+            all.push({...entry,at:Date.now()});localStorage.setItem('ezil-probe',JSON.stringify(all));}catch{/* storage unavailable */}};
+        addEventListener('pagehide',event=>record({type:'pagehide',persisted:event.persisted,path:location.pathname}),true);
+        const original=window.fetch;
+        window.fetch=function(input,init){
+            try{if(typeof init?.body==='string'&&init.body.includes('"action":"checkpoint"'))record({type:'fetch-checkpoint',keepalive:init.keepalive===true});}
+            catch{/* never affects the call */}
+            return original.call(window,input,init);
+        };
+    },origin);
     await context.addInitScript(()=>{
         window.assignmentCueLeases=0;
         window.assignmentNativeEvents={click:0,contextmenu:0};
@@ -134,6 +151,8 @@ async function run({signed,ending}){
             if(u.origin===storage&&req.method()==='PUT')return route.fulfill({status:200,headers:{'Access-Control-Allow-Origin':origin},body:''});
             if(u.origin===storage)return route.fulfill({status:204,headers:{'Access-Control-Allow-Origin':origin,'Access-Control-Allow-Methods':'PUT','Access-Control-Allow-Headers':'*'},body:''});
             if(u.origin!==origin)return route.abort();
+            // A blank OS-origin page, opened only to read the diagnostics record after a failure.
+            if(u.pathname==='/probe')return html('<!doctype html><title>probe</title>');
             if(u.pathname.startsWith('/app/'))return html(shellPage);
             if(u.pathname.startsWith('/os/')){
                 const file=path.join(assets,path.basename(u.pathname));
@@ -359,7 +378,10 @@ async function run({signed,ending}){
         assert.deepEqual(errors,[]);
         return {signed,ending,mints:events.filter(e=>e.startsWith('mint:')),port:before.port,states:before.states,begin:count('begin'),editorReady:count('editor-ready'),checkpoint:count('checkpoint')};
     }catch(error){
-        console.error(JSON.stringify({failure:String(error?.message).slice(0,700),signed,ending,events,errors,consoleLines,reported,browser:browser.version(),
+        const probe=await (async()=>{const reader=await context.newPage();
+            try{await reader.goto(origin+'/probe');return JSON.parse(await reader.evaluate(()=>localStorage.getItem('ezil-probe'))||'null');}
+            finally{await reader.close();}})().catch(e=>'probe unavailable: '+String(e?.message).slice(0,160));
+        console.error(JSON.stringify({failure:String(error?.message).slice(0,700),signed,ending,events,errors,consoleLines,reported,probe,browser:browser.version(),
             drive:await page?.evaluate(()=>({states:window.drive?.states,port:window.drive?.port})).catch(()=>null)}));
         throw error;
     }finally{release();await context.close();}
