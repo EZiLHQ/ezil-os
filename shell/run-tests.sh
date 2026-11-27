@@ -344,6 +344,7 @@ PORTABLE_SUITES=(
     "shell/ezil/context-menu-stack-browser-test.mjs"
     "shell/ezil/app-link-browser-test.mjs"
     "shell/ezil/browser-route-browser-test.mjs"
+    "shell/ezil/assignment-video/tab-browser-test.mjs"
     "shell/ezil/assignment-video/wrong-tab-browser-test.mjs"
     "shell/ezil/assignment-video/work-reopen-browser-test.mjs"
     "shell/ezil/assignment-video/upgrade-browser-test.mjs"
