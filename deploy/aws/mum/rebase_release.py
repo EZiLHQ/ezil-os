@@ -838,6 +838,13 @@ HOST_AGENT_DIRECTED_EXCEPTIONS=(
         'lib/ezil_host/standalone_git_assets/pin.json':('100644 c167f33cf3cd6766898375ea6bdece74ddce7d55','100644 8236bc9b2fe01e5c5b43a3a692efe1e96e6c4b50'),
         'test/test_standalone_git.py':('100644 a406d07d8c9ddc30800bc7f001be1929bdc91beb','100644 365d1111fff10a3429d9d42e6cec25739e7cb6e0'),
     }),
+    # Source eligibility only: main's reviewed pinned host (9e9e789c) to the Worker line's synced supervisor mirror
+    # (6c36b8c8: assignment terminal settings beside the checkout, same CLI). No deployed host was observed for
+    # this map; any other actual deployed tree is still refused.
+    ('d791b9946e6b417d6cce45d7ce6d2706e536d4e5','f7cc57704a180dc4a058d57647b7d7f2df4d0f3b',{
+        'lib/ezil_host/standalone_git_assets/pin.json':('100644 8236bc9b2fe01e5c5b43a3a692efe1e96e6c4b50','100644 bb6cd39c69bcbac1eafa0d8ba1f847bbac082264'),
+        'lib/ezil_host/standalone_git_assets/supervise.py':('100644 e578c8cd0df336409b609d6c4bf9df120ba913a1','100644 4b0f02c8ca00172413cf4ac5312b1b4c2c3c34bd'),
+    }),
 )
 
 

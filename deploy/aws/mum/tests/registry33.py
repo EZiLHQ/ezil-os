@@ -388,14 +388,17 @@ class DirectedHostAbiTests(unittest.TestCase):
 
     The predecessor host trees come from host-abi-predecessors.json (exact path/mode/blob manifests), rebuilt with
     `git mktree --missing` in a private bare repository and checked against their known tree ids, so no private
-    commit history or blob payload is needed. The historical production target is pinned in the same fixture.
-    The private repository borrows this checkout's objects through alternates and writes its own fixture objects."""
+    commit history or blob payload is needed. The historical production target is pinned in the same fixture; its
+    reviewed SUCCESSOR is this checkout's actual HEAD host tree. The private repository borrows this checkout's objects
+    through alternates and writes its own fixture objects."""
     PREVIOUS = '96ff8e224443e0d684cb99e808a903235f2def11'
     DIAGNOSTICS = 'b7700d49c946157cd75c862bce867caf7fd08810'
     NATIVE_BASE = '82228b6e31dfcfedb116c3c6649ae78281b0d799'
     PRODUCTION_R156 = '907dc8767841c32dab510b222785e661b10a4e7f'
     EMPTY_REPOSITORY_PIN = '7e7bfa751e8e45d918f085a218f6ad731b08c21f'
     TARGET = 'd791b9946e6b417d6cce45d7ce6d2706e536d4e5'
+    # 6c36b8c8 Worker-line supervisor mirror: a source-only successor of TARGET; no deployed host observed for it.
+    SUCCESSOR = 'f7cc57704a180dc4a058d57647b7d7f2df4d0f3b'
     PREDECESSORS = {PREVIOUS: 'S 0c113cb4 standalone Git edge/history/resilience host',
                     DIAGNOSTICS: 'cdd39dac standalone Git diagnostics host',
                     NATIVE_BASE: '230e261f protected Native PreviewV2 Host source',
@@ -429,8 +432,22 @@ class DirectedHostAbiTests(unittest.TestCase):
                    GIT_AUTHOR_DATE='2026-11-16T00:00:00Z', GIT_COMMITTER_DATE='2026-11-16T00:00:00Z')
         return subprocess.run(['git', '-C', str(self.repo), *args], input=data, check=True, capture_output=True, env=env).stdout
 
+    def head_files(self):
+        """{path: 'mode blob'} for this checkout's actual HEAD host tree, which must be the reviewed SUCCESSOR."""
+        head = git(REPO, 'rev-parse', 'HEAD')
+        self.assertEqual(release.host_agent_tree_id(head, REPO), self.SUCCESSOR)
+        result = {}
+        for entry in self.run_git('ls-tree', '-r', '-z', self.SUCCESSOR).decode().split('\0')[:-1]:
+            meta, name = entry.split('\t', 1)
+            mode, kind, blob = meta.split(' ')
+            self.assertEqual(kind, 'blob')
+            result[name] = mode + ' ' + blob
+        return result
+
     def files(self, tree):
-        """{path: 'mode blob'} for a reviewed host tree from its pinned fixture manifest."""
+        """{path: 'mode blob'} for a reviewed host tree: its pinned fixture manifest, or HEAD for the SUCCESSOR."""
+        if tree == self.SUCCESSOR:
+            return self.head_files()
         self.assertIn(tree, self.fixture)
         return dict(self.fixture[tree])
 
@@ -467,8 +484,9 @@ class DirectedHostAbiTests(unittest.TestCase):
         for tree, files in self.fixture.items():
             with self.subTest(tree=tree):
                 self.assertEqual(self.tree(files), tree)
-        # Every directed map binds two known, rebuilt host trees.
-        self.assertEqual({tree for source, target, _ in self.maps() for tree in (source, target)}, {*self.PREDECESSORS, self.TARGET})
+        # Every directed map binds two known host trees: rebuilt from the fixture, or this checkout's HEAD successor.
+        self.assertEqual({tree for source, target, _ in self.maps() for tree in (source, target)},
+                         {*self.PREDECESSORS, self.TARGET, self.SUCCESSOR})
 
     def test_reviewed_directed_maps_are_exact_from_the_rebuilt_trees(self):
         self.assertEqual([(source, target, len(delta)) for source, target, delta in self.maps()],
@@ -482,7 +500,8 @@ class DirectedHostAbiTests(unittest.TestCase):
                           (self.DIAGNOSTICS, self.PRODUCTION_R156, 16),
                           (self.NATIVE_BASE, self.PRODUCTION_R156, 8),
                           (self.PRODUCTION_R156, self.EMPTY_REPOSITORY_PIN, 2),
-                          (self.PRODUCTION_R156, self.TARGET, 2)])
+                          (self.PRODUCTION_R156, self.TARGET, 2),
+                          (self.TARGET, self.SUCCESSOR, 2)])
         for source, target, delta in self.maps():
             old, new = self.files(source), self.files(target)
             self.assertEqual({n: (old.get(n), new.get(n)) for n in old.keys() | new.keys() if old.get(n) != new.get(n)}, delta)
@@ -561,13 +580,24 @@ class DirectedHostAbiTests(unittest.TestCase):
                    self.DIAGNOSTICS: self.commit(self.files(self.DIAGNOSTICS)),
                    self.NATIVE_BASE: self.commit(self.files(self.NATIVE_BASE)),
                    self.PRODUCTION_R156: self.commit(self.files(self.PRODUCTION_R156)),
-                   self.EMPTY_REPOSITORY_PIN: self.commit(self.files(self.EMPTY_REPOSITORY_PIN)), self.TARGET: production_target}
+                   self.EMPTY_REPOSITORY_PIN: self.commit(self.files(self.EMPTY_REPOSITORY_PIN)), self.TARGET: production_target,
+                   self.SUCCESSOR: self.commit(self.files(self.SUCCESSOR))}
         for source, target, delta in self.maps():
             baked, deployed = anchors[target], self.commit(self.files(source))
             with self.subTest(source=source, target=target):
                 self.assertEqual(release.require_host_abi(deployed, baked, self.repo), delta)
                 with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
                     release.require_host_abi(baked, deployed, self.repo)
+
+    def test_checked_in_head_is_the_successor_reached_only_from_the_pinned_target(self):
+        # HEAD is the reviewed successor, and only TARGET's exact tree reaches it; every other source is refused.
+        head = self.commit(self.head_files())
+        self.assertEqual(release.host_agent_tree_id(head, self.repo), self.SUCCESSOR)
+        self.assertEqual([(source, target) for source, target, _ in self.maps() if target == self.SUCCESSOR],
+                         [(self.TARGET, self.SUCCESSOR)])
+        for source in self.PREDECESSORS:
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+                release.require_host_abi(self.commit(self.files(source)), head, self.repo)
 
     def test_delta_only_exceptions_are_unchanged(self):
         # Historical behavior is untouched: the empty delta and both delta-only maps admit without any tree pin.
