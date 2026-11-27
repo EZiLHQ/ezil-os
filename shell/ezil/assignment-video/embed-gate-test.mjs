@@ -781,3 +781,322 @@ test('without the signed flag a workbench report is not what opens the editor: t
         assert.equal(server.count('editor-ready'),1);assert.equal(gate.locked(),false);
     }finally{await gate.close();await settle();p.close();}
 });
+
+// ── A phase ended while its signed begin is still in flight ──────────────────────────────────────────────────────────
+// The OS route holds the first capture's `begin` open until the test lets it answer, as a slow broker does. `answer`
+// Production keeps the embedded fixtures in this file: the same cases as Stage's, on the production pair. `screen` is
+// the gate's panel as the person sees it; `p.all()` is every port event, the two additive ones included.
+const screen=w=>{const panel=w.elements.findLast(e=>e.tag==='section'&&e.isConnected);return panel.hidden?'loader':panel.children[0].children[0].textContent;};
+const endShare=(p,captureSessionId=session)=>p.rpc('end',{captureSessionId,reason:'connection_lost',expectedSegments:1});
+// replaces that answer. `checkpoints` names the capture and reason of every checkpoint the route received.
+function heldBegin(server,{answer,capture=session}={}){
+    let release,seen;const sent=new Promise(r=>seen=r),held=new Promise(r=>release=r),checkpoints=[];
+    async function handler(path,options){
+        const body=String(path).startsWith(PROD.bucket)?null:JSON.parse(options.body);
+        if(body?.action==='checkpoint')checkpoints.push([body.captureSessionId,body.reason]);
+        if(body?.action!=='begin' || body.captureSessionId!==capture)return server.handler(path,options);
+        const granted=await server.handler(path,options);
+        seen();await held;
+        return answer?answer(body):granted;
+    }
+    return {handler,sent,release,checkpoints};
+}
+const successor='11111111-1111-4111-8111-111111111111';
+test('a share stopped while its signed begin is in flight is released at once, and the grant that still arrives is checkpointed once',async t=>{
+    const server=fakeServer(),hold=heldBegin(server);t.mock.method(globalThis,'fetch',hold.handler);
+    const w=embeddedWindow(),p=parentPort();
+    const gate=embeddedGate(w,{prepare:async()=>checkout});
+    try{
+        await bound(w,p);
+        const begun=p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        await hold.sent;
+        // The parent's Stop, in its own order: lock, then (it holds no grant) cancel.
+        p.post('lock',{captureSessionId:session,reason:'sharing_stopped'});
+        assert.equal((await begun).code,'recording_phase_changed','the stopped phase answers before its broker does');
+        p.post('cancel',{captureSessionId:session});await settle();
+        assert.deepEqual(hold.checkpoints,[],'nothing is checkpointed before a grant exists');
+        assert.equal(screen(w),'Sharing paused');assert.equal(gate.access(),null);
+        hold.release();await settle(20);
+        assert.deepEqual(hold.checkpoints,[[session,'connection_lost']]);
+        p.post('cancel',{captureSessionId:session});p.post('lock',{captureSessionId:session,reason:'sharing_stopped'});
+        assert.equal((await endShare(p)).code,'recording_phase_changed');await settle(20);
+        assert.deepEqual(hold.checkpoints,[[session,'connection_lost']],'once, whatever the parent repeats');
+        assert.deepEqual(server.log,['preflight','preflight',['begin',4,session,proof],'checkpoint']);
+        assert.deepEqual(p.all(),['capture-ready','ready'],'the late grant says nothing on the port');
+        assert.deepEqual(w.types(),['preparing']);
+    }finally{await gate.close();await settle();p.close();}
+});
+test('a late grant of an ended phase never reaches the phase that followed it',async t=>{
+    // The successor's own begin is answered; the old one answers afterwards, in each of the ways a broker can.
+    const answers={
+        granted:null,
+        refused:()=>Response.json({error:{code:'recording_refused'}},{status:409}),
+        identity:()=>Response.json({error:{code:'identity_refresh_required'}},{status:401}),
+    };
+    for(const [name,answer] of Object.entries(answers)){
+        const server=fakeServer(),hold=heldBegin(server,{answer});t.mock.method(globalThis,'fetch',hold.handler);
+        const w=embeddedWindow(),p=parentPort(),state={opened:0};
+        const gate=state.gate=embeddedGate(w,{prepare:async()=>checkout,open:editorOpener(state)});
+        try{
+            await bound(w,p);
+            const begun=p.rpc('begin',{captureSessionId:session,consentVersion:4});
+            await hold.sent;
+            p.post('lock',{captureSessionId:session,reason:'sharing_stopped'});
+            assert.equal((await begun).code,'recording_phase_changed',name);
+            const next=await p.rpc('begin',{captureSessionId:successor,consentVersion:4});
+            assert.deepEqual(next.value,{captureSessionId:successor,status:'awaiting_frame',nextSequence:0},name+': the released pane takes the next share');
+            hold.release();await settle(20);
+            assert.deepEqual(hold.checkpoints,name==='granted'?[[session,'connection_lost']]:[],name);
+            // The successor goes on exactly as if the old answer had never come.
+            assert.deepEqual(w.types(),['preparing'],name);assert.equal(screen(w),'loader',name);
+            assert.deepEqual(p.all(),['capture-ready','ready'],name);
+            const seed=seedPart();
+            assert.equal((await p.rpc('upload',{captureSessionId:successor,part:seed},[seed.bytes])).value.captureSessionId,successor,name);
+            assert.equal((await p.rpc('unlock',{captureSessionId:successor})).value.captureSessionId,successor,name);
+            assert.deepEqual(state.access,{attemptId:id,phase:'open',repoOpenProof:proof,captureSessionId:successor},name);
+            assert.deepEqual((await endShare(p,successor)).value,{},name);
+            assert.deepEqual(hold.checkpoints.at(-1),[successor,'connection_lost'],name);
+            assert.equal(hold.checkpoints.length,name==='granted'?2:1,name);
+        }finally{await gate.close();await settle();p.close();t.mock.restoreAll();}
+    }
+});
+test('only the ended phase\'s own verified grant is checkpointed: another capture, another status, a refusal or silence send nothing',async t=>{
+    const grant=(body,fields)=>Response.json({recordingId,captureSessionId:body.captureSessionId,status:'awaiting_frame',nextSequence:0,startedAt:null,deadlineAt:null,
+        stopRequestedAt:null,revoked:false,authorizationExpiresAt:new Date(Date.now()+600000).toISOString(),...fields});
+    const answers={
+        'another capture':body=>grant(body,{captureSessionId:successor}),
+        'already recording':body=>grant(body,{status:'recording',startedAt:new Date(Date.now()-1000).toISOString(),deadlineAt:new Date(Date.now()+600000).toISOString()}),
+        'no sequence':body=>grant(body,{nextSequence:null}),
+        'an expired authorization':body=>grant(body,{authorizationExpiresAt:new Date(Date.now()-1000).toISOString()}),
+        'a refusal':()=>Response.json({error:{code:'recording_refused'}},{status:409}),
+        'an outage':()=>Response.json({error:{code:'media_unavailable'}},{status:503}),
+        'not JSON':()=>new Response('upstream',{status:200}),
+        silence:()=>new Promise(()=>{}),
+    };
+    for(const [name,answer] of Object.entries(answers)){
+        const server=fakeServer(),hold=heldBegin(server,{answer});t.mock.method(globalThis,'fetch',hold.handler);
+        const w=embeddedWindow(),p=parentPort();
+        const gate=embeddedGate(w,{prepare:async()=>checkout});
+        try{
+            await bound(w,p);
+            const begun=p.rpc('begin',{captureSessionId:session,consentVersion:4});
+            await hold.sent;
+            p.post('cancel',{captureSessionId:session});
+            assert.equal((await begun).code,'recording_phase_changed',name);
+            hold.release();await settle(30);
+            assert.deepEqual(hold.checkpoints,[],name);
+            assert.deepEqual(server.log,['preflight','preflight',['begin',4,session,proof]],name+': one begin, never asked again');
+            assert.deepEqual(p.all(),['capture-ready','ready'],name);assert.deepEqual(w.types(),['preparing'],name);
+            assert.equal(screen(w),'Sharing paused',name);
+        }finally{await gate.close();await settle();p.close();t.mock.restoreAll();}
+    }
+});
+test('a stale identity refusal leaves the idle pane ready to take the next share',async t=>{
+    const server=fakeServer(),hold=heldBegin(server,{answer:()=>Response.json({error:{code:'identity_refresh_required'}},{status:401})});
+    t.mock.method(globalThis,'fetch',hold.handler);
+    const w=embeddedWindow(),p=parentPort();
+    const gate=embeddedGate(w,{prepare:async()=>checkout});
+    try{
+        await bound(w,p);
+        const begun=p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        await hold.sent;
+        p.post('cancel',{captureSessionId:session});
+        assert.equal((await begun).code,'recording_phase_changed');
+        assert.deepEqual(w.types(),['preparing']);
+        hold.release();await settle(20);
+        assert.deepEqual(w.types(),['preparing']);assert.equal(screen(w),'Sharing paused');
+        assert.deepEqual(hold.checkpoints,[]);
+        const next=await p.rpc('begin',{captureSessionId:successor,consentVersion:4});
+        assert.equal(next.value.captureSessionId,successor);
+        assert.deepEqual((await endShare(p,successor)).value,{});
+        assert.deepEqual(hold.checkpoints,[[successor,'connection_lost']]);
+    }finally{await gate.close();await settle();p.close();}
+});
+test('a parent that goes silent, and the page going away, end a phase under its begin and still checkpoint its late grant once',async t=>{
+    // The parent's heartbeat stops while the broker has not answered.
+    t.mock.timers.enable({apis:['setInterval','Date'],now:Date.now()});
+    let server=fakeServer(),hold=heldBegin(server);t.mock.method(globalThis,'fetch',hold.handler);
+    let w=embeddedWindow(),p=parentPort();
+    let gate=embeddedGate(w,{prepare:async()=>checkout});
+    try{
+        await bound(w,p);
+        const begun=p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        await hold.sent;
+        t.mock.timers.tick(16800);
+        assert.equal((await begun).code,'recording_phase_changed');
+        assert.deepEqual(p.all(),['capture-ready','ready','pause']);assert.deepEqual(hold.checkpoints,[]);
+        hold.release();await settle(20);
+        assert.deepEqual(hold.checkpoints,[[session,'connection_lost']]);
+        assert.deepEqual(p.all(),['capture-ready','ready','pause'],'said once, when the phase ended');
+    }finally{await gate.close();await settle();p.close();t.mock.restoreAll();t.mock.timers.reset();}
+    // The outer page goes away: the gate closes, and the grant that arrives after it is still this capture's to close.
+    server=fakeServer();hold=heldBegin(server);t.mock.method(globalThis,'fetch',hold.handler);
+    w=embeddedWindow();p=parentPort();
+    gate=embeddedGate(w,{prepare:async()=>checkout});
+    try{
+        await bound(w,p);
+        const begun=p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        await hold.sent;
+        for(const fn of [...w.listeners.get('pagehide')])fn();
+        await settle();
+        assert.equal(p.all().at(2),'pause');
+        p.post('cancel',{captureSessionId:session});
+        assert.equal((await begun).code,'recording_phase_changed');
+        await gate.close();await settle();
+        assert.deepEqual(p.all(),['capture-ready','ready','pause','reopen']);assert.deepEqual(hold.checkpoints,[]);
+        hold.release();await settle(20);
+        assert.deepEqual(hold.checkpoints,[[session,'connection_lost']]);
+        assert.deepEqual(p.all(),['capture-ready','ready','pause','reopen']);
+    }finally{await gate.close();await settle();p.close();}
+});
+test('the page going away with no Code window open sends the live capture\'s checkpoint from pagehide itself, as keepalive',async t=>{
+    const server=fakeServer(),sent=[];
+    t.mock.method(globalThis,'fetch',(path,options)=>{
+        if(!String(path).startsWith(PROD.bucket))sent.push({path,options,body:JSON.parse(options.body)});
+        return server.handler(path,options);
+    });
+    const w=embeddedWindow(),p=parentPort(),state={opened:0};
+    const gate=state.gate=embeddedGate(w,{prepare:async()=>checkout,open:editorOpener(state)});
+    try{
+        await bound(w,p);
+        await shareToEditor(p);
+        gate.detach();
+        assert.equal(gate.windowless(),true,'the Code window is closed and the capture is still live');
+        await settle(20);
+        assert.equal(server.count('checkpoint'),0);
+        const before=sent.length;
+        for(const fn of [...w.listeners.get('pagehide')])fn();
+        // Counted before any await: a closing document gets no later turn, so the request must leave inside the handler.
+        const exits=sent.slice(before).filter(r=>r.body.action==='checkpoint');
+        assert.equal(exits.length,1);
+        assert.equal(exits[0].path,'/api/shell/assignment-video');
+        assert.deepEqual(exits[0].body,{action:'checkpoint',attemptId:id,captureSessionId:session,reason:'connection_lost'});
+        assert.deepEqual([exits[0].options.method,exits[0].options.keepalive,exits[0].options.credentials],['POST',true,'same-origin']);
+        await settle(20);
+        assert.ok(p.all().includes('pause'));
+    }finally{await gate.close();await settle();p.close();}
+});
+test('a share stopped during the transport\'s own preflight sends no begin, so there is nothing to checkpoint',async t=>{
+    const server=fakeServer();let release,seen,preflights=0;const sent=new Promise(r=>seen=r),held=new Promise(r=>release=r),checkpoints=[];
+    t.mock.method(globalThis,'fetch',async(path,options)=>{
+        const body=String(path).startsWith(PROD.bucket)?null:JSON.parse(options.body);
+        if(body?.action==='checkpoint')checkpoints.push(body.captureSessionId);
+        const answer=await server.handler(path,options);
+        // The second preflight is the transport's own, inside its begin.
+        if(body?.action==='preflight' && ++preflights===2){seen();await held;}
+        return answer;
+    });
+    const w=embeddedWindow(),p=parentPort();
+    const gate=embeddedGate(w,{prepare:async()=>checkout});
+    try{
+        await bound(w,p);
+        const begun=p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        await sent;
+        p.post('lock',{captureSessionId:session,reason:'sharing_stopped'});
+        assert.equal((await begun).code,'recording_phase_changed');
+        release();await settle(20);
+        assert.deepEqual(server.log,['preflight','preflight']);assert.deepEqual(checkpoints,[]);
+        // The pane is free: the next share begins and is granted as any first one.
+        assert.equal((await p.rpc('begin',{captureSessionId:successor,consentVersion:4})).value.captureSessionId,successor);
+        assert.deepEqual((await endShare(p,successor)).value,{});assert.deepEqual(checkpoints,[successor]);
+    }finally{await gate.close();await settle();p.close();}
+});
+
+test('a parent dropping the already granted but unobserved Begin reply can re-share without waiting for the watchdog',async t=>{
+    t.mock.timers.enable({apis:['setInterval','Date'],now:Date.now()});
+    const server=fakeServer(),checkpoints=[];
+    t.mock.method(globalThis,'fetch',async (path,options)=>{
+        const body=String(path).startsWith(PROD.bucket)?null:JSON.parse(options.body);
+        if(body?.action==='checkpoint')checkpoints.push(body.captureSessionId);
+        return server.handler(path,options);
+    });
+    const w=embeddedWindow(),p=parentPort();
+    const gate=embeddedGate(w,{prepare:async()=>checkout});
+    try{
+        await bound(w,p);
+        const unobserved=await p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        assert.equal(unobserved.value.status,'awaiting_frame');
+        p.post('lock',{captureSessionId:session,reason:'sharing_stopped'});
+        p.post('cancel',{captureSessionId:session});
+        const next=await p.rpc('begin',{captureSessionId:successor,consentVersion:4});
+        assert.equal(server.log.filter(event=>['prepare','put','confirm'].includes(event)).length,0,'no media bytes were requested');
+        if(next.code==='recording_in_use'){
+            const checkpointsImmediately=checkpoints.length;
+            t.mock.timers.tick(16800);
+            await settle(20);
+            const later=await p.rpc('begin',{captureSessionId:successor,consentVersion:4});
+            assert.equal(later.value.captureSessionId,successor);
+            await endShare(p,successor);
+            assert.fail(JSON.stringify({immediateReshare:next.code,checkpointsImmediately,watchdogWindowMs:16800,
+                laterReshare:true,olderPhaseCheckpointed:checkpoints[0]===session,successorSurvived:true,bytes:0}));
+        }
+        assert.equal(next.value.captureSessionId,successor);
+        assert.deepEqual(checkpoints,[session]);
+        p.post('cancel',{captureSessionId:session});
+        await settle(20);
+        assert.deepEqual(checkpoints,[session]);
+        await endShare(p,successor);
+        assert.deepEqual(checkpoints,[session,successor]);
+    }finally{await gate.close();await settle();p.close();}
+});
+
+test('a bare cancel does not retire a phase whose first frame already committed',async t=>{
+    const server=fakeServer();t.mock.method(globalThis,'fetch',server.handler);
+    const w=embeddedWindow(),p=parentPort(),state={opened:0};
+    const gate=state.gate=embeddedGate(w,{prepare:async()=>checkout,open:editorOpener(state)});
+    try{
+        await bound(w,p);
+        const begun=await p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        assert.equal(begun.value.status,'awaiting_frame');
+        const seed=seedPart();
+        assert.equal((await p.rpc('upload',{captureSessionId:session,part:seed},[seed.bytes])).value.phaseReady,true);
+        p.post('cancel',{captureSessionId:session});
+        assert.equal((await p.rpc('unlock',{captureSessionId:session})).value.captureSessionId,session);
+        assert.equal(server.log.filter(event=>event==='checkpoint').length,0);
+        p.post('lock',{captureSessionId:session,reason:'sharing_stopped'});
+        assert.deepEqual((await endShare(p)).value,{});
+        assert.equal(server.log.filter(event=>event==='checkpoint').length,1);
+    }finally{await gate.close();await settle();p.close();}
+});
+
+test('a verified grant returned during gate close releases only the interrupted capture',async t=>{
+    const server=fakeServer(),hold=heldBegin(server);t.mock.method(globalThis,'fetch',hold.handler);
+    const w=embeddedWindow(),p=parentPort();
+    const gate=embeddedGate(w,{prepare:async()=>checkout});
+    try{
+        await bound(w,p);
+        void p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        await hold.sent;
+        const closing=gate.close();
+        await settle(50);
+        hold.release();
+        await closing;await settle(50);
+        assert.deepEqual(hold.checkpoints,[[session,'connection_lost']]);
+        assert.equal(server.log.filter(event=>['prepare','confirm','put'].includes(event)).length,0,'no recording bytes travelled');
+        const nextWindow=embeddedWindow(),nextParent=parentPort();
+        const nextGate=embeddedGate(nextWindow,{prepare:async()=>checkout});
+        try{
+            await bound(nextWindow,nextParent);
+            const reply=await nextParent.rpc('begin',{captureSessionId:successor,consentVersion:4});
+            assert.equal(reply.value.captureSessionId,successor);
+            assert.deepEqual(hold.checkpoints,[[session,'connection_lost']]);
+            assert.deepEqual((await endShare(nextParent,successor)).value,{});
+            assert.deepEqual(hold.checkpoints,[[session,'connection_lost'],[successor,'connection_lost']]);
+        }finally{await nextGate.close();await settle();nextParent.close();}
+    }finally{await gate.close();await settle();p.close();}
+});
+test('a verified grant returned during an approved pause is checkpointed without a frame',async t=>{
+    const server=fakeServer({clockStart:Date.now()-60000}),hold=heldBegin(server);t.mock.method(globalThis,'fetch',hold.handler);
+    const w=embeddedWindow(),p=parentPort();
+    const gate=embeddedGate(w,{prepare:async()=>checkout});
+    try{
+        await bound(w,p);
+        void p.rpc('begin',{captureSessionId:session,consentVersion:4});
+        await hold.sent;
+        server.pause();
+        await until(()=>p.events('pause').length>0,'the pause on the port');
+        hold.release();await settle(80);
+        assert.deepEqual(hold.checkpoints,[[session,'connection_lost']]);
+        assert.equal(server.log.filter(event=>['prepare','confirm','put'].includes(event)).length,0,'no recording bytes travelled');
+    }finally{await gate.close();await settle();p.close();}
+});

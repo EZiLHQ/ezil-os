@@ -624,10 +624,11 @@ describe('a reserved assignment repository whose computer or Universe is not rea
             manifestSha256: makeChallenge(attemptId, repositoryUrl).manifestSha256, providerId: 'fg1wtcrexaf7acl0',
             windowStartedAt: null, deadlineAt: null, expiresAt: new Date(now + 120000).toISOString() };
         const universe = { preflight: () => Response.json(enrolled) as Response, status: () => Response.json({}) as Response,
-            ready: () => new Response(null, {status: 503}) };
+            ready: () => new Response(null, {status: 503}), clock: () => new Response(null, {status: 503}) };
         s.universe = () => {
             const path = s.requests.at(-1)?.url.pathname;
-            return (path?.endsWith('/status') ? universe.status : path?.endsWith('/editor-ready') ? universe.ready : universe.preflight)();
+            return (path?.endsWith('/status') ? universe.status : path?.endsWith('/editor-ready') ? universe.ready
+                : path?.endsWith('/clock') ? universe.clock : universe.preflight)();
         };
         s.gateway = scope => { const packet = standalonePacket(scope); packet.repository.canonicalURL = repositoryUrl; return Response.json(packet); };
         s.worker = body => {
@@ -994,5 +995,207 @@ describe('a reserved assignment repository whose computer or Universe is not rea
         response = await open(enter);
         expect(response.status).toBe(409);
         expect((await response.json()).error.code).toBe('assignment_recording_required');
+    });
+
+    /** A prepared attempt with its original receipt, a mutable raw recording status and a mutable read-only work clock. */
+    async function reopenFixture() {
+        const fixture = await enrolledFixture();
+        const { open, prep, universe, enrolled, now } = fixture;
+        const { readOpen, sealOpen } = await import('@/server/assignment-video/repo-open');
+        const prepared = await open(prep);
+        expect(prepared.status).toBe(200);
+        const preparation = await prepared.json();
+        const actor = { userId: USER, issuer: 'https://id.ezil.work/', subject, sessionId: s.sessionId, expiresAt: now + 600000 };
+        const receipt = readOpen(preparation.assignmentOpen.proof, actor, attemptId, Date.now(), signingKey).eventId;
+        const iso = (offset: number) => new Date(now + offset).toISOString();
+        const state: Record<string, unknown> = { captureSessionId, recordingId, repositoryOpenReceiptId: receipt, status: 'recording',
+            revoked: false, stopRequestedAt: null, startedAt: iso(-1000), deadlineAt: iso(3400000), firstFrameAt: iso(-1000),
+            phaseReady: true, workspaceUnlocked: true };
+        const workClock: Record<string, unknown> = { serverNow: iso(0), startedAt: iso(-60000), deadlineAt: iso(3400000), revision: 1,
+            remainingMs: 3400000, pausedAt: null, pauseReason: null };
+        universe.status = () => Response.json(state);
+        universe.clock = () => Response.json(workClock);
+        // The first-open callbacks answer success: a reopen reaching either would visibly start the work clock.
+        universe.ready = () => Response.json(workClock);
+        const proofAt = (age: number, eventId = receipt, eligible: object = enrolled, sandbox = SANDBOX) =>
+            sealOpen(actor, { ...eligible, status: 'eligible' } as never, COMPUTER, sandbox, eventId, now - age, signingKey).proof;
+        const calls = (suffix: string) => s.requests.filter(request => request.url.pathname.endsWith(suffix)).length;
+        const reopen = (proof = proofAt(301_000), extra: object = {}) =>
+            fixture.open({ phase: 'reopen', attemptId, captureSessionId, repoOpenProof: proof, ...extra });
+        return { ...fixture, preparation, actor, receipt, state, workClock, iso, proofAt, calls, reopen, readOpen };
+    }
+
+    it('reopens the original checkout from a receipt aged 301 s only as phase reopen, only for the exact live capture, and never starts the clock', async () => {
+        const { open, preparation, calls, reopen, proofAt, receipt, readOpen, actor } = await reopenFixture();
+        const aged = proofAt(301_000);
+        // The sealed receipt really is past the five-minute opening window: fresh readers refuse it, the reopen reader does not.
+        expect(() => readOpen(aged, actor, attemptId, Date.now(), signingKey)).toThrow();
+        expect(readOpen(aged, actor, attemptId, Date.now(), signingKey, 'active-reopen').eventId).toBe(receipt);
+        for (const phase of ['open', 'prepare'] as const) {
+            const refused = await open({ phase, attemptId, captureSessionId, repoOpenProof: aged });
+            expect(refused.status).toBe(409);
+            expect(await refused.text()).not.toContain('preview-bootstrap');
+        }
+        expect(calls('/editor-ready')).toBe(0);
+        const statusBefore = calls('/status');
+
+        const restored = await reopen(aged);
+        expect(restored.status).toBe(200);
+        const answer = await restored.json();
+        expect(answer.repository).toEqual(preparation.repository);
+        expect(new URL(answer.codePreviewUrl).searchParams.get('folder')).toBe(preparation.repository.workspaceFolder);
+        // Raw capture status before the mint and again after the verified checkout; one read-only clock; no first-open callback.
+        expect(calls('/status') - statusBefore).toBe(2);
+        expect(calls('/clock')).toBe(1);
+        expect(calls('/editor-ready')).toBe(0);
+        expect(calls('/begin')).toBe(0);
+        // Idempotent, and a receipt still inside its first five minutes reopens as well; neither ever calls editor-ready.
+        expect((await reopen(aged)).status).toBe(200);
+        expect((await reopen(proofAt(1000))).status).toBe(200);
+        expect(calls('/editor-ready')).toBe(0);
+        expect(calls('/begin')).toBe(0);
+        expect(calls('/clock')).toBe(3);
+
+        // Strict phase: no extra keys, a missing proof or capture, and a non-uuid attempt never reach Universe or the computer.
+        for (const bad of [{ foreign: 1 }, { captureSessionId: undefined }, { repoOpenProof: undefined }, { attemptId: 'x' }, { repoOpenProof: 'A'.repeat(20) }]) {
+            s.order = [];
+            expect((await reopen(aged, bad)).status).toBe(409);
+            expect(s.order).not.toContain('codePreviewUrl');
+            expect(s.order).not.toContain('worker');
+        }
+        // A much older receipt still reopens while it is the exact live receipt (the refusals above cover any other).
+        expect((await reopen(proofAt(3_000_000))).status).toBe(200);
+    });
+
+    it('refuses a wrong, foreign, stopped or mismatched reopen before the computer is woken or anything is minted', async () => {
+        const { state, calls, reopen, proofAt, receipt, enrolled, iso } = await reopenFixture();
+        const aged = proofAt(301_000);
+        async function refusedWithoutMint(proof = aged, extra: object = {}, status = 409) {
+            s.order = [];
+            const response = await reopen(proof, extra);
+            expect(response.status).toBe(status);
+            expect(await response.text()).not.toContain('preview-bootstrap');
+            expect(s.order).not.toContain('codePreviewUrl');
+            expect(s.order).not.toContain('worker');
+        }
+        await refusedWithoutMint(aged, { captureSessionId: recordingId });
+        await refusedWithoutMint(proofAt(301_000, recordingId));
+        await refusedWithoutMint(proofAt(301_000, receipt, enrolled, 'guac-9999999999994999-8888888888884888'));
+        await refusedWithoutMint(proofAt(301_000, receipt, { ...enrolled, providerId: 'different' }));
+        await refusedWithoutMint(proofAt(301_000, receipt, { ...enrolled, manifestSha256: '0'.repeat(64) }));
+        await refusedWithoutMint('A'.repeat(80));
+        const session = s.sessionId;
+        s.sessionId = 'different-session';
+        await refusedWithoutMint();
+        s.sessionId = session;
+        for (const change of [{ revoked: true }, { stopRequestedAt: iso(-500) }, { status: 'complete' }, { status: 'paused' },
+            { phaseReady: false }, { workspaceUnlocked: false }, { firstFrameAt: null }, { deadlineAt: iso(-1) }, { startedAt: null },
+            { captureSessionId: recordingId }, { repositoryOpenReceiptId: recordingId }]) {
+            const before = { ...state };
+            Object.assign(state, change);
+            await refusedWithoutMint();
+            Object.assign(state, before);
+        }
+        // Universe not answering is the retryable unavailable, never a refusal, and still wakes and mints nothing.
+        const status = s.universe;
+        s.universe = body => { if (s.requests.at(-1)?.url.pathname.endsWith('/status')) throw new TypeError('fetch failed'); return status!(body); };
+        s.order = [];
+        const blip = await reopen(aged);
+        expect(blip.status).toBe(503);
+        expect((await blip.json()).error.code).toBe('assignment_open_unavailable');
+        expect(s.order).not.toContain('codePreviewUrl');
+        s.universe = status;
+        expect(calls('/editor-ready')).toBe(0);
+        expect(calls('/clock')).toBe(0);
+        expect((await reopen(aged)).status).toBe(200);
+    });
+
+    it('refuses a capture stopped during the checkout, and a paused, expired or unstarted work clock despite live media', async () => {
+        const { universe, state, workClock, iso, calls, reopen, proofAt } = await reopenFixture();
+        const aged = proofAt(301_000);
+        const withheld = async (status = 409, code = 'assignment_recording_required') => {
+            const response = await reopen(aged);
+            expect(response.status).toBe(status);
+            const text = await response.text();
+            expect(text).not.toContain('preview-bootstrap');
+            expect(text).toContain(code);
+        };
+        const worker = s.worker!;
+        s.worker = body => { state.revoked = true; return worker(body); };
+        await withheld();
+        state.revoked = false;
+        s.worker = worker;
+        // The media is live and unlocked in every case below: only the read-only production work clock withholds the URL.
+        const sound = { ...workClock };
+        for (const change of [{ pausedAt: iso(-1000), pauseReason: 'paused', revision: 2 }, { deadlineAt: iso(-1000), remainingMs: 0 },
+            { startedAt: null, deadlineAt: null, remainingMs: null }]) {
+            for (const key of Object.keys(workClock)) delete workClock[key];
+            Object.assign(workClock, sound, change);
+            await withheld();
+        }
+        for (const key of Object.keys(workClock)) delete workClock[key];
+        Object.assign(workClock, sound);
+        universe.clock = () => new Response(null, { status: 503 });
+        await withheld(503, 'assignment_open_unavailable');
+        universe.clock = () => new Response(null, { status: 409 });
+        await withheld();
+        universe.clock = () => Response.json(sound);
+        expect(calls('/editor-ready')).toBe(0);
+        expect(calls('/begin')).toBe(0);
+        expect((await reopen(aged)).status).toBe(200);
+    });
+
+    it('reopens an AWS assignment only on its bound workspace and current placement, through the existing continuation safeguards', async () => {
+        const { open, universe, enrolled, now, calls, reopen, proofAt, preparation: cloudflare } = await reopenFixture();
+        const { workspaceIdentity } = await import('@/server/assignment-video/repo-open');
+        expect(cloudflare.ok).toBe(true);
+        vi.stubEnv('AWS_STANDALONE_REPO_OPEN_ENABLED', '1');
+        Object.assign(s.preview, { computeProvider: 'aws-ec2', sandboxId: SANDBOX, generation: 3, leaseEpoch: 1 });
+        const workspace = workspaceIdentity(USER, COMPUTER, SANDBOX), foreign = '0'.repeat(64);
+        const started = { windowStartedAt: new Date(now - 60000).toISOString(), deadlineAt: new Date(now + 3400000).toISOString() };
+        const aws = (aws = Array<boolean>(6).fill(true)) => { s.aws = aws; return reopen(proofAt(301_000)); };
+        const refused = async (enrollment: object, code = 'assignment_aws_unverified') => {
+            universe.preflight = () => Response.json(enrollment);
+            s.order = [];
+            const response = await aws();
+            expect(response.status).toBe(409);
+            expect((await response.json()).error.code).toBe(code);
+            expect(s.order).not.toContain('worker');
+        };
+        // The AWS checks stay exactly as for a first open: an unbound, foreign or absent binding wakes and clones nothing.
+        await refused(enrolled);
+        await refused({ ...enrolled, boundWorkspaceId: null, ...started });
+        await refused({ ...enrolled, boundWorkspaceId: foreign, ...started });
+        universe.preflight = () => Response.json({ ...enrolled, boundWorkspaceId: workspace, ...started });
+        s.migration = { id: COMPUTER, state: 'provisioning', userId: USER, computerId: COMPUTER, fromProvider: 'cloudflare', toProvider: 'aws-ec2' };
+        s.order = [];
+        expect((await aws()).status).toBe(409);
+        expect(s.order).not.toContain('worker');
+        s.migration = null;
+        // The computer was replaced meanwhile: the preview no longer names the placement.
+        s.preview.sandboxId = 'guac-3333333333334333-4444444444444444';
+        s.order = [];
+        expect((await aws()).status).toBe(409);
+        expect(s.order).not.toContain('worker');
+        s.preview.sandboxId = SANDBOX;
+        s.worker = body => {
+            const { repositoryId, assignmentPreload } = JSON.parse(body);
+            const folder = '/workspace/projects/' + repositoryId;
+            return Response.json({ ok: true, status: 'fetched', folder, checkoutFolder: folder + '/' + enrolled.repositoryUrl.split('/').at(-1)!.slice(0, -4),
+                assignmentPreload: { eventId: assignmentPreload.eventId, nonce: assignmentPreload.nonce, port: 5679, status: 'acknowledged' } });
+        };
+        const restored = await aws();
+        expect(restored.status).toBe(200);
+        expect(new URL((await restored.json()).codePreviewUrl).searchParams.get('folder')).toMatch(/^\/workspace\/projects\//);
+        expect(calls('/editor-ready')).toBe(0);
+        expect(calls('/begin')).toBe(0);
+        expect(calls('/clock')).toBe(1);
+        // A proof sealed for another workspace is not this computer's, even on the right capture.
+        s.order = [];
+        const elsewhere = await reopen(proofAt(301_000, undefined, enrolled, 'guac-9999999999994999-8888888888884888'));
+        expect(elsewhere.status).toBe(409);
+        expect(s.order).not.toContain('worker');
+        expect((await open({ phase: 'open', attemptId, captureSessionId, repoOpenProof: proofAt(301_000) })).status).toBe(409);
+        expect(calls('/editor-ready')).toBe(0);
     });
 });

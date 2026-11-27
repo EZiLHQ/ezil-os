@@ -40,6 +40,11 @@
 // every hello, and hears `ezil.code.workbench` {v:1, nonce, mint, kind:'folder', path} from the editor once its
 // workbench is really mounted (`onWorkbench`). No other binding sends or hears either.
 //
+// Managed checkout (2026-11-26): a repository opened from its address has no ids, so it shares its owner's record on
+// this computer. A verified assignment preview's mint carries the server's folder pair (`tagFolderMint` `checkout`);
+// the signed preparation's binding, on a first document at one of the two, says nothing about a record that is a bare
+// `/workspace/projects/<uuid>` or one of that pair. Every other record is still said; the record is written as before.
+//
 // Why sessionStorage and not history.state: Code is single-instance per tab,
 // the folder belongs to the window rather than to a history entry,
 // Back/Forward never re-mints an open window (app-history.js), and a Code
@@ -58,6 +63,8 @@ const MAX_SEGMENTS = 64;
 const TOKEN_RE = /^[A-Za-z0-9_-]{22}$/;
 const OUTCOME_RE = /^[a-z_]{1,32}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** A bare platform project folder: the wrapper the platform makes for a repository, and nothing below it. */
+const PROJECT_WRAPPER_RE = /^\/workspace\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Server outcomes that opened something other than the asked folder (codes only; never a path). */
 const FALLBACKS = new Set(['missing', 'not_directory', 'symlink', 'outside', 'not_allowed', 'invalid', 'unverified', 'too_long', 'error']);
 /**
@@ -178,18 +185,30 @@ function token () {
     return btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-// mint id -> folder ask, outcome and optional repo presentation. Read once, by the binding of that mint.
+// mint id -> folder ask, outcome, optional repo presentation and optional managed checkout pair. Read once, by the
+// binding of that mint.
 const mints = new Map();
+
+/** A managed checkout's folder pair, or null: two plain normalised paths, the checkout a direct child of the workspace. */
+function checkoutPair (value) {
+    const workspace = value?.workspaceFolder, checkout = value?.checkoutFolder;
+    if ( typeof workspace !== 'string' || typeof checkout !== 'string' || workspace === '/'
+        || plainFolderPath(workspace) !== workspace || plainFolderPath(checkout) !== checkout ) return null;
+    const name = checkout.startsWith(`${workspace}/`) ? checkout.slice(workspace.length + 1) : '';
+    return name !== '' && ! name.includes('/') ? { workspace, checkout } : null;
+}
 
 /**
  * Tag a successful mint: the URL to put in the iframe (the minted one plus
  * `ezil_mint=<id>`), remembering what was asked and answered for it. A server
  * that answered no outcome to an ask is an older one (`unsupported_server`).
+ * `checkout`: the server's `{workspaceFolder, checkoutFolder}` of a verified assignment preview, and of no other mint.
  */
-export function tagFolderMint (url, { asked, answer, repositoryFocus } = {}) {
+export function tagFolderMint (url, { asked, answer, repositoryFocus, checkout } = {}) {
     const id = token();
     const outcome = typeof answer?.outcome === 'string' && OUTCOME_RE.test(answer.outcome) ? answer.outcome : null;
-    mints.set(id, { asked: asked?.path ?? null, outcome: asked && ! outcome ? 'unsupported_server' : outcome, repositoryFocus });
+    mints.set(id, { asked: asked?.path ?? null, outcome: asked && ! outcome ? 'unsupported_server' : outcome, repositoryFocus,
+        checkout: checkoutPair(checkout) });
     while ( mints.size > 8 ) mints.delete(mints.keys().next().value);
     try {
         const u = new URL(url);
@@ -317,6 +336,11 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFold
     // the folder its mint-driven report named, kept until that document's workbench answers or a new hello is sent.
     const asksWorkbench = workbench === true && mintId !== null;
     let armed = null;
+    // Managed checkout: a bare project wrapper or one of the server's pair left in the shared record is not a child
+    // opened by hand, once this mint's first document shows one of the pair. Anything deeper or elsewhere is said.
+    const pair = asksWorkbench ? mint.checkout ?? null : null;
+    const staleManagedRecord = (prev, path) => pair !== null && (path === pair.workspace || path === pair.checkout)
+        && (PROJECT_WRAPPER_RE.test(prev) || prev === pair.workspace || prev === pair.checkout);
     const live = () => iframe.isConnected && iframe.src === frameUrl;
     const hello = () => {
         if ( ! live() ) { detach(); return; }
@@ -398,7 +422,7 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFold
                 // r32: a project reopens at its repository folder; a child opened by hand is not reopened as the
                 // root (the repository's own config stays inert). Say so once, then follow what is on screen.
                 const prev = readFolderRecord(bind);
-                if ( prev?.kind === 'folder' && prev.path !== path ) notice?.projectChild?.(prev.path);
+                if ( prev?.kind === 'folder' && prev.path !== path && ! staleManagedRecord(prev.path, path) ) notice?.projectChild?.(prev.path);
             }
             putFolderRecord(bind, { kind: 'folder', path });
             if ( asksWorkbench && mintDriven ) armed = { nonce: d.nonce, path };

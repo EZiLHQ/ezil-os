@@ -1,4 +1,4 @@
-import {openWithAssignmentConsent, confirmAssignmentFolder, embeddedAssignmentWindow} from '../assignment-video/shell.js';
+import {openWithAssignmentConsent, confirmAssignmentFolder, embeddedAssignmentWindow, assignedProject} from '../assignment-video/shell.js';
 import { warm as warmComputer } from '../warm.js';
 import { ai_trace_collector } from '../ui/ai-traces.js';
 import { attachCodeAuthRecovery, resetOriginRecovery } from './code-auth-recovery.js';
@@ -611,7 +611,14 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
     // Standalone EZiL Git clones have a child named after the repo. Keep the verified parent as the workbench folder.
     const repositoryFocus = project?.repoUrl?.startsWith('https://github.ezil.work/') && repository && repositoryFolder
         ? { name: repository, folder: repositoryFolder } : undefined;
-    const url = tagFolderMint(data.codePreviewUrl, { asked: folder_ask, answer: data.codeFolder, repositoryFocus });
+    // A verified assignment preview alone names the server's folder pair to the bridge, and only when this mint opens
+    // one of the two (`opensRepository` checked the folder; `./code-folder.js` "Managed checkout").
+    const pair = assignment && project?.repoUrl ? data.repository : null;
+    const checkout = typeof pair?.workspaceFolder === 'string' && pair.workspaceFolder.endsWith(`/projects/${pair.id}`)
+        && pair.checkoutFolder === `${pair.workspaceFolder}/${project.repoUrl.split('/').at(-1).replace(/\.git$/, '')}`
+        && [pair.workspaceFolder, pair.checkoutFolder].includes(repositoryFolder)
+        ? { workspaceFolder: pair.workspaceFolder, checkoutFolder: pair.checkoutFolder } : undefined;
+    const url = tagFolderMint(data.codePreviewUrl, { asked: folder_ask, answer: data.codeFolder, repositoryFocus, checkout });
     return { ok: true, url, expiresAt: data.expiresAt, assignmentOpen: data.assignmentOpen, ...(project ? { repository, repositoryFolder } : {}) };
 }
 
@@ -665,6 +672,15 @@ export async function openCodeWindow (ctx = {}) {
         });
         return null;
     }
+
+    /**
+     * A launch that names no project and no folder (the dock, the launcher), in a document that still holds the
+     * assignment its Universe work page framed here because that assignment's Code window was closed: this window
+     * opens the same assigned repository again (`../assignment-video/shell.js` `assignedProject`). Every other
+     * document, and every launch that names its own project or folder, is untouched.
+     */
+    if ( ! nativeSurface && ! project && ctx.project == null && typeof ctx.folder !== 'string' && ! ctx.folderRejected )
+        project = projectOf(assignedProject({ computerId: computer.id, actor: () => session.payload()?.user?.id }));
 
     /**
      * An assignment framed by its own Universe work page (`../assignment-video/shell.js`): a working desktop inside
@@ -1718,11 +1734,18 @@ export async function openCodeWindow (ctx = {}) {
     if ( launch_view === 'full' ) full_view.enter();
     view_now = current_view();
 
-    const dispose = () => {
+    /**
+     * `window_closed` (only the window's own close, `on_before_exit`): an assignment framed by its Universe work page
+     * belongs to the document, so its gate only lets go of THIS window's hooks (`detach`) and the capture, its receipt
+     * and its clocks go on; the next Code window takes it back. Every other gate, and every other way here (the shell
+     * rebuilding), closes as before.
+     */
+    const dispose = (window_closed) => {
         progress.dispose();
         if (disposed) return;
         disposed = true;
-        void assignmentGate?.close();
+        if ( window_closed === true && assignmentGate?.detach ) assignmentGate.detach();
+        else void assignmentGate?.close();
         git_access?.dispose();
         git_access_notice?.remove(); git_access_notice = null;
         hide_state();
@@ -1765,7 +1788,7 @@ export async function openCodeWindow (ctx = {}) {
         // Closing from full view while the Browser is still full-bleed must
         // not put the taskbar over it (`full-view.js#prepare_close`).
         full_view.prepare_close();
-        dispose();
+        dispose(true);
         return true;
     };
     window.addEventListener('ezil:teardown', dispose);
@@ -1837,6 +1860,8 @@ export async function openCodeWindow (ctx = {}) {
                     ...failureFields({reason:result.reason,correlationId:result.correlationId})});
                 return result;
             },
+            // The document's own Code launch, for a gate left without a window when its share asks for the editor.
+            summon: typeof ctx.reopenCode === 'function' ? () => { ctx.reopenCode(); } : undefined,
             open:()=>{if (stillHere()) void start_boot();}});
         if (!assignmentGate) {
             el_body.classList.remove('ezil-assignment-work-locked');
