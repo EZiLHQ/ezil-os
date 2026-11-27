@@ -15,8 +15,10 @@ const storage = 'https://ezil-universe-staging-assignment-media-452630323510-aps
 const attemptId = '2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a';
 const recordingId = '01111111-2222-4333-8444-555555555555';
 const repoId = '12222222-3333-4444-8555-666666666666';
-const repo = 'https://github.ezil.work/default/u-0482ba160482ba16-a-'+attemptId+'.git';
+const repoName = 'u-0482ba160482ba16-a-'+attemptId;
+const repo = 'https://github.ezil.work/default/'+repoName+'.git';
 const folder = '/workspace/projects/'+repoId;
+const repository = {id:repoId,name:'default/qa',workspaceFolder:folder,checkoutFolder:folder+'/'+repoName};
 const proof = 'q'.repeat(70);
 const directory = fs.mkdtempSync(path.join(os.tmpdir(),'ezil-tab-fixture-'));
 const scope = 'EZiL isolated capture rehearsal';
@@ -31,8 +33,11 @@ const browser = await chromium.launch({headless:process.env.EZIL_CHROME_HEADED !
     executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || '/usr/bin/google-chrome',
     args:['--disable-dev-shm-usage','--auto-select-tab-capture-source-by-title='+scope,
         '--host-resolver-rules=MAP * ~NOTFOUND']});
-const recordings=[], events=[], pages=[], references={};
-let opened=false, received=false, finalized, errorDetails=[];
+const recordings=[], confirmed=[], events=[], pages=[], references={};
+let opened=false, received=false, finalized, checkpointed, confirmedAtCheckpoint, phase, seed, firstFrameAt, errorDetails=[];
+// The capture phase's recording state, as Universe answers it once the seed frame is confirmed.
+const recorded = () => ({recordingId,captureSessionId:phase,status:firstFrameAt?'recording':'awaiting_frame',phaseReady:!!firstFrameAt,
+    workspaceUnlocked:!!firstFrameAt,firstFrameAt,revoked:false,stopRequestedAt:null,startedAt:stage,deadlineAt:deadline,serverNow:new Date().toISOString()});
 const content = (route,body) => route.fulfill({contentType:'text/html',body});
 const shellPage = '<!doctype html><html><head><title>'+scope+'</title><link rel="stylesheet" href="/os/bundle.min.css"></head><body><div id="ezil-os-root"></div><script>window.__EZIL_BOOT__='+JSON.stringify(boot)+'</script><script src="/os/icons.js"></script><script src="/os/bundle.min.js"></script></body></html>';
 const frame = '<html><body style="margin:0;background:#4e223b;color:white;font:24px monospace"><h1>Assigned editor</h1><pre>1  const receipt = await submit();</pre><script>addEventListener("message",e=>{if(e.origin!=="'+origin+'"||e.data.type!=="ezil.code.hello")return; const u=new URL(location.href); parent.postMessage({type:"ezil.code.folder",v:1,nonce:e.data.nonce,mint:u.searchParams.get("ezil_mint"),kind:"folder",path:u.searchParams.get("folder")},e.origin);});</script></body></html>';
@@ -57,19 +62,42 @@ try {
         }
         if (u.pathname==='/api/shell/code-preview-url') {
             events.push('open-request');
-            if (post().repository?.url !== repo) return json({ok:false});
-            while(!opened) await new Promise(r=>setTimeout(r,50));
-            received=true;
-            return json({ok:true,repository:{id:repoId,name:'default/qa'},codePreviewUrl:editor+'/?folder='+folder,
-                assignmentOpen:{attemptId,proof,openedAt:new Date().toISOString(),windowStartedAt:stage,deadlineAt:deadline}});
+            const body=post();
+            if (body.repository?.url !== repo || body.assignment?.attemptId !== attemptId) return json({ok:false});
+            // The checkout receipt (`prepare`) is held: no capture may begin, and no media may leave, before it.
+            if (body.assignment.phase==='prepare') {
+                while(!opened) await new Promise(r=>setTimeout(r,50));
+                received=true;
+                return json({ok:true,repository,assignmentOpen:{attemptId,proof,openedAt:new Date().toISOString(),windowStartedAt:stage,deadlineAt:deadline}});
+            }
+            assert.equal(body.assignment.phase,'open'); assert.equal(body.assignment.captureSessionId,phase); assert.ok(firstFrameAt);
+            return json({ok:true,repository,codePreviewUrl:editor+'/?folder='+encodeURIComponent(folder)});
         }
         if (u.pathname==='/api/shell/assignment-video') {
-            const d=post(); events.push(d.action);
+            const d=post();
+            // Universe's canonical countdown: the lease-free `clock` and the verified editor's `editor-ready` (not recording events).
+            if (d.action==='clock' || d.action==='editor-ready') return json({serverNow:new Date().toISOString(),startedAt:stage,deadlineAt:deadline,
+                pausedAt:null,pauseReason:null,remainingMs:null,revision:1});
+            events.push(d.action);
             if (d.action==='preflight') return json({status:'eligible',attemptId,jobId:'1',repositoryUrl:repo,expiresAt:deadline,windowStartedAt:stage,deadlineAt:deadline});
-            if (d.action==='begin') { assert.equal(received,true); assert.equal(d.repoOpenProof,proof); return json({recordingId,status:'recording',startedAt:stage,deadlineAt:deadline}); }
-            if (d.action==='status') return json({recordingId,status:'recording',revoked:false});
+            if (d.action==='begin') {
+                assert.equal(received,true); assert.equal(d.repoOpenProof,proof);
+                phase=d.captureSessionId; seed=0;
+                return json({status:'awaiting_frame',recordingId,captureSessionId:phase,nextSequence:seed,authorizationExpiresAt:deadline,
+                    startedAt:stage,deadlineAt:deadline,serverNow:new Date().toISOString()});
+            }
+            assert.equal(d.captureSessionId,phase);
+            if (d.action==='status') return json(recorded());
             if (d.action==='prepare') return json({putUrl:storage+'/universe-staging/assignment-media/v1/'+attemptId+'/'+recordingId+'/segments/'+d.sequence+'/'+d.sha256+'.webm',headers:{},expiresAt:deadline});
-            if (d.action==='confirm') return json({recordingId,confirmed:true,sequence:d.sequence});
+            if (d.action==='confirm') {
+                confirmed.push(d.sequence);
+                if (d.sequence!==seed) return json({recordingId,confirmed:true,sequence:d.sequence});
+                firstFrameAt??=new Date().toISOString();
+                return json({...recorded(),confirmed:true,sequence:d.sequence,nextSequence:seed+1});
+            }
+            // Stop is a resumable checkpoint of this phase, sent only after its last segment is confirmed.
+            if (d.action==='checkpoint') { checkpointed=d; confirmedAtCheckpoint=confirmed.length;
+                return json({status:'paused',serverNow:new Date().toISOString(),startedAt:stage,deadlineAt:deadline,revision:1}); }
             if (d.action==='finalize') { finalized=d; return json({status:'stopped'}); }
         }
         if (u.searchParams.get('confirm')==='frame') return json({ok:true,confirmed:true,status:200});
@@ -82,15 +110,20 @@ try {
     page.on('pageerror',e=>errorDetails.push(e.message.slice(0,90)));
     await page.goto(origin+'/app/code?repo='+encodeURIComponent(repo)+'&assignment='+attemptId);
     await page.evaluate(()=>window.ezil.boot());
-    const share=page.getByRole('button',{name:'Share this EZiL OS tab and open assignment'});
+    const share=page.getByRole('button',{name:'Share this OS tab and open assignment'});
+    const control=page.getByRole('group',{name:'Assignment recording'});
+    const shown=state=>page.waitForFunction(s=>document.querySelector('.ezil-assignment-recording-status')?.getAttribute('data-state')===s,state);
     await share.waitFor(); await page.evaluate(title=>document.title=title,scope);
     assert.equal(events.includes('open-request'),false);
     await share.click();
-    await page.getByText('Tab sharing is on.',{exact:false}).waitFor();
+    // This tab is shared and the checkout receipt is still held.
+    await shown('sharing'); await page.getByText('Preparing assignment').waitFor();
     await page.waitForTimeout(1200);
     assert.equal(events.includes('begin'),false); assert.equal(recordings.length,0);
     opened=true;
-    await page.getByText('Recording this EZiL OS tab',{exact:false}).waitFor();
+    await shown('recording');
+    assert.equal(await control.locator('.ezil-assignment-recording-dot').count(),1);
+    await page.frameLocator('.window[data-app="code"] iframe').getByText('Assigned editor').waitFor();
     const take=async name=>{
         await page.waitForTimeout(1900);
         const file=path.join(directory,name+'.png'); await page.screenshot({path:file});
@@ -107,9 +140,12 @@ try {
     await page.evaluate(async()=>{const p=window.__EZIL_BOOT__; await window.ezil.registry.launch('settings',{payload:p,computer:p.computer,desktopState:p.desktopState});});
     await page.locator('.window[data-app="settings"]').waitFor();
     await take('Settings');
-    await page.getByRole('button',{name:'Stop sharing'}).click();
-    await page.waitForFunction(()=>document.querySelector('.ezil-assignment-video-panel')?.textContent.includes('Assignment recording stopped.'));
-    assert.equal(finalized.reason,'stopped'); assert.equal(finalized.expectedSegments,recordings.length);
+    await control.getByRole('button',{name:'Stop sharing this assignment tab'}).click();
+    await shown('stopped');
+    // Accepted footage, saved before the checkpoint: the gate offers to resume.
+    await page.waitForFunction(()=>document.querySelector('.ezil-assignment-work-gate')?.textContent.includes('Sharing stopped. Share this OS tab again to resume.'));
+    assert.equal(checkpointed.reason,'sharing_stopped'); assert.equal(finalized,undefined);
+    assert.equal(confirmedAtCheckpoint,recordings.length); assert.deepEqual([...confirmed].sort((a,b)=>a-b),recordings.map((_,i)=>i));
     const frames=[];
     for(const [i,bytes] of recordings.entries()){
         const file=path.join(directory,'segment-'+i+'.webm'); fs.writeFileSync(file,bytes);
@@ -132,7 +168,7 @@ try {
     await ordinary.evaluate(()=>window.ezil.boot());
     await ordinary.locator('.window[data-app="code"]').waitFor();
     await ordinary.waitForTimeout(700);
-    assert.equal(await ordinary.locator('.ezil-assignment-video-panel').count(),0);
+    assert.equal(await ordinary.locator('.ezil-assignment-work-gate, .ezil-assignment-recording-status').count(),0);
     assert.ok(events.slice(previousCalls).includes('open-request'));
     assert.ok(!events.slice(previousCalls).some(action=>['preflight','begin','prepare'].includes(action)));
     console.log(JSON.stringify({result:'pass',ordinaryRepoMediaCalls:0,preReceiptBytes:0,frames:frames.length,segments:recordings.length,scores,
@@ -140,6 +176,6 @@ try {
         real:['top-level OS shell bundle','Code minimize','Browser and Settings windows','browser tab capture and capture handle','silent VP8 encode and FFmpeg decode']}));
 } catch (e) {
     console.error('stage events',events,'page errors',errorDetails);
-    for(const p of pages) console.error('UI',await p.locator('.ezil-assignment-video-panel').allTextContents(), 'windows',await p.locator('.window').evaluateAll(ws=>ws.map(w=>w.dataset.app)));
+    for(const p of pages) console.error('UI',await p.locator('.ezil-assignment-work-gate, .ezil-assignment-recording-status').allTextContents(), 'windows',await p.locator('.window').evaluateAll(ws=>ws.map(w=>w.dataset.app)));
     throw e;
 } finally { await browser.close(); fs.rmSync(directory,{recursive:true,force:true}); }
