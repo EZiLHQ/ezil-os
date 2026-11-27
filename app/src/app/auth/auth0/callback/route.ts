@@ -6,6 +6,8 @@ import {
 } from '@/server/auth/auth0';
 import { bridgeAuth0Identity, refuseSilentAccountSwitch } from '@/server/auth/bridge';
 import { retainProjectIdentity } from '@/server/auth/retained-identity';
+import { isWorkAuthCallback, settleWorkAuth } from '@/server/auth/work-auth';
+import { embeddedWorkReturn, workAccountNotice } from '@/utils/assignment-work-auth';
 import { Routes, safeReturnUrl } from '@/utils/constants';
 import { ownedPublicOrigin } from '@/utils/forwarded';
 import { createClient } from '@/utils/supabase/server';
@@ -20,7 +22,13 @@ async function hasOsSession(): Promise<boolean> {
     }
 }
 
-export async function GET(request: NextRequest) {
+export async function GET(request: NextRequest): Promise<NextResponse> {
+    // The hidden child of an embedded assignment frame: its own transaction and an inert answer. It never reaches the
+    // redirects below, so no sign-in page, here or at id.ezil.work, can open inside a frame through this callback.
+    if (isWorkAuthCallback(request)) {
+        const answer = await settleWorkAuth(request);
+        return new NextResponse(answer.body, { status: answer.status, headers: answer.headers });
+    }
     let destination: string;
     // Set only once the signed transaction has been read: a failure after that (cancelled, unverified email, conflict)
     // goes back to the sign-in page still headed for the same page; a failure before it keeps nothing, because then
@@ -44,7 +52,14 @@ export async function GET(request: NextRequest) {
             const identity = await verifyIdToken(token, { nonce: transaction.nonce });
             // A silent sign-in refreshes the signed-in person's EZiL ID; it never switches the OS account. Before the
             // bridge, which replaces the session.
-            if (transaction.silent) await refuseSilentAccountSwitch(identity);
+            if (transaction.silent) {
+                // Returning to an embedded assignment, the other account is the person's to choose, explicitly: the lock
+                // screen says which EZiL ID is needed. Still refused here, so the OS session is exactly as it was.
+                try { await refuseSilentAccountSwitch(identity); } catch (error) {
+                    throw error instanceof Auth0Error && error.code === 'account_conflict' && embeddedWorkReturn(returnUrl)
+                        ? new Auth0Error(workAccountNotice) : error;
+                }
+            }
             await bridgeAuth0Identity(identity);
             // After the bridge, so the token is bound to the session it just minted. Additive: a failure here never
             // fails the OS sign-in; opening a project then asks for a refresh (IDENTITY_REFRESH_REQUIRED).

@@ -7,6 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+vi.mock('server-only',() => ({}));
 const state = vi.hoisted(() => ({ signedIn: true, seen: [] as unknown[], answer: { ok: true } as unknown }));
 const userId = '11111111-1111-4111-8111-111111111111';
 const computerId = '22222222-2222-4222-8222-222222222222';

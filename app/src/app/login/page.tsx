@@ -4,6 +4,7 @@ import { cookies } from 'next/headers';
 
 import { auth0Enabled } from '@/server/auth/auth0';
 import { readBillingConfig } from '@/server/billing/config';
+import { embeddedWorkReturn, workAccountNotice } from '@/utils/assignment-work-auth';
 import { RETURN_URL_PARAM, Routes, safeReturnUrl } from '@/utils/constants';
 import { LockClock } from './lock-clock';
 import { decodeLoginReturn, LOGIN_RETURN_COOKIE } from './return-cookie';
@@ -32,6 +33,7 @@ function noticeFor(error: string | string[] | undefined): string | null {
     }
     if (error === 'account_conflict') return 'This email is already linked to a different EZiL ID. Contact contact@ezil.work.';
     if (error === 'auth0_disabled') return UNAVAILABLE;
+    if (error === workAccountNotice) return 'This assignment needs the EZiL ID you use on Universe. Sign in with that account to continue.';
     return 'We could not sign you in. Please try again.';
 }
 
@@ -86,6 +88,9 @@ export default async function LoginPage({
     const returnUrl = safeReturnUrl(params[RETURN_URL_PARAM] ?? await keptReturnUrl());
     const useAuth0 = auth0Enabled();
     const notice = useAuth0 ? noticeFor(params.error) : UNAVAILABLE;
+    // The wrong account for an embedded assignment: Continue asks id.ezil.work for the account instead of reusing the
+    // one it already holds. `/auth/auth0/login` honours this only for that same return.
+    const chooseAccount = params.error === workAccountNotice && embeddedWorkReturn(returnUrl) !== null;
 
     return (
         <main className="ezil-lock">
@@ -123,7 +128,7 @@ export default async function LoginPage({
                 {/* A plain link: the route handler's 302s are document loads. */}
                 {useAuth0 && (
                     <div className="ezil-lock-auth">
-                        <a className="ezil-lock-google" href={`/auth/auth0/login?${new URLSearchParams({ returnUrl })}`}>
+                        <a className="ezil-lock-google" href={`/auth/auth0/login?${new URLSearchParams({ ...(chooseAccount ? { prompt: 'login' } : {}), returnUrl })}`}>
                             Continue with EZiL ID
                         </a>
                     </div>

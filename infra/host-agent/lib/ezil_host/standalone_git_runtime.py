@@ -55,6 +55,16 @@ def runtime_command():
     return pin, ["/usr/bin/python3", "-I", "-c", loader, json.dumps(pin), supervisor]
 
 
+def acknowledge_assignment(cfg, checkout, witness, timeout):
+    source = base64.b64encode((ASSETS / "assignment-preload.py").read_bytes()).decode()
+    loader = ("import base64,sys;sys.argv.append(sys.stdin.buffer.read(4096).decode('utf-8'));"
+              "exec(compile(base64.b64decode(" + repr(source) + "),'assignment-preload.py','exec'))")
+    result = desktop.exec_(cfg, ["/usr/bin/python3", "-I", "-c", loader, checkout],
+                           input=json.dumps(witness, separators=(",", ":")).encode(), stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=timeout)
+    return result.returncode == 0 and result.stdout == b"ezil-assignment-preload:ack\n"
+
+
 def execute(cfg, lease, req, ready=host_ready, clock=time.monotonic, wall=time.time):
     """One monotonic budget covers public bootstrap, private open and kill grace."""
     end = clock() + req["timeoutMs"] / 1000
@@ -90,6 +100,20 @@ def execute(cfg, lease, req, ready=host_ready, clock=time.monotonic, wall=time.t
     if result.returncode == 0:
         answer = validate_output(result.stdout, req)
         if answer is not None:
+            witness = req.get("assignmentPreload")
+            if witness:
+                # Separate process, after the grant-bearing operation exits. It receives only the protected witness.
+                try:
+                    remaining = min(2, end - clock())
+                    if remaining <= 0 or not ready(cfg, lease):
+                        return failure("repo_open_failed", "runtime_not_running"), False
+                    if (not acknowledge_assignment(cfg, answer["checkoutFolder"], witness, remaining)
+                            or not ready(cfg, lease) or end <= clock()):
+                        return failure("repo_open_failed", "invalid_result"), False
+                except (OSError, subprocess.SubprocessError):
+                    return failure("repo_open_failed", "invalid_result"), False
+                answer["assignmentPreload"] = {"eventId": witness["eventId"], "nonce": witness["nonce"],
+                                               "port": 5679, "status": "acknowledged"}
             return answer, False
         # Reviewed supervisor preflight/migration refusals start no outstanding Git writer.
         reasons = {
