@@ -38,6 +38,9 @@ let opened=false, received=false, finalized, checkpointed, confirmedAtCheckpoint
 // The capture phase's recording state, as Universe answers it once the seed frame is confirmed.
 const recorded = () => ({recordingId,captureSessionId:phase,status:firstFrameAt?'recording':'awaiting_frame',phaseReady:!!firstFrameAt,
     workspaceUnlocked:!!firstFrameAt,firstFrameAt,revoked:false,stopRequestedAt:null,startedAt:stage,deadlineAt:deadline,serverNow:new Date().toISOString()});
+// The broker's complete `clockState`: an unpaused window, its remaining time read at the same `serverNow`.
+const clockState = (now=Date.now()) => ({serverNow:new Date(now).toISOString(),startedAt:stage,deadlineAt:deadline,pausedAt:null,pauseReason:null,
+    remainingMs:Math.max(0,Math.min(3600000,Date.parse(deadline)-now)),revision:1});
 const content = (route,body) => route.fulfill({contentType:'text/html',body});
 const shellPage = '<!doctype html><html><head><title>'+scope+'</title><link rel="stylesheet" href="/os/bundle.min.css"></head><body><div id="ezil-os-root"></div><script>window.__EZIL_BOOT__='+JSON.stringify(boot)+'</script><script src="/os/icons.js"></script><script src="/os/bundle.min.js"></script></body></html>';
 const frame = '<html><body style="margin:0;background:#4e223b;color:white;font:24px monospace"><h1>Assigned editor</h1><pre>1  const receipt = await submit();</pre><script>addEventListener("message",e=>{if(e.origin!=="'+origin+'"||e.data.type!=="ezil.code.hello")return; const u=new URL(location.href); parent.postMessage({type:"ezil.code.folder",v:1,nonce:e.data.nonce,mint:u.searchParams.get("ezil_mint"),kind:"folder",path:u.searchParams.get("folder")},e.origin);});</script></body></html>';
@@ -76,15 +79,14 @@ try {
         if (u.pathname==='/api/shell/assignment-video') {
             const d=post();
             // Universe's canonical countdown: the lease-free `clock` and the verified editor's `editor-ready` (not recording events).
-            if (d.action==='clock' || d.action==='editor-ready') return json({serverNow:new Date().toISOString(),startedAt:stage,deadlineAt:deadline,
-                pausedAt:null,pauseReason:null,remainingMs:null,revision:1});
+            if (d.action==='clock' || d.action==='editor-ready') return json(clockState());
             events.push(d.action);
             if (d.action==='preflight') return json({status:'eligible',attemptId,jobId:'1',repositoryUrl:repo,expiresAt:deadline,windowStartedAt:stage,deadlineAt:deadline});
             if (d.action==='begin') {
                 assert.equal(received,true); assert.equal(d.repoOpenProof,proof);
                 phase=d.captureSessionId; seed=0;
                 return json({status:'awaiting_frame',recordingId,captureSessionId:phase,nextSequence:seed,authorizationExpiresAt:deadline,
-                    startedAt:stage,deadlineAt:deadline,serverNow:new Date().toISOString()});
+                    startedAt:stage,deadlineAt:deadline,serverNow:new Date().toISOString(),revoked:false,stopRequestedAt:null});
             }
             assert.equal(d.captureSessionId,phase);
             if (d.action==='status') return json(recorded());
@@ -93,11 +95,14 @@ try {
                 confirmed.push(d.sequence);
                 if (d.sequence!==seed) return json({recordingId,confirmed:true,sequence:d.sequence});
                 firstFrameAt??=new Date().toISOString();
-                return json({...recorded(),confirmed:true,sequence:d.sequence,nextSequence:seed+1});
+                // The broker's seed confirmation: exactly these fields.
+                return json({recordingId,sequence:d.sequence,confirmed:true,phaseReady:true,captureSessionId:phase,nextSequence:seed+1,
+                    firstFrameAt,startedAt:stage,deadlineAt:deadline,serverNow:new Date().toISOString()});
             }
             // Stop is a resumable checkpoint of this phase, sent only after its last segment is confirmed.
+            // The broker's checkpoint summary names this capture phase (as its own tests answer it: the state, `partial`).
             if (d.action==='checkpoint') { checkpointed=d; confirmedAtCheckpoint=confirmed.length;
-                return json({status:'paused',serverNow:new Date().toISOString(),startedAt:stage,deadlineAt:deadline,revision:1}); }
+                return json({...recorded(),status:'partial'}); }
             if (d.action==='finalize') { finalized=d; return json({status:'stopped'}); }
         }
         if (u.searchParams.get('confirm')==='frame') return json({ok:true,confirmed:true,status:200});
