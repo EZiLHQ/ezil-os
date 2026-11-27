@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { checkoutAvailable } from '@/server/billing/config';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP, CUSTOM_TOPUP_SKU, customTopupPack } from '@/server/billing/catalog';
 import { hasAiTopupReceipts, type AiTopupReceiptStore } from '@/server/billing/ai-credits';
+import { deliverPaidTopup } from '@/server/billing/ai-topup-delivery';
 import type { CatalogPack } from '@/server/billing/types';
 import { enqueueFreeAiCredits, readAiAccount, readAiAccountEvidence, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
 import { lookupAiAccount, missingAiAccountView } from '@/server/billing/ai-credit-outbox-store';
@@ -39,6 +40,14 @@ import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 import { operatorGrantInEffect } from '@/server/billing/v3/operator-access';
+import { accessOverrideInEffect, ordinaryGrants, withoutAccessOverrides, type AccessRow } from '@/server/billing/v3/effective-access';
+
+/**
+ * An assigned plan in effect blocks a new Stripe purchase: an ordinary operator grant (the operator ends it first), or a
+ * live explicit override, which decides access whatever Stripe sells, so a checkout or trial would pay for nothing.
+ */
+const assignedPlanInEffect = (grants: readonly AccessRow[], now: Date): boolean =>
+    operatorGrantInEffect(ordinaryGrants(grants), now) !== null || accessOverrideInEffect(grants, now) !== null;
 
 /** All router domain failures use the pinned UI vocabulary. */
 function billingError(code: BillingErrorCode, trpcCode: TRPCError['code']): TRPCError {
@@ -73,11 +82,15 @@ async function currentPlan(deps: BillingDeps, userId: string) {
     return { plan, subs, userCreatedAt, changes: changes.filter(change => change.subscriptionId === plan.subscriptionId) };
 }
 
-/** Product access reads may resolve operator grants; Stripe mutation helpers keep using currentPlan above. */
-async function currentEffectivePlan(deps: BillingDeps, userId: string) {
-    const [current, grants, paymentIssues] = await Promise.all([
+/**
+ * Product access reads may resolve operator grants; Stripe mutation helpers keep using currentPlan above.
+ * `accessOverrides: false`: the plan as before explicit overrides (they decide compute only), for the portal.
+ */
+async function currentEffectivePlan(deps: BillingDeps, userId: string, options: { accessOverrides?: boolean } = {}) {
+    const [current, rows, paymentIssues] = await Promise.all([
         currentPlan(deps, userId), deps.store.operatorEntitlementsFor?.(userId) ?? [], deps.store.openPaymentIssues(userId),
     ]);
+    const grants = options.accessOverrides === false ? withoutAccessOverrides(rows) : rows;
     const now = deps.now();
     const operator = operatorAccessFor({ subscriptions: current.subs, paymentIssues, grants, now });
     return planFromSubscriptions({ subs: current.subs, now, userCreatedAt: current.userCreatedAt, operator });
@@ -131,6 +144,13 @@ async function refuseLiveStripeSubscription(stripe: StripeApi, customerId: strin
     }
 }
 
+async function refusePlanChangeDuringOverride(
+    deps: BillingDeps, userId: string, code: 'upgrade_not_allowed' | 'downgrade_not_allowed',
+) {
+    const rows = await deps.store.operatorEntitlementsFor?.(userId);
+    if (accessOverrideInEffect(rows, deps.now())) throw billingError(code, 'PRECONDITION_FAILED');
+}
+
 async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: string, toSku: string) {
     if (toSku !== 'premium_monthly_v3') throw billingError('unknown_sku', 'BAD_REQUEST');
     const { plan, changes, subs } = await currentPlan(deps, userId);
@@ -143,6 +163,7 @@ async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: stri
     if (row && neverPaidTrial(row)) throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     if (changes.some(change => change.kind === 'upgrade')) throw billingError('upgrade_pending', 'CONFLICT');
     if (changes.some(change => change.kind === 'downgrade')) throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
+    await refusePlanChangeDuringOverride(deps, userId, 'upgrade_not_allowed');
     const subscription = await ownedSubscription(deps, stripe, userId, subscriptionId, 'upgrade_not_allowed');
     if (subscription.scheduleId !== null || subscription.status === 'trialing') throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     return { plan, subscriptionId };
@@ -210,7 +231,7 @@ async function readTrialCampaignsBounded(stripe: StripeApi, timeoutMs: number): 
 async function trialEligibilityFor(store: TrialStore, deps: BillingDeps, userId: string, planFamily: string): Promise<{ facts: TrialFacts;
     decision: ReturnType<typeof trialEligibility> }> {
     const [facts, grants] = await Promise.all([store.trialFacts(userId), deps.store.operatorEntitlementsFor?.(userId) ?? []]);
-    return { facts, decision: trialEligibility({ facts, planFamily, operatorPlan: operatorGrantInEffect(grants, deps.now()) !== null }) };
+    return { facts, decision: trialEligibility({ facts, planFamily, operatorPlan: assignedPlanInEffect(grants, deps.now()) }) };
 }
 
 /**
@@ -531,13 +552,16 @@ type StoredEpochs = Awaited<ReturnType<BillingDeps['store']['epochsFor']>>;
 /**
  * Round 6 review (dunning into the hold): a paid subscription without paid access rates the computer on Free's
  * calendar month (summary.ts `computePlanV3`), which can start before the unpaid period; the epochs are then
- * re-read from the month's start, as the start gate does (compute-access.ts loadComputeBillingState).
+ * re-read from the month's start, as the start gate does (compute-access.ts loadComputeBillingState). An explicit Free
+ * override over a Stripe period rates on Free's month the same way; `epochs` were read from the Stripe-only plan's window.
  */
 async function computeWindowEpochs(deps: BillingDeps, userId: string, epochs: StoredEpochs, input: {
-    subs: SubscriptionRow[]; paymentIssues: PaymentIssueRow[]; now: Date; userCreatedAt: Date | null }): Promise<StoredEpochs> {
-    const plan = planFromSubscriptions(input);
-    const { standing } = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues, placementProvider: null, now: input.now });
-    const rated = computePlanV3(plan, standing, input);
+    subs: SubscriptionRow[]; paymentIssues: PaymentIssueRow[]; now: Date; userCreatedAt: Date | null; operatorGrants: readonly AccessRow[] }): Promise<StoredEpochs> {
+    const plan = planFromSubscriptions({ subs: input.subs, now: input.now, userCreatedAt: input.userCreatedAt });
+    const operator = operatorAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues, grants: input.operatorGrants, now: input.now });
+    const effective = planFromSubscriptions({ subs: input.subs, now: input.now, userCreatedAt: input.userCreatedAt, operator });
+    const { standing } = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues, placementProvider: null, now: input.now, operator });
+    const rated = computePlanV3(effective, standing, { subs: input.subs, now: input.now, userCreatedAt: input.userCreatedAt });
     return Date.parse(rated.window.start) < Date.parse(plan.window.start) ? deps.store.epochsFor(userId, new Date(rated.window.start)) : epochs;
 }
 
@@ -609,7 +633,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 deps.store.openPaymentIssues(ctx.user.id),
                 deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [],
             ]);
-            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
+            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt, operatorGrants });
             return buildUsageV3({ config: deps.config, now, subs, userCreatedAt, epochs, grants, storage,
                 consent, overageInvoices, planChanges: [], paymentIssues, sizePreference,
                 hasCustomer: false, computerId: input?.computerId, volumeGiB: placement.volumeGiB, placementProvider: placement.provider,
@@ -643,7 +667,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 ezilIdSignInUrl(),
                 deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [],
             ]);
-            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
+            const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt, operatorGrants });
             // Phase B (§6.1.1): the move computer's reverse row; undefined (today's summary) without 0012 or on any failed read.
             const reverseMove = await reverseMoveSummaryInput(ctx.db, placement.placement, ctx.user,
                 email => isOperator(email));
@@ -767,8 +791,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const { plan } = await currentPlan(deps, ctx.user.id);
             if (plan.family !== 'free') throw billingError('already_subscribed', 'CONFLICT');
             // Product entitlements v1: an operator assignment in effect is the account's plan; no Stripe checkout is layered
-            // over it (the operator ends it first), refused before Stripe is called.
-            if (operatorGrantInEffect(await deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [], deps.now())) {
+            // over it (the operator ends it first), refused before Stripe is called. A live explicit override is one too.
+            if (assignedPlanInEffect(await deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [], deps.now())) {
                 throw billingError('already_subscribed', 'CONFLICT');
             }
             // Standard trial: only the caller's own fresh stored quote, re-checked now, with the end they were shown.
@@ -948,6 +972,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 if (input.toSku !== 'standard_monthly_v3') throw billingError('unknown_sku', 'BAD_REQUEST');
                 const { plan, changes } = await currentPlan(deps, ctx.user.id);
                 const subscriptionId = paidSubscription(plan);
+                await refusePlanChangeDuringOverride(deps, ctx.user.id, 'downgrade_not_allowed');
                 await ownedSubscription(deps, stripe, ctx.user.id, subscriptionId, 'downgrade_not_allowed');
                 if (plan.sku !== 'premium_monthly_v3' || plan.status !== 'active'
                     || changes.some(change => change.kind === 'downgrade')) {
@@ -1100,7 +1125,9 @@ export function createBillingRouter(getDeps: () => BillingDeps,
         portal: protectedProcedure.mutation(async ({ ctx }) => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
-            const plan = await currentEffectivePlan(deps, ctx.user.id);
+            // An explicit override decides compute only: the portal follows the plan as before overrides (a Stripe payer
+            // keeps it; an ordinary grant-only account has none).
+            const plan = await currentEffectivePlan(deps, ctx.user.id, { accessOverrides: false });
             if (plan.operator) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
             const customerId = await deps.store.stripeCustomerFor(ctx.user.id);
             if (!customerId) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
@@ -1157,6 +1184,20 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                     console.warn('[billing.topup] receipt unavailable');
                 }
                 if (!receipt || receipt.userId !== ctx.user.id) return { status, paymentStatus, fulfillment: 'processing', credits: null };
+                // The payer's own poll also retries their own paid, still-pending receipt (one bounded, scoped attempt
+                // under the outbox's lease and backoff): delivery does not wait for the minute sweep. The answer below
+                // is always the stored receipt's: an attempt that did not finish it leaves it "processing".
+                const pending = (receipt.payload.delivery as { status?: unknown } | null | undefined)?.status;
+                // `delivered` and `review` (a terminal refusal) both changed the stored receipt: re-read and report it.
+                if (pending !== 'done' && pending !== 'failed'
+                    && ['delivered', 'review'].includes(await deliverPaidTopup(deps, { paymentIntentId: session.paymentIntentId, userId: ctx.user.id }))) {
+                    try {
+                        receipt = await store.aiTopupReceipt(ctx.user.id, session.paymentIntentId) ?? receipt;
+                    } catch {
+                        console.warn('[billing.topup] receipt unavailable');
+                    }
+                    if (receipt.userId !== ctx.user.id) return { status, paymentStatus, fulfillment: 'processing', credits: null };
+                }
                 const delivery = (receipt.payload.delivery as { status?: unknown } | null | undefined)?.status;
                 const credits = receipt.payload.credits;
                 if (delivery === 'done') return { status, paymentStatus, fulfillment: 'credited', credits: Number.isSafeInteger(credits) ? credits as number : null };

@@ -8,6 +8,8 @@ import { env } from '@/env';
 import { bootPayloadScript, buildShellBootPayload } from '@/server/shell/boot-payload';
 import { shellFeaturesFor } from '@/server/shell/features';
 import { Routes, getReturnUrlQueryParam, returnUrlFor, shellAppRoute } from '@/utils/constants';
+import { AssignmentSignInNotice } from '../assignment/work-return/sign-in-notice';
+import { embeddedCodeAttempt } from '@/utils/assignment-work-auth';
 import { BootWatchdog } from './boot-watchdog';
 import { HydrationSignal } from './hydration-signal';
 
@@ -57,7 +59,7 @@ import { HydrationSignal } from './hydration-signal';
  *    has no UI of its own. That is what makes the hydration handshake below
  *    necessary. Removing them means giving `/os` its own root layout, which in
  *    Next's App Router requires moving EVERY route into route groups — a
- *    change that touches `/computers` and `/computer/[id]`, which have to keep
+ *    change that touches `/computers`, which has to keep
  *    working as the fallback. It is the right follow-up, but not a change to
  *    make in the same breath as landing the shell.
  * 2. 🔴 React hydrates this document, and until it has, the shell may not
@@ -120,11 +122,23 @@ export default async function Page({ params: routeParams, searchParams }: {
     heads.set('x-trpc-source', 'rsc-os');
     const ctx = await createTRPCContext({ headers: heads });
 
+    // The exact assigned Code entry, framed by the Universe tab paired with this deployment. Its editor needs an OS session AND that
+    // session's retained EZiL ID, so both absences get the same small document: it makes one bounded silent attempt in a
+    // hidden child and reloads only this frame (`../assignment/work-return/silent-sign-in`). Every other entry, and
+    // this one once the identity is kept, is the shell exactly as before.
+    const framedAttempt = appId === 'code' && heads.get('sec-fetch-dest') === 'iframe' ? embeddedCodeAttempt(params) : null;
+    const staged = framedAttempt !== null && (await import('@/server/git/assignment-enrollment')).assignmentEnrollmentEnabled();
+    if (staged && ctx.user && !ctx.delegation) {
+        const { retainedIdentity } = await import('@/server/auth/retained-identity');
+        // Lost with a restart, expired, or inside its own minimum validity: `retainedIdentity` alone decides.
+        if (!await retainedIdentity(ctx.user.id).then(() => true, () => false)) return <AssignmentSignInNotice attemptId={framedAttempt} />;
+    }
+
     if (!ctx.user) {
-        // Same gate as `src/app/computers/layout.tsx` and
-        // `src/app/computer/layout.tsx`. The pathname is known here (`/os`,
-        // or `/app/<id>` for an allowlisted id), so it is used directly rather
-        // than read back from `x-pathname`.
+        if (staged) return <AssignmentSignInNotice attemptId={framedAttempt} />;
+        // Same gate as `src/app/computers/layout.tsx`. The pathname is known
+        // here (`/os`, or `/app/<id>` for an allowlisted id), so it is used
+        // directly rather than read back from `x-pathname`.
         redirect(`${Routes.LOGIN}?${getReturnUrlQueryParam(returnUrl)}`);
     }
 

@@ -1,0 +1,132 @@
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const codeRepo = /^https:\/\/github\.ezil\.work\/default\/u-[0-9a-f]{16}-a-([0-9a-f-]{36})\.git$/;
+export function assignmentRepositoryAttempt(repo: string): string | null {
+    const attempt = codeRepo.exec(repo)?.[1];
+    return attempt && uuid.test(attempt) ? attempt : null;
+}
+
+export function isAssignmentCodeReturn(path: string): boolean {
+    const url = new URL(path, 'https://os.ezil.work');
+    if (url.pathname !== '/app/code' || url.searchParams.has('project') || url.searchParams.getAll('repo').length !== 1
+        || url.searchParams.getAll('assignment').length > 1) return false;
+    const attempt = assignmentRepositoryAttempt(url.searchParams.get('repo') ?? '');
+    const hint = url.searchParams.get('assignment');
+    return !!attempt && (hint === null || hint === attempt);
+}
+
+export const workReturnPath = '/assignment/work-return';
+/** The return of a sign-in started from the embedded workspace: it goes back to that Universe workspace page. */
+export const embeddedWorkReturnSuffix = '&workspace=1';
+
+const embeddedReturn = /^([0-9a-f-]{36})&workspace=1(?:&owner=([0-9a-f]{16}))?$/;
+
+/**
+ * The embedded workspace's return, byte for byte: `?attempt=<uuid>&workspace=1`, optionally followed by
+ * `&owner=<16 hex>`, the owner tag of the repository Universe assigned (`u-<owner>-a-<attempt>`). The tag is a claim
+ * from the link, never an identity: `/assignment/work-return` only compares it with the tag this server derives from
+ * its own verified EZiL ID, to tell a person signed in to another account apart from one who only needs a refresh.
+ */
+export function embeddedWorkReturn(destination: string): { attempt: string; owner: string | null } | null {
+    const prefix = workReturnPath + '?attempt=';
+    const match = destination.startsWith(prefix) ? embeddedReturn.exec(destination.slice(prefix.length)) : null;
+    return match && uuid.test(match[1]!) ? { attempt: match[1]!, owner: match[2] ?? null } : null;
+}
+
+/** The lock screen's code for "this assignment belongs to another EZiL ID" (`app/login/page.tsx`). */
+export const workAccountNotice = 'assignment_account';
+
+export function workReturnAttempt(destination: string, path: typeof workReturnPath | '/app/assignment-enrollment' = workReturnPath): string | null {
+    const prefix = path + '?attempt=';
+    if (!destination.startsWith(prefix)) return null;
+    if (path === workReturnPath) {
+        const embedded = embeddedWorkReturn(destination);
+        if (embedded) return embedded.attempt;
+    }
+    const attempt = destination.slice(prefix.length);
+    return uuid.test(attempt) && attempt.length === 36 ? attempt : null;
+}
+
+export function embeddedCodeAttempt(params: Record<string, string | string[] | undefined>): string | null {
+    const {attempt, assignment, repo} = params;
+    if (attempt !== undefined || typeof assignment !== 'string' || !uuid.test(assignment) || typeof repo !== 'string') return null;
+    return assignmentRepositoryAttempt(repo) === assignment ? assignment : null;
+}
+
+const workProtocol = 'ezil.assignment.work/v2';
+/**
+ * The one Universe origin that may frame each EZiL OS origin: OS and Universe are selected as one deployment
+ * (`server/assignment-video/authority.ts`), so production pairs only with production and staging only with staging.
+ */
+const workHosts: Readonly<Record<string, string>> = {
+    'https://os.ezil.work': 'https://universe.ezil.work',
+    'https://os-staging.ezil.work': 'https://universe-staging.ezil.work',
+};
+export const workHostFor = (osOrigin: string): string | null => Object.hasOwn(workHosts, osOrigin) ? workHosts[osOrigin]! : null;
+export type WorkState = 'authentication_required' | 'preparing' | 'ready' | 'unavailable';
+const workStates: readonly WorkState[] = ['authentication_required', 'preparing', 'ready', 'unavailable'];
+
+/**
+ * The OS document is the direct child of a top-level page of its own paired Universe origin. Where the browser names
+ * the ancestors, that one ancestor must be that origin; the parent's origin itself is only trusted from each `discover`.
+ */
+function embeddedWorkHost(win: Window): string | null {
+    const host = workHostFor(win.location.origin);
+    const ancestors = (win.location as Location & { ancestorOrigins?: DOMStringList }).ancestorOrigins;
+    return host && win !== win.top && win.parent === win.top
+        && (ancestors == null || (ancestors.length === 1 && ancestors[0] === host)) ? host : null;
+}
+
+/**
+ * `ezil.assignment.work/v2`, child side. Answers only the actual parent window at the exact paired Universe origin, only
+ * for this attempt, echoing that discover's challenge, and posts only to that origin. `push` re-sends the current state
+ * against the latest accepted challenge, which `onDiscover` receives before the reply. Replies carry no proof,
+ * repository, computer or recording identifier.
+ * 🔴 `shell/ezil/assignment-video/work-protocol.js` is the shell's copy; `assignment-work-auth.test.ts` runs both on one fixture.
+ *
+ * `identityPending` is this copy's one addition, for the sign-in document only (`silent-sign-in.ts`): while it is
+ * exactly true, a `preparing` reply also carries `identityPending: true`. It tells Universe this document is about to
+ * reload itself, so nothing should be bound to it yet. No other state carries the field, and the shell, which never
+ * passes the argument, never sends it.
+ */
+export function respondToWorkDiscover(attemptId: string, win: Window, current: () => WorkState, onDiscover?: (challenge: string) => void,
+    identityPending?: () => boolean): { dispose: () => void; push: () => void } {
+    const host = uuid.test(attemptId) ? embeddedWorkHost(win) : null;
+    if (!host) return { dispose: () => {}, push: () => {} };
+    let challenge: string | null = null;
+    const push = () => {
+        const type = current();
+        if (challenge && workStates.includes(type)) win.parent.postMessage({protocol:workProtocol, type, attemptId, challenge,
+            ...(type === 'preparing' && identityPending?.() === true ? {identityPending: true} : {})}, host);
+    };
+    const receive = (event: MessageEvent) => {
+        const data = event.data;
+        if (event.source !== win.parent || event.origin !== host || data?.protocol !== workProtocol || data.type !== 'discover'
+            || data.attemptId !== attemptId || typeof data.challenge !== 'string' || !uuid.test(data.challenge)) return;
+        challenge = data.challenge;
+        onDiscover?.(data.challenge);
+        push();
+    };
+    win.addEventListener('message', receive);
+    return { dispose: () => win.removeEventListener('message', receive), push };
+}
+
+/** Only an authenticated parent handoff can prepare the workspace. This reply only explains a sign-in requirement. */
+export function listenForWorkSignIn(attemptId: string, win: Window): () => void {
+    return respondToWorkDiscover(attemptId, win, () => 'authentication_required').dispose;
+}
+
+/**
+ * The single framing rule the embed adds: the exact canonical assignment Code entry may be framed by the Universe
+ * origin paired with this OS origin, and by nothing else. Every other path, host and query keeps today's headers (no
+ * policy is returned).
+ */
+export function assignmentEmbedFramePolicy(publicOrigin: string, url: { pathname: string; searchParams: URLSearchParams }): string | null {
+    const host = workHostFor(publicOrigin);
+    if (!host || url.pathname !== '/app/code') return null;
+    const params: Record<string, string | string[]> = {};
+    for (const key of new Set(url.searchParams.keys())) {
+        const values = url.searchParams.getAll(key);
+        params[key] = values.length === 1 ? values[0]! : values;
+    }
+    return embeddedCodeAttempt(params) ? 'frame-ancestors ' + host : null;
+}

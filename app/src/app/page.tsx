@@ -27,8 +27,8 @@ import { couponBillingPath } from './coupon-entry';
  * client-side path to `/`. `entry-contract.test.ts` pins that the logo stays
  * an `<a>`, not a `<Link>`; if it is ever converted back, that test fails
  * before this route can regress into the dead-page defect again.
- * `/computers` remains reachable as the escape hatch from `/os` and
- * `/computer/[id]`, just no longer the default landing spot for `/`.
+ * `/computers` remains reachable as the escape hatch from `/os`, just no
+ * longer the default landing spot for `/`.
  */
 // No parameter default: Next's generated PageProps check refuses a props type that admits `undefined`.
 export default async function HomePage({ searchParams }: { searchParams?: Promise<Record<string, string | string[] | undefined>> }) {

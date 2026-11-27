@@ -15,7 +15,9 @@ export const AUTH0_COOKIE_OPTIONS = { httpOnly: true, secure: true, sameSite: 'l
 const TEN_MINUTES = 600_000;
 
 type ErrorCode = 'auth0_disabled' | 'invalid_transaction' | 'state_mismatch' | 'token_exchange_failed'
-    | 'invalid_id_token' | 'email_unverified' | 'account_conflict' | 'session_failed' | 'auth0_failed';
+    | 'invalid_id_token' | 'email_unverified' | 'account_conflict' | 'session_failed' | 'auth0_failed'
+    /** A silent refresh for an embedded assignment answered for another account (`assignment/work-return`). */
+    | 'assignment_account';
 
 export class Auth0Error extends Error {
     constructor(readonly code: ErrorCode) { super(code); }
@@ -59,7 +61,7 @@ export const SILENT_LOGIN_FALLBACK_ERRORS: ReadonlySet<string> = new Set(['login
  * `prompt: 'none'` is the silent re-auth that refreshes the retained ID token (`./retained-identity.ts`) after it
  * expired or a restart emptied the vault. It rides on the id.ezil.work single sign-on session and shows no UI.
  */
-export async function buildAuthorizeUrl({ origin, returnUrl, prompt }: { origin: string; returnUrl?: string | null; prompt?: 'none' }) {
+export async function buildAuthorizeUrl({ origin, returnUrl, prompt }: { origin: string; returnUrl?: string | null; prompt?: 'none' | 'login' }) {
     const { clientId } = config();
     const transaction: Transaction = {
         state: randomBytes(32).toString('base64url'),
@@ -80,7 +82,7 @@ export async function buildAuthorizeUrl({ origin, returnUrl, prompt }: { origin:
         redirect_uri: `${new URL(origin).origin}/auth/auth0/callback`,
         state: transaction.state, nonce: transaction.nonce,
         code_challenge: Buffer.from(challenge).toString('base64url'), code_challenge_method: 'S256',
-        ...(transaction.silent ? { prompt: 'none' } : {}),
+        ...(prompt ? { prompt } : {}),
     }).toString();
     return url;
 }
@@ -144,7 +146,12 @@ async function signingKeys(refresh = false): Promise<SigningKey[]> {
 export interface Auth0Identity { sub: string; email: string }
 
 export async function verifyIdToken(idToken: string, { nonce }: { nonce: string }): Promise<Auth0Identity> {
-    const { clientId } = config();
+    return verifyIdTokenForAudience(idToken, { nonce, clientId: config().clientId });
+}
+
+export async function verifyIdTokenForAudience(idToken: string, { nonce, clientId, maxAgeSeconds }: {
+    nonce: string; clientId: string; maxAgeSeconds?: number;
+}): Promise<Auth0Identity> {
     try {
         const parts = idToken.split('.');
         if (parts.length !== 3 || !parts.every(p => /^[\w-]+$/.test(p))) throw new Error();
@@ -161,9 +168,11 @@ export async function verifyIdToken(idToken: string, { nonce }: { nonce: string 
         const now = Date.now() / 1000;
         const audience = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
         const failed = claims.iss !== AUTH0_ISSUER ? 'iss'
-            : !audience.includes(clientId) || (audience.length > 1 && claims.azp !== clientId) || (claims.azp !== undefined && claims.azp !== clientId) ? 'aud'
-            : typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || claims.exp <= now - 60 ? 'exp'
-            : typeof claims.iat !== 'number' || !Number.isFinite(claims.iat) || claims.iat > now + 60 || claims.iat >= claims.exp ? 'iat'
+            : !audience.includes(clientId) || (audience.length > 1 && (maxAgeSeconds !== undefined || claims.azp !== clientId))
+                || (claims.azp !== undefined && claims.azp !== clientId) ? 'aud'
+            : typeof claims.exp !== 'number' || !Number.isFinite(claims.exp) || claims.exp <= now - (maxAgeSeconds === undefined ? 60 : 0) ? 'exp'
+            : typeof claims.iat !== 'number' || !Number.isFinite(claims.iat) || claims.iat > now + 60 || claims.iat >= claims.exp
+                || (maxAgeSeconds !== undefined && (claims.iat < now - maxAgeSeconds || claims.gty === 'client-credentials')) ? 'iat'
             : typeof claims.nonce !== 'string' || !constantTimeEqual(claims.nonce, nonce) ? 'nonce'
             : typeof claims.sub !== 'string' || !claims.sub.trim() ? 'sub'
             : typeof claims.email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(claims.email) ? 'email'

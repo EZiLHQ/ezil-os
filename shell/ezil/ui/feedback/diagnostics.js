@@ -4,6 +4,7 @@ import { feedbackTraceSnapshot } from '../../trace.js';
 import { recentEvents } from '../../telemetry.js';
 import { isCorrelationId, isFailureReason } from './failure-shapes.js';
 import { app_failures_for } from './app-failures.js';
+import { recentCodeLifecycle } from '../../apps/code-lifecycle.js';
 
 /**
  * FEEDBACK-DIAG: at most this many recent events — the newest — carry the
@@ -100,7 +101,8 @@ export function build_diagnostics (appContext) {
     result.fullbleed = [...document.querySelectorAll('.ezil-fullbleed')].some(visible);
     if (trace) result.traceId = trace.id;
     // Expanded phase snapshots above never finish the active app-open.
-    const events = recentEvents().slice(-50)
+    const events = [...recentEvents(), ...(expanded ? recentCodeLifecycle(appContext, captured) : [])]
+        .sort((a, b) => (a.t ?? 0) - (b.t ?? 0)).slice(-50)
         .filter(event => ['eventClass', 'site', 'code'].every(key => typeof event[key] === 'string'
             && /^[a-zA-Z0-9_:#/.-]+$/.test(event[key]) && !event[key].includes('://') && !/[a-f0-9]{24,}/i.test(event[key])));
     // FEEDBACK-DIAG: `{code, reason, correlationId}` of a failed API call. Both

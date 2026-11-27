@@ -57,8 +57,34 @@ def valid_ref(value):
                     for p in value.split("/")))
 
 
+def valid_assignment_preload(req, packet):
+    witness = req.get("assignmentPreload")
+    if not isinstance(witness, dict) or set(witness) != {
+        "eventId", "attemptId", "ownerSha256", "canonicalURL", "repositoryId", "ref", "manifestSha256", "nonce",
+    } or req.get("refreshOnly") or packet["git"]["scope"] != "write":
+        return False
+    attempt = witness["attemptId"]
+    event = witness["eventId"]
+    if (not isinstance(attempt, str) or not UUID.fullmatch(attempt)
+            or not isinstance(event, str) or not UUID.fullmatch(event) or event[14] != "4" or event[19] not in "89ab"
+            or any(not isinstance(witness[key], str) or not HEX64.fullmatch(witness[key])
+                   for key in ("nonce", "manifestSha256"))):
+        return False
+    owner = hashlib.sha256(packet["identity"]["subject"].encode()).hexdigest()
+    canonical = f"https://github.ezil.work/default/u-{owner[:16]}-a-{attempt}.git"
+    identifier = list(hashlib.sha256(f"ezil-os/repo-url/v1|{canonical}".encode()).hexdigest()[:32])
+    identifier[12] = "8"
+    identifier[16] = "89ab"[int(identifier[16], 16) & 3]
+    hex_id = "".join(identifier)
+    folder = f"{hex_id[:8]}-{hex_id[8:12]}-{hex_id[12:16]}-{hex_id[16:20]}-{hex_id[20:]}"
+    return (packet["repository"]["canonicalURL"] == witness["canonicalURL"] == canonical
+            and packet["repository"]["ref"] == witness["ref"] == "refs/heads/main"
+            and req["repositoryId"] == witness["repositoryId"] == folder
+            and witness["ownerSha256"] == owner)
+
+
 def valid_request(req, now_ms):
-    if (not isinstance(req, dict) or set(req) - {"gitAuthor", "refreshOnly"} != {"v", "jobId", "repositoryId", "privatePacket", "timeoutMs"}
+    if (not isinstance(req, dict) or set(req) - {"gitAuthor", "refreshOnly", "assignmentPreload"} != {"v", "jobId", "repositoryId", "privatePacket", "timeoutMs"}
             or type(req["v"]) is not int or req["v"] != 1
             or not isinstance(req["jobId"], str) or not HEX64.fullmatch(req["jobId"])
             or not isinstance(req["repositoryId"], str) or not UUID.fullmatch(req["repositoryId"])
@@ -87,6 +113,8 @@ def valid_request(req, now_ms):
             or not isinstance(g, dict) or set(g) != {"username", "token", "expiresAt", "scope"}
             or g["username"] != "ezil" or g["scope"] not in ("read", "write")
             or not isinstance(g["token"], str) or not TOKEN.fullmatch(g["token"])):
+        return False
+    if "assignmentPreload" in req and not valid_assignment_preload(req, p):
         return False
     end = expiry(g["expiresAt"])
     return (end is not None and req["timeoutMs"] + 5000 <= end - now_ms <= 300000
@@ -157,8 +185,10 @@ def validate_output(raw, req):
             or v["identity"] != p["identity"] or v["status"] not in ("cloned", "reused")
             or v["folder"] not in allowed):
         return None
-    return {"ok": True, "folder": "/workspace/projects/" + req["repositoryId"],
-            "status": "fetched" if v["status"] == "reused" else "cloned"}
+    answer = {"ok": True, "folder": folder, "status": "fetched" if v["status"] == "reused" else "cloned"}
+    if "assignmentPreload" in req:
+        answer["checkoutFolder"] = v["folder"]
+    return answer
 
 
 class Jobs:

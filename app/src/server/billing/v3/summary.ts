@@ -12,10 +12,11 @@ import { operatorGrantedSubscription, planFromSubscriptions, publicOffers, type 
 import {
     CATALOG_V3, CATALOG_V3_VERSION, type AiAccountV3, type AiGrantKindV3, type BillingSummaryV3, type ComputerReverseMoveV3, type ComputeStandingV3, type SellableSkuV3,
 } from './contract';
-import { deriveStanding, operatorAccessFor, paidAccess } from './standing';
+import { deriveStanding, effectiveAccessFor, paidAccess } from './standing';
+import { withoutAccessOverrides, type AccessRow } from './effective-access';
 import { fairUseAllowance, renewalGrantPending } from './funding';
 export { fairUseAllowance, renewalGrantPending, GRANT_PENDING_SECONDS } from './funding';
-import { issuedByOf, type OperatorEntitlementRow } from './operator-access';
+import { issuedByOf } from './operator-access';
 import {
     reverseHoldOpenable, reverseMoveView, reverseMoveVisible, reverseTryAgainForbidden, type ReverseMovePlacementView,
 } from '../../lib/compute/provider-reverse';
@@ -34,7 +35,7 @@ const iso = (date: Date) => isoSeconds(epochSeconds(date));
  * Gateway has not acknowledged, that have not expired and whose delivery has not failed terminally.
  * null when nothing waits or receipts are unreadable.
  */
-function waitingCredits(receipts: readonly AiCreditReceipt[] | null, now: Date): { credits: number } | null {
+export function waitingCredits(receipts: readonly AiCreditReceipt[] | null, now: Date): { credits: number } | null {
     const credits = (receipts ?? []).reduce((sum, receipt) => receipt.deliveredAt === null && !receipt.failed
         && Date.parse(receipt.expiresAt) > now.getTime() ? sum + receipt.credits : sum, 0);
     return credits > 0 ? { credits } : null;
@@ -364,10 +365,12 @@ now: Date): BillingSummaryV3['plan']['trial'] | undefined {
  * plan, for `billing.aiAccount`: the Usage poll's balance read, which needs no compute, Stripe or catalog input.
  */
 export function aiAccountSummaryV3(input: { subs: Input['subs']; userCreatedAt: Input['userCreatedAt']; paymentIssues: Input['paymentIssues'];
-    operatorGrants?: readonly OperatorEntitlementRow[]; enrollment: BillingSummaryV3['ai']['enrollment']; now: Date;
+    operatorGrants?: readonly AccessRow[]; enrollment: BillingSummaryV3['ai']['enrollment']; now: Date;
     ai: NonNullable<Parameters<typeof buildSummaryV3>[0]['ai']> }): Pick<BillingSummaryV3['ai'], 'enrollment' | 'waiting' | 'delivering'> & { account: AiAccountV3 } {
-    const operator = operatorAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues, grants: input.operatorGrants, now: input.now });
-    const plan = planFromSubscriptions({ subs: input.subs, now: input.now, userCreatedAt: input.userCreatedAt, operator });
+    // The summary's AI plan (`buildSummaryV3` basePlan): explicit overrides decide compute only, never AI credits.
+    const base = effectiveAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
+        grants: withoutAccessOverrides(input.operatorGrants), now: input.now });
+    const plan = planFromSubscriptions({ subs: input.subs, now: input.now, userCreatedAt: input.userCreatedAt, operator: base.row });
     const enrolled = input.enrollment === 'enrolled';
     const delivering = enrolled ? waitingCredits(input.ai.receipts, input.now) : null;
     return { enrollment: input.enrollment, waiting: enrolled ? null : waitingCredits(input.ai.receipts, input.now),
@@ -403,12 +406,20 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     /** Phase B (§6.1.1): the move computer's reverse row and placement; omitted = today's output exactly (no new key). */
     reverseMove?: ReverseMoveSummaryInput;
     /** Product entitlements v1: the account's operator assignments; omitted = none (Stripe or Free, as before). */
-    operatorGrants?: readonly OperatorEntitlementRow[];
+    operatorGrants?: readonly AccessRow[];
     /** Standard trial: the router's eligibility for this viewer (server facts); omitted = no offer key. */
     trialOffer?: BillingSummaryV3['trialOffer'];
 }): BillingSummaryV3 {
-    const operator = operatorAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues, grants: input.operatorGrants, now: input.now });
+    const access = effectiveAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues, grants: input.operatorGrants, now: input.now });
+    const operator = access.row;
+    const override = access.source === 'override';
     const plan = planFromSubscriptions({ ...input, operator });
+    // An explicit override decides compute only. AI credits, the Stripe cancel and the portal keep reading the plan as it
+    // was before overrides (Stripe paid access, else an ordinary grant, else Free), so a payer under an override still
+    // manages its subscription and a grant-only account stays without the portal; the same plan when no override is live.
+    const baseOperator = override ? effectiveAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
+        grants: withoutAccessOverrides(input.operatorGrants), now: input.now }).row : operator;
+    const basePlan = override ? planFromSubscriptions({ ...input, operator: baseOperator }) : plan;
     const standing = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
         placementProvider: input.placementProvider ?? null, now: input.now, operator });
     const legacy = plan.sku === 'legacy' ? buildSummaryV2(input) : null;
@@ -461,7 +472,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     const disk = storageDisk(rated, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB, input.liveComputers);
     const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;
     // Promotion review: an operator-granted plan has no Stripe subscription, so no Stripe-backed action applies to it.
-    const stripeActions = enabled && !operatorGrantedSubscription(plan.subscriptionId);
+    const stripeActions = enabled && !operatorGrantedSubscription(basePlan.subscriptionId);
     const trial = operator ? undefined : trialBlock(input.subs.find(sub => sub.stripeSubscriptionId === plan.subscriptionId), plan.sku,
         paymentIssue !== null, input.renewal ?? null, input.now);
     const enrollment = input.enrollment?.state ?? 'enrolled';
@@ -476,7 +487,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         scheduledChange, pendingUpgrade, paymentIssue, graceEndsAt: standing.graceEndsAt, planEndsAt: standing.planEndsAt,
         // Product entitlements v1: assigned by an EZiL operator, not paid (no renewal, no Stripe actions); key absent otherwise.
         ...(operator ? { access: { source: 'operator' as const, ref: operator.ref, endsAt: operator.endsAt === null ? null : iso(operator.endsAt),
-            untilRevoked: operator.endsAt === null, issuedBy: issuedByOf(operator) } } : {}),
+            untilRevoked: operator.endsAt === null, issuedBy: issuedByOf(operator), ...(override ? { override: true as const } : {}) } } : {}),
         ...(trial ? { trial } : {}) },
         computer: { size: size.code, vcpu: size.vcpu, memoryGiB: size.memoryGiB, sessionMaxSeconds: rated.sessionMaxSeconds,
             opening: rated.sku === 'legacy' ? 'standard' : rated.offer.opening, activeDeadline,
@@ -493,29 +504,33 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             // Phase B (§6.1): the move rides its own key; `move` above stays null so an old shell never renders it.
             ...reverseMoveFields(input.reverseMove, standing.standing) },
         // Balance is filled from the AI Gateway by the caller; legacy plans grant nothing new.
-        // An operator grant includes no AI credits (product entitlements v1: credits are never granted with access).
-        ai: { grant: plan.sku === 'legacy' || operator ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
+        // An operator grant includes no AI credits (product entitlements v1: credits are never granted with access); an
+        // explicit override changes no credits, so they are the base plan's.
+        ai: { grant: basePlan.sku === 'legacy' || baseOperator ? { amount: 0, per: 'period' } : { ...basePlan.offer.aiCredits },
+            balance: null, state: 'unavailable',
             enrollment, waiting: enrollment === 'enrolled' ? null : waitingCredits(input.ai?.receipts ?? null, input.now),
             ...(delivering ? { delivering } : {}),
-            ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro),
-                account: aiAccountV3({ plan, ...input.ai, now: input.now }) } : {}) },
+            ...(input.ai ? { ...aiCreditBuckets({ plan: basePlan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro),
+                account: aiAccountV3({ plan: basePlan, ...input.ai, now: input.now }) } : {}) },
         fairUse: { status: unmetered ? 'ok' : fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end,
             ...(unmetered ? { policy: 'unmetered' as const } : {}) },
         // Free has no provisioned disk: capBytes '0' with 'unavailable' (the pinned wire type is a string).
         // No sample yet: usedBytes null with 'unavailable', never a measured-looking '0'.
         storage: { usedBytes: disk.usedBytes?.toString() ?? null, capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },
         // Round 5 D1: credits bought before enrollment would only wait, so top-up needs a Gateway member.
-        actions: { checkout: enabled && plan.family === 'free', topup: enabled && enrollment === 'enrolled',
+        // Under an explicit override no purchase changes access (checkout, upgrade and downgrade stay off, and createCheckout
+        // refuses); the account's own subscription keeps its cancel and portal.
+        actions: { checkout: enabled && plan.family === 'free' && !override, topup: enabled && enrollment === 'enrolled',
             // A trial is not upgraded: its $0 proration would turn a free Standard month into a free Premium one.
             upgrade: stripeActions && !operator && !trial && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             downgrade: stripeActions && !operator && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
             // payment_pending keeps the supported cancel (cancelAtPeriodEnd): it stops renewals; the first charge already
             // being collected is not voided, and clients say so (paused access, no "stays active").
-            cancel: stripeActions && plan.subscriptionId !== null && plan.planActive && !pendingUpgrade,
-            portal: stripeActions && !operator && input.hasCustomer,
+            cancel: stripeActions && basePlan.subscriptionId !== null && basePlan.planActive && !pendingUpgrade,
+            portal: stripeActions && !baseOperator && input.hasCustomer,
             ezilId: enrollment === 'needs_ezil_id' ? input.enrollment?.ezilIdUrl ?? null : null },
         // Round 6 (R1-06): the Free offer says the hours this account gets on Free (legacy 8 h today).
-        ...(input.trialOffer !== undefined && enabled && plan.family === 'free' ? { trialOffer: input.trialOffer } : {}),
+        ...(input.trialOffer !== undefined && enabled && plan.family === 'free' && !override ? { trialOffer: input.trialOffer } : {}),
         catalog: { version: CATALOG_V3_VERSION, offers: publicOffers({ legacyFree: plan.legacyFree }),
             packs: (input.packs ?? []).filter(aiPackCheckoutEligible).map(({ sku, aiCredits, creditCents, discountPercent, totalCents }) => ({
                 sku, aiCredits, creditCents, discountPercent, totalCents, currency: 'usd' })),

@@ -31,6 +31,7 @@ function deps(over: Partial<OperatorEntitlementDeps> = {}): () => Promise<Operat
         readAssignments: async () => [], withCommand: async (_c, _u, run) => run({
             findEvent: async () => null, withAccessTransaction: run => run(), assignments: async () => [], insertAssignment: async () => {}, updateAssignment: async () => true,
             closeLapsed: async () => {}, insertEvent: async () => {} }),
+        accessOverridesInstalled: async () => false,
         ...over,
     };
     return async () => value;
@@ -67,6 +68,15 @@ describe('ezil-os entitlement routes', () => {
         expect(response.status).toBe(200);
         expect(response.headers.get('cache-control')).toBe('no-store');
         expect(await response.json()).toEqual(sourceCatalog());
+    });
+
+    it('GET catalog advertises access_overrides once 0038 is installed; deps that cannot be built still answer the v1 catalog', async () => {
+        const installed = await call(signed('GET', 'catalog'), 'catalog', { deps: deps({ accessOverridesInstalled: async () => true }) });
+        expect([installed.status, await installed.json()]).toEqual([200, { ...sourceCatalog(), access_overrides: true }]);
+        const broken = await call(signed('GET', 'catalog'), 'catalog', { deps: async () => { throw new SourceUnavailable('commands'); } });
+        expect([broken.status, await broken.json()]).toEqual([200, sourceCatalog()]);
+        const unknown = await call(signed('GET', 'catalog'), 'catalog', { deps: deps({ accessOverridesInstalled: async () => { throw new Error('probe unavailable'); } }) });
+        expect([unknown.status, await unknown.json()]).toEqual([200, sourceCatalog()]);
     });
 
     it('GET assignments: both ids required (400), a non-linked pair is 404 and reveals nothing, a linked one is 200', async () => {

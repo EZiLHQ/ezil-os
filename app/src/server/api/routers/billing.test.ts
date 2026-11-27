@@ -16,7 +16,13 @@ import { selectTrialOffer, trialOfferFingerprint } from '@/server/billing/v3/tri
 import { CAMPAIGNS_ON, STANDARD_PRICE_ID, STANDARD_PRODUCT_ID, standardTrialRead } from '@/server/billing/v3/trial-campaigns.test-support';
 import type { createTRPCContext } from '../trpc';
 
+// `../trpc` reaches a `server-only` module (the MCP identity bootstrap); the marker has no meaning under vitest.
+vi.mock('server-only', () => ({}));
 vi.mock('@/server/db', () => ({ db: {} }));
+// The scoped top-up delivery itself is proven against Postgres (ai-credit-outbox.pg.test.ts); here only when
+// `topupStatus` asks for it, for whom, and how it reports the result. Default: nothing to deliver.
+const topupDelivery = vi.hoisted(() => ({ deliver: vi.fn<typeof import('@/server/billing/ai-topup-delivery').deliverPaidTopup>(async () => 'skipped') }));
+vi.mock('@/server/billing/ai-topup-delivery', () => ({ deliverPaidTopup: topupDelivery.deliver }));
 const auth0 = vi.hoisted(() => ({ enabled: vi.fn(() => true) }));
 vi.mock('@/server/auth/auth0', () => ({ auth0Enabled: auth0.enabled }));
 vi.mock('@/server/lib/compute/provider-migrate-orchestrator', () => ({ schedulePaidMigration: vi.fn() }));
@@ -372,6 +378,31 @@ describe('billing router', () => {
         expect(f.stripe.createPortalSession).not.toHaveBeenCalled();
         expect(f.stripe.retrieveSubscription).not.toHaveBeenCalled();
         await expect(f.caller.history()).resolves.toEqual(history);
+    });
+
+    it('an explicit override decides compute only: a Stripe payer keeps the portal, a grant-only account has none, no checkout over it', async () => {
+        const f = fixture();
+        await f.store.linkCustomer(userId, 'cus_fixture');
+        f.store.subscriptionsFor.mockResolvedValue([subscription()]);
+        const base = { revision: 1, userId, accountPublicId: '10000000-0000-4000-8000-0000000000a1',
+            startsAt: new Date(now.getTime() - 86_400_000), endsAt: null, endedAt: null };
+        const override = { ...base, ref: 'osg-00000000-0000-4000-8000-0000000000bb', sku: 'free_v3' as const, accessOverride: true };
+        const store = f.store as BillingStore;
+        store.operatorEntitlementsFor = vi.fn(async () => [override]);
+        await expect(f.caller.portal()).resolves.toEqual({ url: 'https://billing.example/portal' });
+        expect(f.stripe.createPortalSession).toHaveBeenCalledTimes(1);
+        // An ordinary grant under the override, no Stripe subscription: the pre-override rule (no portal) stands.
+        f.store.subscriptionsFor.mockResolvedValue([]);
+        store.operatorEntitlementsFor = vi.fn(async () => [override, { ...base, ref: 'osg-00000000-0000-4000-8000-000000000001', sku: 'standard_monthly_v3' as const }]);
+        await expect(f.caller.portal()).rejects.toMatchObject({ message: 'not_subscribed' });
+        expect(f.stripe.createPortalSession).toHaveBeenCalledTimes(1);
+        // A Free viewer under a live override buys nothing that would change access: refused before Stripe is called.
+        store.operatorEntitlementsFor = vi.fn(async () => [override]);
+        await expect(f.caller.createCheckout({ sku })).rejects.toMatchObject({ code: 'CONFLICT', message: 'already_subscribed' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        // Positive control: the override ended, the same Free viewer checks out.
+        store.operatorEntitlementsFor = vi.fn(async () => [{ ...override, endedAt: new Date(now.getTime() - 1000) }]);
+        await checkoutControl(f);
     });
 
     it('refuses another checkout for a v2 Standard subscription', async () => {
@@ -976,6 +1007,92 @@ describe('top-up quote, stale-quote guard and confirmed fulfilment (synthetic fi
         await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing', credits: null });
     });
 
+    describe('the payer\'s poll delivers their own paid, pending receipt (no sweep needed)', () => {
+        const pendingThenDone = (f: ReturnType<typeof fixture>) => {
+            const read = vi.fn<AiTopupReceiptStore['aiTopupReceipt']>().mockResolvedValueOnce(receipt({ status: 'pending' }))
+                .mockResolvedValue(receipt({ status: 'done' }));
+            Object.assign(f.store, { aiTopupReceipt: read, recordAiTopup: vi.fn<AiTopupReceiptStore['recordAiTopup']>() });
+            return read;
+        };
+
+        it('asks for exactly this payment as this user, then reports the re-read receipt: credited', async () => {
+            topupDelivery.deliver.mockReset().mockResolvedValue('delivered');
+            const f = topupFixture();
+            const read = pendingThenDone(f);
+            f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid',
+                fulfillment: 'credited', credits: 500 });
+            expect(topupDelivery.deliver).toHaveBeenCalledTimes(1);
+            expect(topupDelivery.deliver).toHaveBeenCalledWith(f.deps, { paymentIntentId: 'pi_fixture', userId });
+            expect(read).toHaveBeenCalledTimes(2);
+            expect(read).toHaveBeenLastCalledWith(userId, 'pi_fixture');
+        });
+
+        it('an attempt the Gateway refuses for good is reported from the re-read receipt as "review", never credited or still processing', async () => {
+            topupDelivery.deliver.mockReset().mockResolvedValue('review');
+            const f = topupFixture();
+            const read = vi.fn<AiTopupReceiptStore['aiTopupReceipt']>().mockResolvedValueOnce(receipt({ status: 'retry' }))
+                .mockResolvedValue(receipt({ status: 'failed' }));
+            Object.assign(f.store, { aiTopupReceipt: read, recordAiTopup: vi.fn<AiTopupReceiptStore['recordAiTopup']>() });
+            f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid',
+                fulfillment: 'review', credits: null });
+            expect(read).toHaveBeenCalledTimes(2);
+        });
+
+        it.each(['queued', 'skipped'] as const)('an attempt that ends %s stays an honest "processing", with no second read or claim of success', async outcome => {
+            topupDelivery.deliver.mockReset().mockResolvedValue(outcome);
+            const f = topupFixture();
+            const read = withReceipt(f, receipt({ status: 'retry' }));
+            f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid',
+                fulfillment: 'processing', credits: null });
+            expect(topupDelivery.deliver).toHaveBeenCalledTimes(1);
+            expect(read).toHaveBeenCalledTimes(1);
+        });
+
+        it('a delivered receipt that cannot be re-read, or re-reads as another owner\'s, is still not credited', async () => {
+            topupDelivery.deliver.mockReset().mockResolvedValue('delivered');
+            vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const f = topupFixture();
+            f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+            Object.assign(f.store, { recordAiTopup: vi.fn<AiTopupReceiptStore['recordAiTopup']>(),
+                aiTopupReceipt: vi.fn<AiTopupReceiptStore['aiTopupReceipt']>().mockResolvedValueOnce(receipt({ status: 'pending' })).mockRejectedValue(new Error('db down')) });
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing', credits: null });
+            Object.assign(f.store, { aiTopupReceipt: vi.fn<AiTopupReceiptStore['aiTopupReceipt']>().mockResolvedValueOnce(receipt({ status: 'pending' }))
+                .mockResolvedValue(receipt({ status: 'done' }, '22222222-2222-4222-8222-222222222222')) });
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing', credits: null });
+        });
+
+        it('never attempts delivery for an unpaid or unowned checkout, a missing or foreign receipt, or a finished one', async () => {
+            topupDelivery.deliver.mockReset().mockResolvedValue('delivered');
+            const f = topupFixture();
+            withReceipt(f, receipt({ status: 'pending' }));
+            // Charge not confirmed: open, completed-but-unpaid, expired.
+            for (const unpaid of [{ status: 'open', paymentStatus: 'unpaid' }, { paymentStatus: 'unpaid' }, { status: 'expired', paymentStatus: 'unpaid' }] as const) {
+                f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession(unpaid));
+                await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'awaiting_payment' });
+            }
+            // Another person's checkout, and a session that is not a top-up.
+            f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ clientReferenceId: '22222222-2222-4222-8222-222222222222' }));
+            await expect(f.caller.topupStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+            f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ mode: 'subscription', sku }));
+            await expect(f.caller.topupStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+            // Paid, but no receipt yet (the webhook has not committed one), or the row is another owner's.
+            f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+            withReceipt(f, null);
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing' });
+            withReceipt(f, receipt({ status: 'pending' }, '22222222-2222-4222-8222-222222222222'));
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing' });
+            // Already delivered, or terminally failed (an operator's review): nothing to retry from a poll.
+            withReceipt(f, receipt({ status: 'done' }));
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'credited', credits: 500 });
+            withReceipt(f, receipt({ status: 'failed' }));
+            await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'review', credits: null });
+            expect(topupDelivery.deliver).not.toHaveBeenCalled();
+        });
+    });
+
     it('duplicate webhook delivery still writes one receipt, and status reports it credited once delivered', async () => {
         const f = topupFixture();
         const receipts: Parameters<AiTopupReceiptStore['recordAiTopup']>[1][] = [];
@@ -1132,6 +1249,34 @@ describe('billing v3 mutations', () => {
         await domainFailure(() => call(f), 'upgrade_not_allowed');
         expect(f.stripe.previewUpgrade).not.toHaveBeenCalled();
         expect(f.stripe.confirmUpgrade).not.toHaveBeenCalled();
+    });
+
+    it('blocks direct plan changes while a compute override is live and allows them after expiry', async () => {
+        const override = {
+            ref: 'osg-00000000-0000-4000-8000-0000000000bb',
+            revision: 1, userId, accountPublicId: '10000000-0000-4000-8000-0000000000a1',
+            sku: 'free_v3' as const, startsAt: new Date(now.getTime() - 1000),
+            endsAt: new Date(now.getTime() + 1000), endedAt: null, accessOverride: true,
+        };
+        const standard = await paidFixture();
+        const standardStore: BillingStore = standard.store;
+        standardStore.operatorEntitlementsFor = vi.fn(async () => [override]);
+        await domainFailure(() => standard.caller.previewUpgrade(toCompute), 'upgrade_not_allowed');
+        await domainFailure(() => standard.caller.confirmUpgrade(confirmInput), 'upgrade_not_allowed');
+        expect(standard.stripe.retrieveSubscription).not.toHaveBeenCalled();
+        expect(standard.stripe.previewUpgrade).not.toHaveBeenCalled();
+        expect(standard.stripe.confirmUpgrade).not.toHaveBeenCalled();
+        expect(standard.store.recordPlanChange).not.toHaveBeenCalled();
+        standardStore.operatorEntitlementsFor = vi.fn(async () => [{ ...override, endsAt: now }]);
+        await expect(standard.caller.previewUpgrade(toCompute)).resolves.toMatchObject(toCompute);
+
+        const premium = await paidFixture('premium_monthly_v3');
+        const premiumStore: BillingStore = premium.store;
+        premiumStore.operatorEntitlementsFor = vi.fn(async () => [override]);
+        await domainFailure(() => premium.caller.scheduleDowngrade(toStandard), 'downgrade_not_allowed');
+        expect(premium.stripe.retrieveSubscription).not.toHaveBeenCalled();
+        expect(premium.stripe.scheduleDowngrade).not.toHaveBeenCalled();
+        expect(premium.store.recordPlanChange).not.toHaveBeenCalled();
     });
 
     it('schedules a downgrade, persists its identity, and ignores foreign plan changes', async () => {

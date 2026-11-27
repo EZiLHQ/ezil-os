@@ -1,3 +1,6 @@
+import { editorDelegationEnabled } from '@/server/api/editor-delegation';
+import { reconcileColdStarts } from '@/server/computer-start/start';
+import type { SessionDb } from '@/server/agent-session/store';
 import { drainFeedbackNotifications } from '@/server/feedback/notifications';
 import { feedbackNotificationMailer } from '@/server/feedback/notification-mail';
 import { drainIncidentAlerts } from '@/server/telemetry/incident-alerts';
@@ -17,6 +20,7 @@ import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { readLastUsageStop, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { ComputerRef } from '@/server/lib/compute/provider';
+import { freeOverrideHandoffReady } from '@/server/lib/compute/provider-reverse-override';
 import { advanceReverseMoves } from '@/server/lib/compute/provider-reverse-runtime';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { handleBillingSessionSweep, reverseMoveInFlightFor, RUNNING_GRACE_MS } from './handler';
@@ -89,6 +93,12 @@ function aiPlanRefresh(now: Date) {
 export async function GET(req: Request): Promise<Response> {
     if (!env.CRON_SECRET) return new Response(null, { status: 404 });
     if (req.headers.get('authorization') !== `Bearer ${env.CRON_SECRET}`) return new Response(null, { status: 404 });
+    if (editorDelegationEnabled(process.env)) {
+        try {
+            const { observeAdmittedStart } = await import('@/server/computer-start/port');
+            await reconcileColdStarts(db as unknown as SessionDb, computer => observeAdmittedStart(db, computer));
+        } catch { console.warn('[computer.start] readiness sweep unavailable'); }
+    }
     // Independent of billing configuration: feedback notifications must retry even
     // when a billing dependency is unavailable. One send adds at most 5 seconds.
     try {
@@ -119,6 +129,10 @@ export async function GET(req: Request): Promise<Response> {
         isStillRunning: isStillRunningAt(now),
         awsStopProof,
         refreshAiPlans: aiPlanRefresh(now),
+        // The explicit Free override lane (provider-reverse-override.ts) owns such an owner's AWS stops only while it can run:
+        // the AWS flags AND its schema (0019 and 0012; production has no 0012). Probed by the handler once, when needed; a
+        // read error is "not ready", so the sweep's own stops keep the host.
+        overrideLane: () => freeOverrideHandoffReady(db as unknown as PlacementExecutor, process.env),
         // The held bound reads placements (C-2, through placement.ts): only where placement reads are on, as sandbox-reap.
         ...(isPlacementReadEnabled(process.env)
             ? { runningAwsPlacements: (after: string | null, limit: number) => runningAwsComputersAfterEpochs(db, after, limit),

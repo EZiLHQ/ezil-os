@@ -83,7 +83,7 @@ Supabase config, run `dev:stop` followed by `dev:setup` to restart its services.
 3. Open `/computers`; confirm one computer. Reload `/os` and confirm the same
    computer remains. Do not manually create an extra computer for this check.
 4. Sign out from the OS Start menu (**Sign out**), then sign in as local B. Confirm B has a different computer and only
-   B's computer appears in the list. Trying A's `/computer/<id>` URL as B must fail.
+   B's computer appears in the list. Trying A's `/app/browser?computer=<id>` URL as B must fail.
 5. Sign out and confirm `/os` and protected shell APIs require authentication.
 6. Run `dev:setup` again; verify both users' computers are retained and it reports
    zero applied migrations. Stop/restart Supabase and repeat login.

@@ -7,6 +7,8 @@
 //     announced; a project child announced, never asked; an ask whose first document
 //     opened anything else, or the asked folder after a definite non-restore, is always
 //     said, once per mint);
+//   - the managed checkout: a verified assignment preview says nothing about a bare project wrapper or its own
+//     pair left in the shared record, and still says every folder opened by hand, every other binding and mint;
 //   - the notice band (text only, actions wired; `unverified` offers no Try again);
 //   - storage that throws never breaks the window.
 //
@@ -348,6 +350,186 @@ for ( const code of ['link_invalid', 'with_repository'] ) {
 }
 nb.close(); ok(body.children.at(-1).removed, 'close');
 
+// ── workbench readiness: asked only by a binding that wants it, answered only by this mint's mounted document ──
+{
+    F = frame();
+    const P = { userId: 'u1', computerId: 'c-ready', project: { projectId: '11111111-1111-4111-8111-111111111111', repoId: '22222222-2222-4222-8222-222222222222' } };
+    const ROOT = '/workspace/projects/22222222-2222-4222-8222-222222222222';
+    const mounted = []; const roots = [];
+    const attach = (extra = {}) => {
+        F.src = M.tagFolderMint(minted('w1'), {});
+        M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind: P, notice, workbench: true,
+            onRoot: (r, how) => roots.push([r, how]), onWorkbench: (r) => mounted.push(r), ...extra });
+        return mintOf(F.src);
+    };
+    const helloNonce = () => F.sent.at(-1).m.nonce;
+    const workbench = (mint, path, nonce = helloNonce(), more = {}, ev = {}) =>
+        fire({ type: 'ezil.code.workbench', v: 1, nonce, mint, kind: 'folder', path, ...more }, ev);
+    let id = attach();
+    // the opt-in rides every hello, with the mint id the editor must match
+    eq(F.sent.at(-1), { m: { type: 'ezil.code.hello', v: 1, nonce: helloNonce(), workbenchReady: true, mint: id }, o: ORIGIN }, 'the opted-in hello: workbenchReady + this mint, to the minted origin');
+    // ahead of its hello's folder report: dropped (the echo names the document first)
+    workbench(id, ROOT); eq(mounted, [], 'a workbench message before the folder report is dropped');
+    report(id, 'folder', ROOT); const n1 = F.sent.at(-1).m.nonce;
+    eq(roots.at(-1), [{ kind: 'folder', path: ROOT }, { mintDriven: true, fallback: false }], 'the folder echo still reaches onRoot');
+    eq(mounted, [], 'the folder echo alone is never the workbench');
+    // every refusal changes nothing and leaves the real answer acceptable
+    workbench(id, ROOT, n1, {}, { origin: 'https://evil.example' });
+    workbench(id, ROOT, n1, {}, { source: {} });
+    workbench(id, ROOT, 'C'.repeat(22));
+    workbench(id, ROOT, null);
+    workbench(id, ROOT, n1, { v: 2 });
+    workbench(null, ROOT, n1);
+    workbench('D'.repeat(22), ROOT, n1);
+    workbench(id, `${ROOT}/child`, n1);
+    workbench(id, '/workspace/../etc', n1);
+    workbench(id, undefined, n1);
+    workbench(id, ROOT, n1, { kind: 'empty' });
+    workbench(id, ROOT, n1, { kind: 'workspace' });
+    eq(mounted, [], 'origin, source, nonce, version, mint, folder and kind refusals: nothing heard');
+    workbench(id, `${ROOT}/`, n1);
+    eq(mounted, [{ kind: 'folder', path: ROOT }], 'the mounted workbench of this mint, this hello and this folder is heard');
+    workbench(id, ROOT, n1); workbench(id, ROOT, n1);
+    eq(mounted.length, 1, 'once per hello: a repeat is dropped');
+    // RE-ARM, same document: a new hello (the iframe load) forgets the one before it
+    report(id, 'folder', ROOT, n1); eq(mounted.length, 1, 'a replayed folder report does not re-arm');
+    F.load(); const n2 = helloNonce(); ok(n2 !== n1, 'a new hello, a new nonce');
+    eq(F.sent.at(-1).m.workbenchReady, true, 'and it asks again');
+    workbench(id, ROOT, n1); eq(mounted.length, 1, 'the earlier nonce is dropped after a new hello');
+    workbench(id, ROOT, n2); eq(mounted.length, 1, 'the new nonce is dropped until its own folder report');
+    report(id, 'folder', ROOT, n2);
+    workbench(id, ROOT, n1); eq(mounted.length, 1, 'the earlier nonce stays dropped once the new hello is answered');
+    workbench(id, ROOT, n2); eq(mounted.length, 2, 'the same mounted document answers the new hello again');
+    // RE-ARM, a new document of the same mint (a reload in the frame): its ready makes a new hello; what the document
+    // before it was told answers nothing, and only the new document's own mounted workbench counts
+    F.load(); const n3 = helloNonce(); report(id, 'folder', ROOT, n3);
+    fire({ type: 'ezil.code.ready', v: 1 }); const n4 = helloNonce(); ok(n4 !== n3, 'a new document: a new hello');
+    workbench(id, ROOT, n3); eq(mounted.length, 2, 'the replaced document\'s armed nonce no longer answers');
+    report(id, 'folder', ROOT, n4); eq(mounted.length, 2, 'the new document\'s echo: parked, no workbench yet');
+    workbench(id, ROOT, n3); eq(mounted.length, 2, 'still not the earlier nonce');
+    workbench(id, ROOT, n4); eq(mounted.length, 3, 'the new document\'s mounted workbench is heard');
+    // a document that says it is leaving cannot answer afterwards
+    F.load(); report(id, 'folder', ROOT); const n5 = helloNonce();
+    fire({ type: 'ezil.code.leaving', v: 1 }); workbench(id, ROOT, n5);
+    eq(mounted.length, 3, 'leaving disarms the hello');
+    // a document the person navigated to (no mint) reports its folder but is never this mint's workbench
+    F.load(); report(null, 'folder', ROOT); const n6 = helloNonce();
+    eq(roots.at(-1)[1], { mintDriven: false, fallback: false }, 'the user-driven document is still heard as a root');
+    workbench(null, ROOT, n6); workbench(id, ROOT, n6);
+    eq(mounted.length, 3, 'a user-driven document never arms, whatever mint its message claims');
+    // an empty or unsupported first document never arms
+    for ( const kind of ['empty', 'workspace', 'foreign'] ) {
+        F.load(); report(id, kind); workbench(id, ROOT); eq(mounted.length, 3, `${kind}: never armed`);
+    }
+    // a throwing listener is the window's own fault
+    M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind: P, notice, workbench: true, onWorkbench: () => { throw new Error('window bug'); } });
+    eq(mounted.length, 3, 're-attached: the earlier binding hears nothing more');
+    // replaced src: the stale binding drops the message and detaches
+    id = attach(); report(id, 'folder', ROOT); const stale = helloNonce();
+    F.src = M.tagFolderMint(minted('w2'), {}); workbench(id, ROOT, stale);
+    eq(mounted.length, 3, 'a replaced frame URL: dropped'); eq(listeners.size, 0, 'and detached');
+    // a fallback first document (the asked folder is not what opened) shows its notice and never arms
+    F = frame(); store.clear();
+    const own = { userId: 'u1', computerId: 'c-ready-own', project: null };
+    F.src = M.tagFolderMint(minted('w3'), { asked: { v: 1, path: '/workspace/asked' }, answer: { v: 1, outcome: 'restored' } });
+    M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind: own, notice, workbench: true, onWorkbench: (r) => mounted.push(r) });
+    report(mintOf(F.src), 'folder', '/workspace'); eq(notices.at(-1), ['not_reopened', '/workspace/asked'], 'the fallback is said');
+    workbench(mintOf(F.src), '/workspace'); workbench(mintOf(F.src), '/workspace/asked');
+    eq(mounted.length, 3, 'a fallback document never arms');
+    // LEGACY: a binding that did not ask sends no opt-in and hears nothing, whatever arrives
+    for ( const off of [undefined, false, 'true', 1] ) {
+        F = frame(); F.src = M.tagFolderMint(minted('w4'), {});
+        M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind: P, notice, ...(off === undefined ? {} : { workbench: off }), onWorkbench: (r) => mounted.push(r) });
+        eq(Object.keys(F.sent.at(-1).m).sort(), ['nonce', 'type', 'v'], `workbench ${String(off)}: the hello is the ordinary one, byte for byte`);
+        report(mintOf(F.src), 'folder', ROOT); workbench(mintOf(F.src), ROOT, F.sent.at(-1).m.nonce);
+        eq(mounted.length, 3, `workbench ${String(off)}: nothing heard`);
+    }
+    // the repository presentation hint keeps its own fields beside the opt-in
+    F = frame(); F.src = M.tagFolderMint(minted('w5'), { repositoryFocus: { folder: ROOT, name: 'default/qa' } });
+    M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind: P, notice, workbench: true });
+    eq(F.sent.at(-1).m, { type: 'ezil.code.hello', v: 1, nonce: helloNonce(), workbenchReady: true, mint: mintOf(F.src), repositoryFocus: { folder: ROOT, name: 'default/qa' } }, 'opt-in and presentation hint together');
+    // a frame with no mint (a continued editor document) has no first document to ask
+    F = frame(); F.src = `${ORIGIN}/?folder=${encodeURIComponent(ROOT)}`;
+    M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind: P, notice, workbench: true, continued: true, onWorkbench: (r) => mounted.push(r) });
+    eq(Object.keys(F.sent.at(-1).m).sort(), ['nonce', 'type', 'v'], 'continued: never asks');
+    report(null, 'folder', ROOT); workbench(null, ROOT); eq(mounted.length, 3, 'continued: nothing heard');
+    M.detachFolderBridge(F);
+}
+
+// ── managed checkout: a leftover of the shared record is not a folder opened by hand ────────────────────────
+{
+    // A repository opened from its address has no ids: its record is the one its owner and computer share.
+    const A = '2d5fd5d2-ad3e-47ea-9a95-60eb51bce32a';
+    const R = { userId: 'u1', computerId: 'c-managed', project: { repoUrl: `https://github.ezil.work/default/u-0482ba160482ba16-a-${A}.git` } };
+    const own = { userId: 'u1', computerId: 'c-managed', project: null };
+    const WS = '/workspace/projects/12222222-3333-4444-8555-666666666666', CO = `${WS}/u-0482ba160482ba16-a-${A}`;
+    const OTHER = '/workspace/projects/0aaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const PAIR = { workspaceFolder: WS, checkoutFolder: CO };
+    const mounted = []; const roots = [];
+    // One mint of the verified preview: `prev` is what the shared record held, `shown` what its first document reports.
+    const open = (prev, shown, o = {}) => {
+        const has = (k) => Object.hasOwn(o, k), checkout = has('checkout') ? o.checkout : PAIR, workbench = has('workbench') ? o.workbench : true;
+        notices.length = 0; roots.length = 0;
+        F = frame(); M.forgetFolder(R);
+        if ( prev ) { F.src = M.tagFolderMint(minted('m0'), {}); M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind: own, notice }); report(mintOf(F.src), 'folder', prev); }
+        eq(M.readFolderRecord(R)?.path ?? null, prev, 'the repository reads the shared record');
+        F.src = M.tagFolderMint(minted('m1'), { checkout });
+        M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind: R, notice, ...(workbench === undefined ? {} : { workbench }),
+            onRoot: (r, how) => roots.push([r, how]), onWorkbench: (r) => mounted.push(r) });
+        report(has('mint') ? o.mint : mintOf(F.src), 'folder', shown);
+        return notices.slice();
+    };
+    const SAID = (prev) => [['child', prev]];
+    // the reported case: the record is a bare project wrapper, the verified workbench opened the server's folder
+    eq(open(OTHER, WS), [], 'another bare wrapper, then the verified workspace folder: nothing is said');
+    eq(M.readFolderRecord(R)?.path, WS, 'the record still follows the screen');
+    eq(roots, [[{ kind: 'folder', path: WS }, { mintDriven: true, fallback: false }]], 'the root is heard as before');
+    fire({ type: 'ezil.code.workbench', v: 1, nonce: F.sent.at(-1).m.nonce, mint: mintOf(F.src), kind: 'folder', path: WS });
+    eq(mounted, [{ kind: 'folder', path: WS }], 'and its mounted workbench still answers');
+    eq(open(OTHER, CO), [], 'another bare wrapper, then the verified checkout: nothing is said');
+    eq(open(CO, WS), [], 'the exact checkout, then its workspace folder: nothing is said');
+    eq(open(WS, CO), [], 'the exact workspace folder, then its checkout: nothing is said');
+    eq(open(WS, WS), [], 'the same folder: nothing was ever said');
+    eq(open(null, WS), [], 'no record: nothing to say');
+    // a folder opened by hand is still said: below the checkout, below the wrapper, below another wrapper
+    for ( const prev of [`${CO}/src`, `${WS}/other`, `${OTHER}/repository`, `${OTHER}/repository/web`] ) {
+        eq(open(prev, WS), SAID(prev), `${prev}: a deeper folder is still said`);
+        eq(M.readFolderRecord(R)?.path, WS, 'and the record follows the screen as before');
+    }
+    // an ordinary folder, and anything that only looks like a wrapper
+    for ( const prev of ['/workspace', '/workspace/sports/sports-web', '/workspace/projects', '/workspace/projects/my-site',
+        '/workspace/projects/0AAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE', `/home/user${OTHER}`, `${OTHER}x`] ) {
+        eq(open(prev, WS), SAID(prev), `${prev}: not a bare wrapper, still said`);
+    }
+    // the verified pair is the only thing that silences: a first document on any other folder is said
+    for ( const shown of [OTHER, `${CO}/src`, '/workspace', `${WS}x`] ) eq(open(WS, shown), SAID(WS), `${shown}: not the verified pair, said`);
+    eq(open(OTHER, `${CO}/src`), SAID(OTHER), 'a bare wrapper is said too when the document is not the verified pair');
+    // only the signed preparation's binding, and only with the server's pair on this very mint
+    for ( const workbench of [undefined, false, 1, 'true'] ) eq(open(OTHER, WS, { workbench }), SAID(OTHER), `workbench ${String(workbench)}: said as before`);
+    for ( const checkout of [undefined, null, {}, 'x', { workspaceFolder: WS }, { checkoutFolder: CO }, { workspaceFolder: CO, checkoutFolder: WS },
+        { workspaceFolder: WS, checkoutFolder: WS }, { workspaceFolder: WS, checkoutFolder: `${CO}/src` }, { workspaceFolder: WS, checkoutFolder: `${WS}x/repo` },
+        { workspaceFolder: `${WS}/`, checkoutFolder: CO }, { workspaceFolder: WS, checkoutFolder: `${CO}/` }, { workspaceFolder: WS, checkoutFolder: `${WS}/../x` },
+        { workspaceFolder: '/', checkoutFolder: '/x' }, { workspaceFolder: 'workspace', checkoutFolder: 'workspace/x' }, { workspaceFolder: 7, checkoutFolder: CO }, { workspaceFolder: null, checkoutFolder: null }, { workspaceFolder: WS, checkoutFolder: null },
+        { workspaceFolder: null, checkoutFolder: CO }, { workspaceFolder: '', checkoutFolder: '' }] ) {
+        eq(open(OTHER, WS, { checkout }), SAID(OTHER), `no well-formed pair (${JSON.stringify(checkout)}): said as before`);
+    }
+    // a document that is not this mint's first is never the one that decides (dropped: no notice, no record)
+    eq(open(OTHER, WS, { mint: 'D'.repeat(22) }), [], 'another mint\'s document says nothing'); eq(M.readFolderRecord(R)?.path, OTHER, 'and writes nothing');
+    eq(open(OTHER, WS, { mint: null }), [], 'a document before the first report says nothing'); eq(M.readFolderRecord(R)?.path, OTHER, 'and writes nothing');
+    // the pair is read once, by its own mint: the next mint without it says the record again
+    open(OTHER, WS); M.forgetFolder(R);
+    F = frame(); F.src = M.tagFolderMint(minted('m2'), {}); M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind: own, notice }); report(mintOf(F.src), 'folder', OTHER);
+    F.src = M.tagFolderMint(minted('m3'), {}); M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind: R, notice, workbench: true });
+    notices.length = 0; report(mintOf(F.src), 'folder', WS); eq(notices, SAID(OTHER), 'a later mint without the pair is said as before');
+    // a project with ids keeps its own record and its own rule (r32), pair or no pair
+    const P = { userId: 'u1', computerId: 'c-managed', project: { projectId: '11111111-1111-4111-8111-111111111111', repoId: '12222222-3333-4444-8555-666666666666' } };
+    F = frame(); F.src = M.tagFolderMint(minted('m4'), {}); M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind: P, notice }); report(mintOf(F.src), 'folder', WS);
+    F.load(); report(null, 'folder', `${WS}/web`);
+    F.src = M.tagFolderMint(minted('m5'), { checkout: PAIR }); M.attachFolderBridge({ iframe: F, frameUrl: F.src, bind: P, notice, workbench: true });
+    notices.length = 0; report(mintOf(F.src), 'folder', WS); eq(notices, SAID(`${WS}/web`), 'a project child opened by hand is still said');
+    M.detachFolderBridge(F); M.forgetFolder(R); M.forgetFolder(P); notices.length = 0;
+}
+
 // ── storage that throws never breaks the window ─────────────────────────────
 globalThis.sessionStorage = { getItem () { throw new Error('denied'); }, setItem () { throw new Error('denied'); } };
 eq(M.folderAskFor(bind), undefined, 'throwing storage: no ask');
@@ -358,4 +540,4 @@ eq(M.readFolderRecord(bind), null, 'a foreign store shape is ignored');
 globalThis.sessionStorage = { getItem: () => JSON.stringify({ v: 1, entries: { 'u1\nc1\n\n': { v: 1, kind: 'folder', path: '/workspace/../etc', at: 1 } } }), setItem () {} };
 eq(M.folderAskFor(bind), undefined, 'a tampered record that is not a plain path is never asked');
 
-console.log(`PASS ${checks} checks: code-folder (shared grammar, mint-id + nonce binding in both orderings, stale document, record rules, project child, notices, storage failures)`);
+console.log(`PASS ${checks} checks: code-folder (shared grammar, mint-id + nonce binding in both orderings, stale document, record rules, project child, notices, workbench readiness, managed checkout, storage failures)`);

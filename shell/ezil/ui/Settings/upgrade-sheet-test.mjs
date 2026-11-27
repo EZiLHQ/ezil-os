@@ -974,6 +974,215 @@ test('AI pack: closing before payment finishes reports a cancel once; closing af
     assert.equal(cancels, 1);
 });
 
+// Hosted staging run, 2026-11-26: the dialog said "Your balance is now …", × closed it, and Billing kept the old
+// balance. Once the server has credited a top-up, every way out of the dialog asks Billing for one re-read.
+const paidTopup = fulfillment => ({ status: 'complete', paymentStatus: 'paid', fulfillment, credits: null });
+const LEAVE = {
+    '×': h => h.click('[data-action="close-sheet"]'),
+    Escape: h => h.key('Escape'),
+    'the backdrop': h => h.click('.ezil-upgrade-backdrop'),
+    Done: h => h.click('[data-action="done"]'),
+};
+for ( const [way, leave] of Object.entries(LEAVE) ) {
+    test(`AI pack: a credited top-up left by ${way} asks Billing to re-read exactly once`, async h => {
+        const pending = [];
+        let cancels = 0;
+        h.create = async () => topupSession;
+        h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+        h.topup = async () => credited;
+        h.summary = async () => withAccount('4718550000');
+        h.open({ sku: pack.sku, pack, userId: 'fixture-user', onUnconfirmed: value => pending.push(value), onCancel: () => { cancels++; } });
+        await settle(); h.complete(); await settle();
+        assert.equal(h.q('[data-role="topup-new-balance"]').textContent, 'Your balance is now 4,718 credits.');
+        assert.equal(h.q('[data-action="done"]').textContent, 'Done');
+        assert.equal(h.done, 0, 'nothing is asked of Billing while the dialog is open');
+        leave(h);
+        assert.equal(h.q('[data-role="upgrade-sheet"]'), null, `${way} closes the dialog`);
+        assert.equal(h.done, 1);
+        h.handle.close(); h.handle.close();
+        await h.tick(60000);
+        assert.equal(h.done, 1, 'a repeated close and elapsed time ask nothing more');
+        assert.equal(h.closed, 1);
+        assert.equal(pending.length, 0, 'a credited top-up is never handed to the watch');
+        assert.equal(cancels, 0);
+        assert.equal(h.destroyed, 1);
+        assert.equal(h.timers.size, 0);
+        assert.equal(h.document.activeElement, h.q('#opener'));
+    });
+}
+
+test('AI pack: credited while the dialog is still reading the balance, × asks Billing to re-read once', async h => {
+    const read = deferred();
+    h.create = async () => topupSession;
+    h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+    h.topup = async () => credited;
+    h.summary = () => read.promise;
+    h.open({ sku: pack.sku, pack }); await settle(); h.complete(); await settle();
+    assert.equal(h.q('[data-role="upgrade-success"]'), null);
+    assert.match(h.text(), /Payment received\. Adding your AI credits…/);
+    h.click('[data-action="close-sheet"]');
+    assert.equal(h.done, 1);
+    read.resolve(summaryV3()); await settle(); await h.tick(60000);
+    assert.equal(h.done, 1, 'the late balance read changes nothing');
+    assert.equal(h.q('[data-role="upgrade-sheet"]'), null);
+    assert.equal(h.closed, 1);
+});
+
+for ( const way of ['×', 'Back to Billing'] ) {
+    test(`AI pack: credited but the balance unreadable until the deadline, ${way} asks Billing to re-read once`, async h => {
+        const pending = [];
+        h.create = async () => topupSession;
+        h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+        h.topup = async () => credited;
+        h.summary = async () => { throw new Error('offline'); };
+        h.open({ sku: pack.sku, pack, onUnconfirmed: value => pending.push(value) }); await settle(); h.complete(); await h.tick(60000);
+        assert.equal(h.q('[data-role="upgrade-success"]'), null);
+        assert.match(h.text(), /Check Settings → Billing for updates/);
+        h.click(way === '×' ? '[data-action="close-sheet"]' : '[data-action="return-to-billing"]');
+        h.handle.close();
+        assert.equal(h.done, 1);
+        assert.equal(h.closed, 1);
+        assert.equal(pending.length, 0);
+    });
+}
+
+// What the fix leaves alone: no credit, no re-read on dismissal. The watch (`onUnconfirmed`) still owns an open session.
+for ( const [name, topup, handoff, wait] of [
+    ['before payment', null, [{ sessionId: topupSession.sessionId, paid: false }], 0],
+    ['a bank payment still unpaid', { status: 'complete', paymentStatus: 'unpaid', fulfillment: 'awaiting_payment', credits: null }, [{ sessionId: topupSession.sessionId, paid: false }], 0],
+    ['paid and processing', paidTopup('processing'), [{ sessionId: topupSession.sessionId, paid: true }], 0],
+    ['paid and past the deadline', paidTopup('processing'), [{ sessionId: topupSession.sessionId, paid: true }], 60000],
+    ['in review', paidTopup('review'), [], 0],
+    ['expired', { status: 'expired', paymentStatus: 'unpaid', fulfillment: 'awaiting_payment', credits: null }, [], 0],
+] ) {
+    for ( const way of ['×', 'Escape'] ) {
+        test(`AI pack ${name}: ${way} asks for no Billing re-read`, async h => {
+            const pending = [];
+            let cancels = 0;
+            h.create = async () => topupSession;
+            if ( topup ) h.topup = async () => topup;
+            h.open({ sku: pack.sku, pack, onUnconfirmed: value => pending.push(value), onCancel: () => { cancels++; } });
+            await settle();
+            if ( topup ) { h.complete(); await settle(); }
+            if ( wait ) await h.tick(wait);
+            LEAVE[way](h);
+            assert.equal(h.q('[data-role="upgrade-sheet"]'), null);
+            assert.equal(h.done, 0);
+            assert.equal(h.count('billing.summary'), 0);
+            assert.deepEqual(JSON.parse(JSON.stringify(pending)), handoff);
+            assert.equal(cancels, topup ? 0 : 1);
+            assert.equal(h.closed, 1);
+        });
+    }
+}
+
+test('plan checkout is outside the top-up fix: × after success asks nothing, Done asks once', async h => {
+    h.summary = async () => standard;
+    h.open(); await settle(); h.complete(); await settle();
+    assert.match(h.text(), /You're on EZiL Standard/);
+    h.click('[data-action="close-sheet"]');
+    assert.equal(h.done, 0);
+    assert.equal(h.closed, 1);
+    h.open(); await settle(); h.complete(); await settle();
+    h.click('[data-action="done"]'); h.handle.close();
+    assert.equal(h.done, 1);
+    assert.equal(h.closed, 2);
+});
+
+for ( const way of ['×', 'Done'] ) {
+    test(`AI pack: an onDone that closes the sheet itself or throws, on ${way}, is asked once and teardown completes`, async h => {
+        let asked = 0;
+        h.create = async () => topupSession;
+        h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+        h.topup = async () => credited;
+        h.summary = async () => summaryV3();
+        h.open({ sku: pack.sku, pack, onDone: () => { asked++; h.handle.close(); throw new Error('callback failed'); } });
+        await settle(); h.complete(); await settle();
+        assert.ok(h.q('[data-role="upgrade-success"]'));
+        // Done's own click handler rethrows after closing (as before); jsdom reports it without stopping teardown.
+        h.window.addEventListener('error', event => event.preventDefault());
+        LEAVE[way](h);
+        h.handle.close();
+        assert.equal(asked, 1);
+        assert.equal(h.closed, 1);
+        assert.equal(h.destroyed, 1);
+        assert.equal(h.timers.size, 0);
+        assert.equal(h.q('[data-role="upgrade-sheet"]'), null);
+    });
+}
+
+for ( const timeout of [false, true] ) {
+    test(`AI pack onUnconfirmed: paid processing hands off once on ${timeout ? 'deadline + Back to Billing' : 'close'}`, async h => {
+        const pending = [];
+        let cancels = 0;
+        h.create = async () => topupSession;
+        h.topup = async () => ({ status: 'complete', paymentStatus: 'paid', fulfillment: 'processing' });
+        h.open({ sku: pack.sku, pack, onUnconfirmed: value => pending.push(value), onCancel: () => { cancels++; } });
+        await settle(); h.complete(); await settle();
+        if ( timeout ) { await h.tick(60000); h.click('[data-action="return-to-billing"]'); }
+        else h.click('[data-action="close-sheet"]');
+        h.handle.close();
+        assert.deepEqual(JSON.parse(JSON.stringify(pending)), [{ sessionId: topupSession.sessionId, paid: true }]);
+        assert.equal(cancels, 0);
+        assert.equal(h.closed, 1);
+        assert.equal(h.timers.size, 0);
+    });
+}
+test('AI pack: a credited top-up without a usable server count never shows the quoted pack as delivered', async h => {
+    h.create = async () => topupSession;
+    h.status = async () => ({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+    h.topup = async () => ({ ...credited, credits: null });
+    h.summary = async () => summaryV3();
+    h.open({ sku: pack.sku, pack }); await settle(); h.complete(); await settle();
+    const success = h.q('[data-role="upgrade-success"]');
+    assert.ok(success);
+    assert.match(success.textContent, /AI credits added/);
+    assert.doesNotMatch(success.textContent, new RegExp(pack.aiCredits.toLocaleString('en-US') + ' AI credits added'));
+});
+
+test('AI pack onUnconfirmed: unpaid close preserves the once-only onCancel callback', async h => {
+    const pending = [];
+    let cancels = 0;
+    h.create = async () => topupSession;
+    h.open({ sku: pack.sku, pack, onUnconfirmed: value => pending.push(value), onCancel: () => { cancels++; } });
+    await settle(); h.handle.close(); h.handle.close();
+    assert.deepEqual(JSON.parse(JSON.stringify(pending)), [{ sessionId: topupSession.sessionId, paid: false }]);
+    assert.equal(cancels, 1);
+});
+for ( const terminal of ['credited', 'review', 'expired', 'creation failed'] ) {
+    test(`AI pack onUnconfirmed: no handoff after ${terminal}`, async h => {
+        const pending = [];
+        h.create = async () => terminal === 'creation failed' ? { ok: false, message: 'stripe_unavailable' } : topupSession;
+        h.topup = async () => ({ status: terminal === 'expired' ? 'expired' : 'complete', paymentStatus: 'paid', fulfillment: terminal, credits: pack.aiCredits });
+        h.summary = async () => summaryV3();
+        h.open({ sku: pack.sku, pack, onUnconfirmed: value => pending.push(value) }); await settle();
+        if ( terminal !== 'creation failed' ) { h.complete(); await settle(); }
+        if ( terminal === 'credited' ) assert.ok(h.q('[data-role="upgrade-success"]'));
+        if ( terminal === 'review' ) assert.equal(h.q('[data-role="checkout-state"] p').textContent, h.window.sheetApi.TOPUP_REVIEW_COPY);
+        h.handle.close(); h.handle.close();
+        assert.equal(pending.length, 0);
+    });
+}
+test('AI pack onUnconfirmed: expiry observed by the open form is terminal', async h => {
+    let pending = 0;
+    h.create = async () => topupSession;
+    h.status = async () => ({ status: 'expired', paymentStatus: 'unpaid' });
+    h.open({ sku: pack.sku, pack, onUnconfirmed: () => { pending++; } }); await settle();
+    await h.tick(4000); h.handle.close();
+    assert.equal(pending, 0);
+});
+test('AI pack onUnconfirmed: a throwing callback cannot interrupt teardown', async h => {
+    let pending = 0;
+    h.create = async () => topupSession;
+    h.open({ sku: pack.sku, pack, onUnconfirmed: () => { pending++; throw new Error('callback failed'); } });
+    await settle(); h.handle.close(); h.handle.close();
+    assert.equal(pending, 1);
+    assert.equal(h.closed, 1);
+    assert.equal(h.destroyed, 1);
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.q('[data-role="upgrade-sheet"]'), null);
+});
+
 test('a quoted custom top-up sends exactly its quoted input, once, and shows its own credits and discount', async h => {
     h.create = async () => topupSession;
     const custom = { sku: 'ai_custom_v2', aiCredits: 500, totalCents: 5000, creditCents: 5000, discountPercent: 0, currency: 'usd',

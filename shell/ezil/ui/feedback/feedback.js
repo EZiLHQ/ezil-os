@@ -6,6 +6,7 @@ import { scan } from './secret-scan.js';
 import { encode_under_limit, open_redact_editor } from './redact-editor.js';
 import { uploaded_image_canvas } from './image-file.js';
 import { currentComputer } from '../../session.js';
+import { assignmentWorkDesktop } from '../../assignment-video/work-protocol.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">'
@@ -35,6 +36,7 @@ function legacy_text (description, bug) {
 const DRAFT_KEY = 'ezil:feedback:draft:v1:';
 const OUTBOX_KEY = 'ezil:feedback:outbox:v1:';
 const OUTBOX_MAX = 10;
+const assignmentDocuments = new WeakSet();
 let chipObserver = null;
 /** `matchMedia('(pointer: coarse)')` and the icon's sync it calls on a change. */
 let chipPointer = null;
@@ -413,6 +415,14 @@ function flush_after_restore (event) { if ( event.persisted ) void flush_feedbac
  */
 export function mount_feedback_chip () {
     if ( ! feedback_enabled() || ! document.body ) return;
+    // The host owns assignment controls. Remember the original embedded document across native app history changes.
+    // Settings can still open Feedback, and any already submitted report can still leave the outbox.
+    if ( assignmentWorkDesktop(window) ) assignmentDocuments.add(document);
+    if ( assignmentDocuments.has(document) ) {
+        unmount_feedback_chip();
+        resume_feedback_outbox();
+        return;
+    }
     let chip = document.querySelector('button.ezil-feedback-chip');
     if ( ! chip ) {
         chip = document.createElement('button');
@@ -545,7 +555,7 @@ export function open_feedback_dialog (_opts) {
         && typeof trusted.appSession === 'string' && trusted.appSession.length > 0;
     const computer = hasAppContext ? trusted.computerId : currentComputer()?.id;
     let computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
-    const appContext = Object.freeze({ computerId, ...(hasAppContext ? { appSession: trusted.appSession } : {}),
+    const appContext = Object.freeze({ userId: ownerAccount, computerId, ...(hasAppContext ? { appSession: trusted.appSession } : {}),
         ...(hasAppContext && typeof trusted.traceId === 'string' && UUID.test(trusted.traceId) ? { traceId: trusted.traceId } : {}) });
     const queuedEntry = draft ? read_outbox().find(entry => entry.clientRequestId === clientRequestId) : null;
     const screenshotsAvailable = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshots === true;

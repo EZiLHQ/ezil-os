@@ -1,4 +1,5 @@
 import { after } from 'next/server';
+import type { assignmentMigrationClock } from './assignment-migration-clock';
 import { pendingRecovery, TERMINAL_MIGRATION_STATES } from './provider-migrate';
 import { MigrationConflictError, type ComputeMigration, type createProviderMigrationStore, type MigrationFailureReason, type MigrationStoreEvent } from './provider-migrate-store';
 import type { MigrateBeginResult, MigrateCommitInput, MigrateResult } from '../cloudflare-guacamole-provider';
@@ -21,6 +22,7 @@ export interface MigrationDeps {
     abort(m: ComputeMigration): Promise<MigrateResult<unknown>>;
     reopen(m: ComputeMigration, etag: string): Promise<MigrateResult<unknown>>;
     stopCloudflare(m: ComputeMigration): Promise<void>;
+    assignmentClock?: ReturnType<typeof assignmentMigrationClock>;
 }
 export class MigrationStepError extends Error {
     constructor(readonly retryable: boolean, readonly reason?: MigrationFailureReason) { super('migration_step_failed'); }
@@ -60,10 +62,15 @@ export async function advanceMigration(deps: MigrationDeps, migrationId: string)
                     if (error instanceof MigrationConflictError) throw error;
                     await transition({ type: 'error', step: effect, retryable: false,
                         reason: error instanceof MigrationStepError ? error.reason : undefined });
+                    return;
                 }
+                await deps.assignmentClock?.flush(m.id).catch(() => {
+                    console.warn('[compute.migration] assignment clock delivery pending', { migrationId: m.id });
+                });
             };
             const recovery = pendingRecovery(m);
             if (recovery) { await recover(recovery); return; }
+            if (m.state !== 'requested' && deps.assignmentClock && !await deps.assignmentClock.flush(m.id)) return;
             let step: string = m.state;
             try {
                 switch (m.state) {
@@ -173,6 +180,15 @@ export async function advanceStaleMigrations(startedAt = Date.now()): Promise<vo
     try {
         const { defaultMigrationDeps } = await import('./provider-migrate-runtime');
         const deps = await defaultMigrationDeps();
+        const clock = deps.assignmentClock;
+        if (clock && Date.now() - startedAt < 40_000) {
+            try {
+                for (const id of await clock.pendingCompletions(10)) {
+                    if (Date.now() - startedAt >= 40_000) break;
+                    await deps.exclusive(id, async () => { await clock.flush(id); });
+                }
+            } catch { console.warn('[compute.migration] assignment clock delivery pending'); }
+        }
         await sweepMigrations({ claimStale: deps.store.claimStale, advance: id => advanceMigration(deps, id), startedAt,
             log: id => console.warn('[compute.migration]', { migrationId: id }) });
     } catch { /* Preserve the billing sweep if migration storage is unavailable. */ }

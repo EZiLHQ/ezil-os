@@ -284,6 +284,34 @@ try {
         feedbackSubmitSchema.parse(JSON.parse(body));
         assert.ok(new TextEncoder().encode(body).byteLength < 32 * 1024, `${new TextEncoder().encode(body).byteLength} bytes`);
     });
+    for (const [realm, tier] of [['production', ''], ['staging', '-staging']]) {
+        await check('only an embedded Universe assignment suppresses the feedback chip across native app history (' + realm + ')', () => {
+            const attempt = '26685417-c1e4-4cc9-a136-cf9b4d72e1f6';
+            const repo = 'https://github.ezil.work/default/u-1234567890abcdef-a-' + attempt + '.git';
+            const home = 'https://os' + tier + '.ezil.work/app/code?' + new URLSearchParams({repo, assignment: attempt});
+            const top = new JSDOM('<iframe></iframe>', {url: 'https://universe' + tier + '.ezil.work/assignment/work'});
+            const frame = top.window.document.querySelector('iframe');
+            frame.src = home;
+            const child = frame.contentWindow;
+            child.__EZIL_BOOT__ = window.__EZIL_BOOT__;
+            const globals = {window: globalThis.window, document: globalThis.document};
+            try {
+                Object.defineProperty(globalThis, 'window', {configurable: true, value: child});
+                Object.defineProperty(globalThis, 'document', {configurable: true, value: child.document});
+                assert.equal(feedback.feedback_enabled(), true);
+                feedback.mount_feedback_chip();
+                assert.equal(child.document.querySelector('button.ezil-feedback-chip'), null);
+                child.history.replaceState(null, '', '/os');
+                feedback.mount_feedback_chip();
+                assert.equal(child.document.querySelector('button.ezil-feedback-chip'), null);
+            } finally {
+                child.dispatchEvent(new child.Event('ezil:teardown'));
+                top.window.close();
+                for (const key of ['window', 'document'])
+                    Object.defineProperty(globalThis, key, {configurable: true, value: globals[key]});
+            }
+        });
+    }
     await check('in-app icon: mounted once, icon only, hidden on the home screen, shown only while an app window is open', async () => {
         feedback.mount_feedback_chip(); feedback.mount_feedback_chip();
         assert.equal(document.querySelectorAll('.ezil-feedback-chip').length, 1);
@@ -695,6 +723,34 @@ try {
         assert.equal(snapshot.tracePhases[0].code, 'display');
         diagnosticsSchema.parse(snapshot);
         delete window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle;
+    });
+    await check('consented feedback includes only the current checkout lifecycle codes and ages', () => {
+        const key = 'ezil-os:code-lifecycle:v1';
+        const userId = window.__EZIL_BOOT__.user.id;
+        const now = Date.now();
+        window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle = true;
+        window.sessionStorage.setItem(key, JSON.stringify({ userId, computerId, entries: [
+            { code: 'opened', t: now - 31 * 60_000 },
+            { code: 'page_hidden', t: now - 100, extra: 'private_fixture_url' },
+            { code: 'opened_after_reload', t: now - 50 },
+            { code: 'attacker_supplied_code', t: now - 10 },
+        ] }));
+        try {
+            assert.equal(build_diagnostics({ userId, computerId: 'another-computer' }).recentEvents
+                .some(event => event.eventClass === 'code_lifecycle'), false);
+            assert.equal(build_diagnostics({ userId: 'another-user', computerId }).recentEvents
+                .some(event => event.eventClass === 'code_lifecycle'), false);
+            open();
+            const events = payload().diagnostics.recentEvents.filter(event => event.eventClass === 'code_lifecycle');
+            assert.deepEqual(events.map(event => event.code), ['page_hidden', 'opened_after_reload']);
+            assert.ok(events.every(event => Number.isInteger(event.ageMs)));
+            assert.ok(!JSON.stringify(events).includes(userId) && !JSON.stringify(events).includes('private_fixture_url'));
+            diagnosticsSchema.parse(payload().diagnostics);
+            change('diagnostics', false); assert.equal(payload().diagnostics, null);
+        } finally {
+            close(); window.sessionStorage.removeItem(key);
+            delete window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle;
+        }
     });
     await check('quota failure retains text and never claims an image report is saved for automatic retry', async () => {
         open(); setDescription('Keep my report when storage fills');

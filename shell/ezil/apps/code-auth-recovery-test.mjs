@@ -34,6 +34,35 @@ test('unknown status uses the guarded full OS auth bootstrap instead of a perman
     assert.deepEqual(next.seen, ['unknown']); next.state.retry(); await flush();
     assert.deepEqual(next.seen, ['unknown', 'full-os-reload']);
 });
+test('offline preview recovery keeps the OS page and the guard available for reconnect', async () => {
+    for (const type of [CODE_AUTH_REQUIRED, CODE_ORIGIN_UNAVAILABLE]) {
+        let online = false;
+        const actions = [];
+        const h = setup({ online: () => online, onAction: action => actions.push(action),
+            reopen: () => actions.push('reopen') });
+        h.send({ data: { type } }); await flush();
+        assert.equal(h.state.probes, 0);
+        assert.equal(h.store.size, 0);
+        assert.deepEqual(h.seen, ['unknown']);
+        assert.deepEqual(actions, ['recovery_offline']);
+        online = true; h.state.retry(); await flush();
+        assert.equal(h.state.probes, 1);
+        if (type === CODE_AUTH_REQUIRED) {
+            assert.deepEqual(h.seen, ['unknown', 'full-os-reload']);
+            assert.deepEqual(actions, ['recovery_offline', 'auth_reload']);
+        } else {
+            assert.deepEqual(actions, ['recovery_offline', 'origin_reopen', 'reopen']);
+        }
+        h.dispose();
+    }
+});
+test('a disconnect during the preview status probe does not reload the OS', async () => {
+    let online = true, resolve;
+    const h = setup({ online: () => online, desktopRunning: () => new Promise(r => { resolve = r; }) });
+    h.send(); online = false; resolve(undefined); await flush();
+    assert.deepEqual(h.seen, ['unknown']);
+    assert.equal(h.store.size, 0);
+});
 test('actual session desktopRunning maps expired401, redirectHTML and network failure to unknown; each can rebootstrap', async () => {
     const { desktopRunning } = await import('../session.js');
     const originalFetch = globalThis.fetch;

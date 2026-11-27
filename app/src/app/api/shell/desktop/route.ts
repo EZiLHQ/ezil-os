@@ -158,9 +158,8 @@ export async function POST(req: Request) {
         };
 
         const preview = await caller.cloudflareGuacamole.previewUrl({
-            // The session id is a correlation key only. Defaulting it to the
-            // computer id matches what `/computer/[id]` already passes, so the
-            // shell path and the fallback path correlate identically in logs.
+            // The session id is a correlation key only; it defaults to the
+            // computer id, so one computer's requests correlate in logs.
             sessionId: sessionId ?? computerId,
             computerId,
             screen,

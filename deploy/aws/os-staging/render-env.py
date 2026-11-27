@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -73,12 +74,22 @@ EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR_SHA256 EZIL_
 EZIL_NATIVE_GATEWAY_POLICY_ID EZIL_NATIVE_GATEWAY_SERVICE_CREDENTIAL EZIL_NATIVE_GATEWAY_SERVICE_EXPIRES_AT
 EZIL_NATIVE_QUALIFICATION_TARGET
 """.split())
+ASSIGNMENT_GATE = "EZIL_ASSIGNMENT_PRODUCTION_ENABLED"
+ASSIGNMENT_SIGNER = "UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET"
+ASSIGNMENT_CA = "UNIVERSE_ASSIGNMENT_API_CA_PEM"
+PRODUCTION_ASSIGNMENT = frozenset((ASSIGNMENT_GATE, ASSIGNMENT_SIGNER, ASSIGNMENT_CA))
+PRODUCTION_UNIVERSE_ORIGIN = "https://universe.ezil.work"
+ASSIGNMENT_CA_MAX_LENGTH = 16384
+ASSIGNMENT_CA_PEM = re.compile(
+    r"-----BEGIN CERTIFICATE-----\n([A-Za-z0-9+/=\n]+)\n-----END CERTIFICATE-----\n?"
+)
 PRODUCTION_BROWSER_GATE = "EZIL_DELEGATED_BROWSER_PROD_CANARY"
 PRODUCTION_BROWSER_PINS = (
     "EZIL_BROWSER_PROD_CANARY_USER_ID", "EZIL_BROWSER_PROD_CANARY_COMPUTER_ID",
     "EZIL_BROWSER_PROD_CANARY_TEST_ORIGIN",
 )
-PRODUCTION_BROWSER = frozenset((PRODUCTION_BROWSER_GATE, *PRODUCTION_BROWSER_PINS))
+BROWSER_RELAY_SWITCHES = ("EZIL_DELEGATED_BROWSER_OBSERVE", "EZIL_DELEGATED_BROWSER_CONTROL")
+PRODUCTION_BROWSER = frozenset((PRODUCTION_BROWSER_GATE, *PRODUCTION_BROWSER_PINS, *BROWSER_RELAY_SWITCHES))
 PRODUCTION_BROWSER_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 NATIVE_SWITCHES = ("EZIL_NATIVE_SESSIONS", "EZIL_NATIVE_AUTH_INTENTS",
                    "EZIL_NATIVE_HOST_TRANSPORT", "EZIL_NATIVE_RUNTIME_CONTROL")
@@ -86,6 +97,13 @@ NATIVE_SWITCHES = ("EZIL_NATIVE_SESSIONS", "EZIL_NATIVE_AUTH_INTENTS",
 # unsafe pin as "not configured" and anything but the exact gate value "enabled" as off, so the
 # renderer refuses what the receiver would silently ignore. Off unless the gate is "enabled".
 DELEGATION_GATE = "EZIL_DELEGATED_COMPUTER_READS"
+EDITOR_SWITCHES = ("EZIL_DELEGATED_EDITOR_SESSIONS", "EZIL_EDITOR_BRIDGE", "EZIL_EDITOR_BRIDGE_CONTROLS")
+ONBOARDING_GATE = "EZIL_DELEGATED_ONBOARDING"
+MCP_BOOTSTRAP_CLIENT = "EZIL_MCP_IDENTITY_BOOTSTRAP_AUTH0_CLIENT_ID"
+EDITOR_PRODUCER_PINS = ("EZIL_EDITOR_WORKER_ORIGIN", "EZIL_EDITOR_WORKER_PROTOCOL")
+OS_PUBLIC_ORIGIN = "EZIL_OS_PUBLIC_ORIGIN"
+PREVIEW_TOKEN_V2 = "EZIL_PREVIEW_TOKEN_V2"
+PRODUCTION_EDITOR = frozenset((*EDITOR_SWITCHES, ONBOARDING_GATE, MCP_BOOTSTRAP_CLIENT, *EDITOR_PRODUCER_PINS, OS_PUBLIC_ORIGIN, PREVIEW_TOKEN_V2))
 DELEGATION_PINS = ("EZIL_DELEGATION_ISSUER", "EZIL_DELEGATION_AUDIENCE",
                    "EZIL_DELEGATION_PUBLIC_JWKS", "EZIL_DELEGATION_CLIENT_IDS")
 # Caddy serves exactly these two names for production OS; the audience is the origin the MCP signs.
@@ -110,12 +128,16 @@ class RenderError(Exception):
 def validate(values, environment="staging"):
     if not isinstance(values, dict):
         raise RenderError("Expected a JSON object")
-    allowed = REQUIRED | OPTIONAL | ((PRODUCTION_NATIVE | PRODUCTION_BROWSER) if environment == "production" else frozenset())
+    allowed = REQUIRED | OPTIONAL
+    if environment == "production":
+        allowed |= PRODUCTION_NATIVE | PRODUCTION_BROWSER | PRODUCTION_ASSIGNMENT | PRODUCTION_EDITOR
     if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):
         raise RenderError("Unknown key refused")
     if REQUIRED - values.keys():
         raise RenderError("Missing required key")
-    for value in values.values():
+    for key, value in values.items():
+        if key == ASSIGNMENT_CA and isinstance(value, str) and value:
+            continue  # The production CA validator below handles complete PEM input.
         if not isinstance(value, str) or not value or value != value.strip():
             raise RenderError("Expected nonempty strings without surrounding whitespace")
         if any(c in value for c in "\r\n\0"):
@@ -125,6 +147,8 @@ def validate(values, environment="staging"):
     validate_delegation(values, environment)
     if environment == "production":
         validate_production(values)
+        validate_production_editor(values)
+        return validate_production_assignment(values)
     elif any(marker in value for value in values.values() for marker in PRODUCTION_MARKERS):
         raise RenderError("Staging refuses production API or database values")
     elif any(value.startswith(LIVE_STRIPE) for value in values.values()):
@@ -208,7 +232,57 @@ def validate_delegation(values, environment):
     delegation_jwks(values["EZIL_DELEGATION_PUBLIC_JWKS"])
 
 
+def validate_production_editor(values):
+    """Opt-in production candidate only; never synthesize gates or reuse staging pins."""
+    switches = tuple(values.get(name) for name in EDITOR_SWITCHES)
+    onboarding = values.get(ONBOARDING_GATE)
+    if any(value not in (None, "enabled", "disabled") for value in (*switches, onboarding)):
+        raise RenderError("Editor and onboarding switches must be exactly enabled or disabled")
+    enabled_editor = "enabled" in switches
+    if OS_PUBLIC_ORIGIN in values and values[OS_PUBLIC_ORIGIN] != "https://os.ezil.work":
+        raise RenderError("Production OS public origin must be canonical")
+    producer = tuple(values.get(name) for name in EDITOR_PRODUCER_PINS)
+    if producer != (None, None) and producer != ("https://api-desktop.ezil.org", "2"):
+        raise RenderError("Editor producer pins require the canonical production Worker and protocol 2")
+    preview = values.get(PREVIEW_TOKEN_V2)
+    if preview not in (None, "0", "1"):
+        raise RenderError("Preview token v2 must be exactly 0 or 1")
+    if enabled_editor and switches[:2] != ("enabled", "enabled"):
+        raise RenderError("Editor requires both session and bridge base switches")
+    if enabled_editor or onboarding == "enabled":
+        if (values.get(DELEGATION_GATE) != "enabled"
+            or any(pin not in values for pin in DELEGATION_PINS)
+            or values.get("EZIL_DELEGATION_ISSUER") != "https://connect.ezil.work"
+            or values.get("EZIL_DELEGATION_AUDIENCE") != "https://os.ezil.work"):
+            raise RenderError("Production editor/onboarding requires canonical Connect and OS delegation pins")
+    if (enabled_editor or preview == "1") and (
+        values.get("CLOUDFLARE_GUACAMOLE_WORKER_URL") != "https://api-desktop.ezil.org"
+        or not values.get("CLOUDFLARE_GUACAMOLE_HMAC_SECRET")
+        or producer != ("https://api-desktop.ezil.org", "2")
+    ):
+        raise RenderError("Production editor requires the canonical authenticated producer Worker")
+    if (enabled_editor or onboarding == "enabled") and values.get(OS_PUBLIC_ORIGIN) != "https://os.ezil.work":
+        raise RenderError("Production editor/onboarding requires canonical OS public origin")
+    client = values.get(MCP_BOOTSTRAP_CLIENT)
+    if client is not None and (onboarding != "enabled" or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", client)):
+        raise RenderError("MCP bootstrap requires onboarding and one legitimate upstream Auth0 client ID")
+
+
 def validate_production_browser(values):
+    # The source-bound relay remains off by default. These independent switches
+    # only render configuration; producer/target admission still needs its own proof.
+    relay = tuple(values.get(name) for name in BROWSER_RELAY_SWITCHES)
+    if any(value not in (None, "enabled", "disabled") for value in relay):
+        raise RenderError("Browser relay switches must be exactly enabled or disabled")
+    if "enabled" in relay and (
+        values.get(DELEGATION_GATE) != "enabled"
+        or any(pin not in values for pin in DELEGATION_PINS)
+        or values.get("EZIL_DELEGATION_ISSUER") != "https://connect.ezil.work"
+        or values.get("EZIL_DELEGATION_AUDIENCE") != "https://os.ezil.work"
+        or values.get("CLOUDFLARE_GUACAMOLE_WORKER_URL") != "https://api-desktop.ezil.org"
+        or not values.get("CLOUDFLARE_GUACAMOLE_HMAC_SECRET")
+    ):
+        raise RenderError("Browser relay requires canonical authenticated production delegation and Worker pins")
     gate = values.get(PRODUCTION_BROWSER_GATE)
     if gate not in (None, "enabled", "disabled"):
         raise RenderError("Production Browser canary gate must be exactly enabled or disabled")
@@ -229,6 +303,47 @@ def validate_production_browser(values):
         or not values.get("CLOUDFLARE_GUACAMOLE_HMAC_SECRET")
     ):
         raise RenderError("Production Browser canary requires the canonical connector, OS and Cloudflare Worker pins")
+
+
+def assignment_ca_env_value(raw):
+    """Parse one public trust anchor and pack the canonical PEM into one raw Compose line."""
+    if len(raw) > ASSIGNMENT_CA_MAX_LENGTH:
+        raise RenderError("Production assignment ingress requires one valid CA certificate")
+    pem = raw.replace("\r\n", "\n").replace(r"\r\n", "\n").replace(r"\n", "\n")
+    match = ASSIGNMENT_CA_PEM.fullmatch(pem)
+    try:
+        if not match:
+            raise ValueError
+        der = base64.b64decode(match[1].replace("\n", ""), validate=True)
+        pem = ssl.DER_cert_to_PEM_cert(der)
+        trust = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        trust.load_verify_locations(cadata=pem)
+        if trust.get_ca_certs(binary_form=True) != [der]:
+            raise ValueError
+        packed = pem.replace("\n", r"\n")
+        if len(packed) > ASSIGNMENT_CA_MAX_LENGTH:
+            raise ValueError
+        return packed
+    except (ValueError, ssl.SSLError):
+        raise RenderError("Production assignment ingress requires one valid CA certificate") from None
+
+
+def validate_production_assignment(values):
+    gate = values.get(ASSIGNMENT_GATE)
+    if gate not in (None, "0", "1"):
+        raise RenderError("Production assignment gate must be exactly 0 or 1")
+    if gate != "1":
+        if ASSIGNMENT_SIGNER in values or ASSIGNMENT_CA in values:
+            raise RenderError("Production assignment credentials require the enabled gate")
+        return values
+    if values.get("UNIVERSE_PROJECT_REPO_ORIGIN") != PRODUCTION_UNIVERSE_ORIGIN \
+            or values.get("BILLING_FUNDING_URL") != PRODUCTION_FUNDING_URL:
+        raise RenderError("Production assignments require the canonical Universe and funding origins")
+    if len(values.get(ASSIGNMENT_SIGNER, "")) < 32:
+        raise RenderError("Production assignment signer requires at least 32 characters")
+    if ASSIGNMENT_CA not in values:
+        return values
+    return {**values, ASSIGNMENT_CA: assignment_ca_env_value(values[ASSIGNMENT_CA])}
 
 
 def validate_production(values):

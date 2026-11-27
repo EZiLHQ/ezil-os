@@ -11,7 +11,8 @@ import type { SubscriptionRow } from '@/server/billing/meters';
 import type { BillingDeps, BillingStore, GrantRow, PaymentIssueRow } from '@/server/billing/ports';
 import { billingV2EntitlementReader, gateComputerStart, loadComputeBillingState, paidComputeUnmeteredState } from '@/server/billing/v2/compute-access';
 import { paidCloudflareCandidates } from '@/server/lib/compute/placement';
-import { readPaidPoolEligibility } from '@/server/lib/compute/ready-pool';
+import { readPaidPoolEligibility, readPoolDemand } from '@/server/lib/compute/ready-pool';
+import { aiIncludedModelsFor } from '@/server/billing/v3/ai-models';
 import { sourceCatalog, type Result } from './contract';
 import type { CommandStore } from './service';
 import { handleAdminEntitlementRequest, type Endpoint } from './http';
@@ -55,6 +56,7 @@ describe.skipIf(!MODULE)('operator reader parity on offline PostgreSQL', () => {
         subscriptionsFor: async (): Promise<SubscriptionRow[]> => (await rows(sql`SELECT * FROM public.ezil_billing_subscriptions WHERE user_id = ${USER}::uuid`)).map(r => ({
             stripeSubscriptionId: String(r.stripe_subscription_id), sku: String(r.sku), status: String(r.status),
             currentPeriodStart: date(r.current_period_start), currentPeriodEnd: date(r.current_period_end), cancelAtPeriodEnd: r.cancel_at_period_end === true,
+            trialEnd: date(r.trial_end), firstPaidAt: date(r.first_paid_at),
         })),
         openPaymentIssues: async (): Promise<PaymentIssueRow[]> => (await rows(sql`SELECT * FROM public.ezil_billing_payment_issues WHERE user_id = ${USER}::uuid`)).map(r => ({
             userId: USER, subscriptionId: String(r.subscription_id), invoiceKind: String(r.invoice_kind), issue: String(r.issue),
@@ -73,7 +75,7 @@ describe.skipIf(!MODULE)('operator reader parity on offline PostgreSQL', () => {
     const command = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
         format: 'ezil.admin-entitlement-command.v1', command_id: randomUUID(), action: 'assign', producer: 'ezil-os', scope: 'individual',
         operator: { via: 'auth0_operator', actor: 'synthetic_operator', email: null }, product: { ref: 'standard_monthly_v3', catalog_revision: REVISION },
-        target, quantity: null, starts_at: null, validity: { until_revoked: true }, reason: 'Synthetic local reader regression', assignment: null,
+        target, quantity: null, starts_at: null, validity: { ends_at: '2026-12-04T13:30:00.000Z' }, reason: 'Synthetic local reader regression', assignment: null,
         billing_effect: 'none', credit_option: 'none', ...over,
     });
     const request = async (endpoint: Endpoint, body?: Record<string, unknown>) => {
@@ -111,15 +113,26 @@ describe.skipIf(!MODULE)('operator reader parity on offline PostgreSQL', () => {
             CREATE TABLE auth.users (id uuid PRIMARY KEY, deleted_at timestamptz, banned_until timestamptz, is_anonymous boolean);
             CREATE TABLE ezil_works.ai_members (auth_user_id uuid, public_id uuid);
             CREATE TABLE public.ezil_billing_subscriptions (stripe_subscription_id text PRIMARY KEY, user_id uuid, sku text, status text,
-                current_period_start timestamptz, current_period_end timestamptz, cancel_at_period_end boolean);
+                current_period_start timestamptz, current_period_end timestamptz, cancel_at_period_end boolean,
+                trial_end timestamptz, first_paid_at timestamptz);
             CREATE TABLE public.ezil_billing_size_preferences (user_id uuid PRIMARY KEY, size text);
             CREATE TABLE public.ezil_billing_grants (id text, user_id uuid, subscription_id text, meter text, amount bigint, period_start timestamptz, period_end timestamptz);
             CREATE TABLE public.ezil_billing_payment_issues (user_id uuid, subscription_id text, invoice_kind text, resolved_at timestamptz, issue text, stripe_event_created timestamptz);
-            CREATE TABLE public.ezil_computers (id uuid PRIMARY KEY, user_id uuid, slot int DEFAULT 1, deleted_at timestamptz);
-            CREATE TABLE public.ezil_computer_placements (computer_id uuid PRIMARY KEY, provider text);
+            CREATE TABLE public.ezil_computers (id uuid PRIMARY KEY, user_id uuid, slot int DEFAULT 1, deleted_at timestamptz, metadata jsonb);
+            CREATE TABLE public.ezil_computer_placements (computer_id uuid PRIMARY KEY, provider text, owner_user_id uuid,
+                region text, zone_id text, instance_type text, state text, instance_id text, lifecycle_job_id uuid);
+            CREATE TABLE public.ezil_compute_pool_hosts (id uuid, region text, zone_id text, instance_type text, state text,
+                health text, instance_id text, ready_at timestamptz, editor_ready_at timestamptz, enrolled_at timestamptz,
+                created_at timestamptz, generation bigint, leased_computer_id uuid, leased_at timestamptz, leased_generation bigint,
+                lease_token uuid, claim_generation bigint, claim_lease_epoch bigint, claim_fence text, claim_volume_serial text);
+            CREATE TABLE public.ezil_compute_capacity_demands (region text, closed_at timestamptz, expires_at timestamptz, vcpu int, cleanup jsonb);
+            CREATE TABLE public.ezil_billing_compute_epochs (id uuid, subscription_id text, user_id uuid, computer_id uuid, size text, ready_at timestamptz);
             CREATE TABLE public.ezil_compute_migrations (computer_id uuid, user_id uuid, state text, last_error text, updated_at timestamptz);`);
-        await pg.exec(readFileSync(path.resolve(__dirname, '../../../../drizzle/0019_operator_entitlements.sql'), 'utf8'));
-        await pg.exec(readFileSync(path.resolve(__dirname, '../../../../drizzle/0020_operator_refusal_receipts.sql'), 'utf8'));
+        const drizzle = path.resolve(__dirname, '../../../../drizzle');
+        // Production has its own 0034 history. Qualify this exact 0038 on 0019/0020, independently of 0023 and 0034–0037.
+        for (const file of ['0019_operator_entitlements.sql', '0020_operator_refusal_receipts.sql', '0038_operator_access_overrides.sql']) {
+            await pg.exec(readFileSync(path.join(drizzle, file), 'utf8'));
+        }
     });
     beforeEach(async () => {
         now = new Date(NOW); resetOperatorEntitlementsInstalled();
@@ -282,11 +295,11 @@ describe.skipIf(!MODULE)('operator reader parity on offline PostgreSQL', () => {
 
     it('refusal receipt: a stale revision cannot apply once that revision later exists', async () => {
         const assigned = await assign();
-        const stale = command({ action: 'change', product: null, validity: { ends_at: '2026-12-04T00:00:00.000Z' },
+        const stale = command({ action: 'change', product: { ref: 'premium_monthly_v3', catalog_revision: REVISION }, validity: null,
             assignment: { ref: assigned.assignment!.ref, expected_revision: 2 } });
         const first = await send(stale);
         expect(first.refusal?.code).toBe('stale_revision');
-        expect(await send(command({ action: 'change', product: null, validity: { ends_at: '2026-11-11T00:00:00.000Z' },
+        expect(await send(command({ action: 'change', product: { ref: 'premium_monthly_v3', catalog_revision: REVISION }, validity: null,
             assignment: { ref: assigned.assignment!.ref, expected_revision: 1 } }))).toMatchObject({ assignment: { revision: 2 } });
         const before = await rows(sql`SELECT * FROM public.ezil_operator_entitlements`);
         expect(await send(stale)).toEqual(first);
@@ -316,7 +329,7 @@ describe.skipIf(!MODULE)('operator reader parity on offline PostgreSQL', () => {
             } }));
         let result: Result;
         try {
-            result = await send(command({ action: 'change', product: null, validity: { ends_at: '2026-11-11T00:00:00.000Z' },
+            result = await send(command({ action: 'change', product: { ref: 'premium_monthly_v3', catalog_revision: REVISION }, validity: null,
                 assignment: { ref: assigned.assignment!.ref, expected_revision: 1 } }));
         } finally { source.withCommand = original; }
         expect(result.refusal?.code).toBe('stale_revision');
@@ -334,6 +347,226 @@ describe.skipIf(!MODULE)('operator reader parity on offline PostgreSQL', () => {
         await expect(db.execute(sql`UPDATE public.ezil_operator_entitlement_events SET reason = 'changed'`)).rejects.toThrow(/append-only/);
         await expect(db.execute(sql`DELETE FROM public.ezil_operator_entitlement_events`)).rejects.toThrow(/append-only/);
         expect(await send(body)).toEqual(first);
+    });
+
+    // --- access_override: an explicit operator override that wins over funded Stripe (raw wire key, no contract import) ---
+    const ORDINARY_END = '2026-12-04T13:30:00.000Z'; // an ordinary grant: one calendar month after NOW (addCalendarMonthUtc)
+    // An override's explicit, short end. Deliberately not the legacy month: a source that ignored the sent validity and
+    // computed the ordinary month would fail the exact-end assertions instead of passing by accident.
+    const OVERRIDE_END = '2026-11-06T13:30:00.000Z';
+    const STRIPE_END = '2026-12-24T00:00:00.000Z'; // the live Stripe period outlasts both ends
+    const FREE = { ref: 'free_v3', catalog_revision: REVISION }, STANDARD = { ref: 'standard_monthly_v3', catalog_revision: REVISION };
+    const PREMIUM = { ref: 'premium_monthly_v3', catalog_revision: REVISION };
+    const override = (over: Record<string, unknown> = {}) => command({ product: FREE, validity: { ends_at: OVERRIDE_END }, access_override: true, ...over });
+    /** A funded live Stripe Standard: plain `active`, or a real `trialing` row whose trial has paid (trial_end + first_paid_at set, as 0021 stores). */
+    const fundedStripeStandard = async (status: 'active' | 'trialing' = 'active') => {
+        const trialEnd = status === 'trialing' ? '2026-11-23T00:00:00.000Z' : null, firstPaidAt = status === 'trialing' ? START : null;
+        await db.execute(sql`INSERT INTO public.ezil_billing_subscriptions VALUES ('sub_synthetic', ${USER}::uuid, 'standard_monthly_v3', ${status},
+            ${START}::timestamptz, ${STRIPE_END}::timestamptz, false, ${trialEnd}::timestamptz, ${firstPaidAt}::timestamptz)`);
+        await db.execute(sql`INSERT INTO public.ezil_billing_grants (id, user_id, subscription_id, meter, amount, period_start, period_end)
+            VALUES (${randomUUID()}, ${USER}::uuid, 'sub_synthetic', 'compute_std_seconds', 1800000, ${START}::timestamptz, ${STRIPE_END}::timestamptz)`);
+    };
+    const STRIPE_LIVE = expect.stringMatching(/^(active|trialing)$/);
+    const stripeSnapshot = async () => ({
+        subscriptions: await rows(sql`SELECT * FROM public.ezil_billing_subscriptions ORDER BY stripe_subscription_id`),
+        grants: await rows(sql`SELECT * FROM public.ezil_billing_grants ORDER BY id`),
+    });
+    const expectFreeEverywhere = async () => {
+        expect(await state()).toMatchObject({ planSku: 'free_v3', provider: 'cloudflare', entitledSize: 'free-cf' });
+        expect(await reader()).toMatchObject({ planId: 'free_v3' });
+        expect(await assignmentRead()).toMatchObject({ effective_access: { state: 'active', product_ref: 'free_v3', via: 'operator' },
+            stripe: { state: STRIPE_LIVE, product_ref: 'standard_monthly_v3' } });
+        const gate = (kind: 'cloudflare' | 'aws-ec2', instanceType: string | null) => gateComputerStart({ deps: billing, userId: USER, computerId: COMPUTER, kind, instanceType, now });
+        // Free admission: Cloudflare opens; a held existing AWS machine opens only as std-2 (the intentional C8 hold);
+        // a larger AWS class stays closed and no new AWS placement is sized from the entitlement.
+        expect(await gate('cloudflare', null)).toEqual({ allowed: true });
+        expect(await gate('aws-ec2', 'm6i.large')).toEqual({ allowed: true });
+        expect(await gate('aws-ec2', 'm6i.2xlarge')).toEqual({ allowed: false, reason: 'files_on_aws' });
+        expect(await gate('aws-ec2', null)).toEqual({ allowed: false, reason: 'size_not_allowed' });
+        expect(await pool()).toBeNull(); expect(await migration()).toEqual([]);
+    };
+    const expectStripeStandardRestored = async () => {
+        expect(await state()).toMatchObject({ planSku: 'standard_monthly_v3', provider: 'aws', planActive: true });
+        expect(await reader()).toMatchObject({ planId: 'standard_monthly_v3' });
+        expect(await assignmentRead()).toMatchObject({ effective_access: { state: 'active', product_ref: 'standard_monthly_v3', via: 'stripe' },
+            stripe: { state: STRIPE_LIVE, product_ref: 'standard_monthly_v3' } });
+        expect(await pool()).toEqual({ instanceType: 'm6i.large' });
+        expect(await migration()).toEqual([{ userId: USER, computerId: COMPUTER, toSize: 'standard' }]);
+    };
+
+    it('access_override: legacy commands keep their wire behaviour (Free refused without override; no override flag on a plain assign)', async () => {
+        expect(await send(command({ product: FREE }))).toMatchObject({ refusal: { code: 'product_not_assignable' } });
+        const plain = await assign();
+        expect((plain.assignment as unknown as Record<string, unknown>).access_override).not.toBe(true);
+        expect(plain.assignment).toMatchObject({ product_ref: 'standard_monthly_v3', revision: 1, ends_at: ORDINARY_END, until_revoked: false });
+        expect(await send(override({ access_override: 'yes' }))).toMatchObject({ refusal: { code: 'invalid_command' } });
+    });
+
+    it('access_override: the flag is covered by the sender signature, so a tampered body is unauthorized before parsing', async () => {
+        const signed = command({ product: STANDARD }), sent = { ...signed, access_override: true };
+        const timestamp = Math.floor(now.getTime() / 1000), url = new URL('https://os.synthetic.test/api/gateway/admin-entitlements/v1/commands');
+        const signature = sign(null, signingInput('POST', url.pathname, timestamp, new TextEncoder().encode(JSON.stringify(signed))), TEST_PRIVATE).toString('base64url');
+        const response = await handleAdminEntitlementRequest(new Request(url, { method: 'POST', body: JSON.stringify(sent),
+            headers: { [HEADERS.kid]: 'synthetic-ae', [HEADERS.timestamp]: String(timestamp), [HEADERS.signature]: signature } }),
+            'commands', { deps: async () => source, nowSeconds: () => timestamp });
+        expect(response.status).toBe(401);
+        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlement_events`)).toEqual([]);
+        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlements`)).toEqual([]);
+    });
+
+    it('access_override: explicit Free over funded live Stripe Standard decides every reader, then Standard → Premium → end converge and restore Stripe', async () => {
+        await fundedStripeStandard();
+        const before = await stripeSnapshot();
+        await expectStripeStandardRestored(); // the funded Stripe Standard is in effect before any command
+        const assigned = await send(override());
+        expect(assigned).toMatchObject({ outcome: 'applied', assignment: { product_ref: 'free_v3', revision: 1, starts_at: NOW.toISOString(), ends_at: OVERRIDE_END, access_override: true },
+            effective_access: { state: 'active', product_ref: 'free_v3', via: 'operator' } });
+        expect(await send(override())).toMatchObject({ refusal: { code: 'invalid_command' } }); // one live override per account (the ordinary grant is an independent slot)
+        await expectFreeEverywhere();
+        expect((await readOperatorEntitlements(db, USER)).map(g => [g.sku, g.revision, g.endedAt])).toEqual([['free_v3', 1, null]]);
+        expect(await stripeSnapshot()).toEqual(before);
+
+        const ref = assigned.assignment!.ref;
+        const change = (product: typeof STANDARD, expected_revision: number) => send(command({ action: 'change', product, validity: null,
+            assignment: { ref, expected_revision }, access_override: true }));
+        const toStandard = await change(STANDARD, 1);
+        expect(toStandard).toMatchObject({ outcome: 'applied', assignment: { product_ref: 'standard_monthly_v3', revision: 2, ends_at: OVERRIDE_END, access_override: true },
+            effective_access: { state: 'active', product_ref: 'standard_monthly_v3', via: 'operator' } });
+        expect(await state()).toMatchObject({ planSku: 'standard_monthly_v3', provider: 'aws', entitledSize: 'std-2' });
+        expect(await assignmentRead()).toMatchObject({ effective_access: { product_ref: 'standard_monthly_v3', via: 'operator' } });
+        expect(await pool()).toEqual({ instanceType: 'm6i.large' });
+        expect(await migration()).toEqual([{ userId: USER, computerId: COMPUTER, toSize: 'standard' }]);
+        expect(await change(STANDARD, 1)).toMatchObject({ refusal: { code: 'stale_revision' } });
+
+        const toPremium = await change(PREMIUM, 2);
+        expect(toPremium).toMatchObject({ outcome: 'applied', assignment: { product_ref: 'premium_monthly_v3', revision: 3, ends_at: OVERRIDE_END, access_override: true },
+            effective_access: { state: 'active', product_ref: 'premium_monthly_v3', via: 'operator' } });
+        expect(await state()).toMatchObject({ planSku: 'premium_monthly_v3', provider: 'aws' });
+        expect(await reader()).toMatchObject({ status: 'active', planId: 'premium_monthly_v3' });
+        expect(await pool()).toEqual({ instanceType: 'm6i.2xlarge' });
+        expect(await migration()).toEqual([{ userId: USER, computerId: COMPUTER, toSize: 'premium' }]);
+        expect((await readOperatorEntitlements(db, USER)).map(g => [g.sku, g.revision, g.endedAt])).toEqual([['premium_monthly_v3', 3, null]]);
+        expect(await stripeSnapshot()).toEqual(before);
+
+        // An unmarked (ordinary) change or end cannot mutate a marked override: refused, nothing written.
+        const unmarkedEnd = command({ action: 'end', product: null, validity: null, assignment: { ref, expected_revision: 3 } });
+        expect(await send(command({ action: 'change', product: STANDARD, validity: null, assignment: { ref, expected_revision: 3 } }))).toMatchObject({ outcome: 'refused' });
+        expect(await send(unmarkedEnd)).toMatchObject({ outcome: 'refused' });
+        expect((await readOperatorEntitlements(db, USER)).map(g => [g.sku, g.revision, g.endedAt])).toEqual([['premium_monthly_v3', 3, null]]);
+        expect(await pool()).toEqual({ instanceType: 'm6i.2xlarge' });
+
+        const ended = await send({ ...unmarkedEnd, command_id: randomUUID(), access_override: true });
+        expect(ended).toMatchObject({ outcome: 'applied', assignment: { revision: 4, state: 'ended', ends_at: NOW.toISOString() },
+            effective_access: { state: 'active', product_ref: 'standard_monthly_v3', via: 'stripe' } });
+        await expectStripeStandardRestored();
+        expect(await assignmentRead()).toMatchObject({ assignments: [{ state: 'ended', revision: 4 }] });
+        expect(await stripeSnapshot()).toEqual(before);
+        expect(await rows(sql`SELECT * FROM public.ezil_operator_entitlement_events`)).toHaveLength(8);
+    });
+
+    it('access_override: exact-end boundary — Free holds until the last instant, a funded trialing Stripe Standard returns at the end, Stripe rows untouched', async () => {
+        await fundedStripeStandard('trialing');
+        await expectStripeStandardRestored(); // the paid trial is live before the override
+        const before = await stripeSnapshot();
+        const assigned = await send(override());
+        expect(assigned).toMatchObject({ outcome: 'applied', assignment: { product_ref: 'free_v3', ends_at: OVERRIDE_END, access_override: true } });
+        await expectFreeEverywhere();
+
+        now = new Date(new Date(OVERRIDE_END).getTime() - 1);
+        await expectFreeEverywhere();
+        expect(await assignmentRead()).toMatchObject({ assignments: [{ state: 'active', revision: 1 }] });
+
+        now = new Date(OVERRIDE_END);
+        await expectStripeStandardRestored();
+        expect(await assignmentRead()).toMatchObject({ assignments: [{ state: 'ended', revision: 1, ends_at: OVERRIDE_END }] });
+        expect(await send(command({ action: 'end', product: null, validity: null, assignment: { ref: assigned.assignment!.ref, expected_revision: 1 }, access_override: true })))
+            .toMatchObject({ refusal: { code: 'invalid_command' }, effective_access: { product_ref: 'standard_monthly_v3', via: 'stripe' } });
+
+        now = new Date(new Date(OVERRIDE_END).getTime() + 60_000);
+        await expectStripeStandardRestored();
+        expect(await stripeSnapshot()).toEqual(before);
+        expect(await rows(sql`SELECT revision, ended_at FROM public.ezil_operator_entitlements`)).toEqual([{ revision: 1, ended_at: null }]);
+    });
+
+    const demand = (instanceType: 'm6i.large' | 'm6i.2xlarge', executor: Executor = db) => readPoolDemand(executor,
+        { region: 'ap-south-1', zoneId: 'aps1-az1', instanceType }, now);
+    const durableSnapshot = async () => ({
+        ...(await stripeSnapshot()),
+        operatorGrants: await rows(sql`SELECT * FROM public.ezil_operator_entitlements ORDER BY ref`),
+        receipts: await rows(sql`SELECT * FROM public.ezil_operator_entitlement_events ORDER BY id`),
+        indexes: await rows(sql`SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public'
+            AND tablename IN ('ezil_operator_entitlements', 'ezil_operator_entitlement_events') ORDER BY indexname`),
+        constraints: await rows(sql`SELECT conname, pg_get_constraintdef(oid) AS definition FROM pg_constraint
+            WHERE conrelid = 'public.ezil_operator_entitlements'::regclass ORDER BY conname`),
+        roles: await rows(sql`SELECT relname, relacl, relrowsecurity FROM pg_class WHERE oid IN
+            ('public.ezil_operator_entitlements'::regclass, 'public.ezil_operator_entitlement_events'::regclass) ORDER BY relname`),
+    });
+
+    it.each(['free_v3', 'premium_monthly_v3'])('application rollback with active %s preserves rows, revisions, indexes and receipts; demand matches policy', async sku => {
+        await assign(); // keep an ordinary paid grant in its independent slot
+        await fundedStripeStandard();
+        const body = override({ product: { ref: sku, catalog_revision: REVISION }, validity: { until_revoked: true } });
+        const result = await send(body);
+        expect(result.outcome).toBe('applied');
+        const before = await durableSnapshot();
+        // The qualified down-plan is source replacement only. Fresh deps model the rollback process's cold reader;
+        // no SQL down migration, grant ending or row rewrites are performed.
+        resetOperatorEntitlementsInstalled();
+        const rolled = createOperatorEntitlementDeps(db, billing, () => now);
+        expect(await rolled.readAssignments(USER)).toHaveLength(2);
+        expect((await state()).summary).toMatchObject({ plan: { sku, access: { override: true } },
+            actions: { checkout: false, upgrade: false, downgrade: false } });
+        expect(await aiIncludedModelsFor(USER, () => billing)).toBeNull(); // payer's AI remains paid
+        if (sku === 'free_v3') {
+            await expectFreeEverywhere();
+            expect(await demand('m6i.large')).toMatchObject({ activeStandard: 0, activePremium: 0 });
+            expect(await demand('m6i.2xlarge')).toMatchObject({ activeStandard: 0, activePremium: 0 });
+        } else {
+            expect(await reader()).toMatchObject({ planId: sku, status: 'active' });
+            expect(await pool()).toEqual({ instanceType: 'm6i.2xlarge' });
+            expect(await migration()).toEqual([{ userId: USER, computerId: COMPUTER, toSize: 'premium' }]);
+            expect(await demand('m6i.large')).toMatchObject({ activeStandard: 0, activePremium: 0 });
+            expect(await demand('m6i.2xlarge')).toMatchObject({ activeStandard: 0, activePremium: 1 });
+            expect(await gateComputerStart({ deps: billing, userId: USER, computerId: COMPUTER, kind: 'aws-ec2', instanceType: 'm6i.2xlarge', now }))
+                .toEqual({ allowed: true });
+        }
+        expect(await send(body)).toEqual({ ...result, outcome: 'replayed' });
+        expect(await durableSnapshot()).toEqual(before);
+        now = new Date('2027-01-01T00:00:00Z'); // until-revoked semantics survive well beyond ordinary/Stripe expiry
+        expect((await state()).planSku).toBe(sku);
+        expect(await durableSnapshot()).toEqual(before);
+    });
+
+    it.each(['42501', '42P01', '57014'])('unknown assignment read (%s) holds admission/AI and never falls back to funded Stripe', async code => {
+        await fundedStripeStandard(); await send(override());
+        const before = await durableSnapshot();
+        const broken: Executor = { execute: query => {
+            if (dialect.sqlToQuery(query).sql.startsWith('SELECT ref, revision')) {
+                return Promise.reject(Object.assign(new Error('synthetic assignment read failure'), { code }));
+            }
+            return db.execute(query); // a 42P01 on a dependency cannot masquerade as an absent operator table
+        } };
+        const deps = { ...billing, store: { ...store, operatorEntitlementsFor: (id: string) => readOperatorEntitlements(broken, id) } };
+        await expect(loadComputeBillingState(deps, USER, now)).rejects.toThrow('synthetic assignment read failure');
+        expect(await gateComputerStart({ deps, userId: USER, computerId: COMPUTER, kind: 'aws-ec2', instanceType: 'm6i.large', now }))
+            .toEqual({ allowed: false, reason: 'billing_unavailable' });
+        expect(await aiIncludedModelsFor(USER, () => deps)).toBeUndefined();
+        expect(await durableSnapshot()).toEqual(before);
+    });
+
+    it('cold table-probe failure holds all SQL consumers with an active Free override and leaves all data untouched', async () => {
+        await fundedStripeStandard(); await send(override());
+        const before = await durableSnapshot();
+        const broken: Executor = { execute: query => {
+            if (dialect.sqlToQuery(query).sql.includes("to_regclass('public.ezil_operator_entitlements')")) {
+                throw new Error('synthetic table probe unavailable');
+            }
+            return db.execute(query);
+        } };
+        await expect(readPaidPoolEligibility(broken, USER, now)).rejects.toThrow('synthetic table probe unavailable');
+        await expect(paidCloudflareCandidates(broken, now)).rejects.toThrow('synthetic table probe unavailable');
+        await expect(demand('m6i.large', broken)).rejects.toThrow('synthetic table probe unavailable');
+        expect(await durableSnapshot()).toEqual(before);
     });
 
 });

@@ -5,6 +5,7 @@ import type { SubscriptionRow } from '../meters';
 import type { BillingDeps, BillingStore, GrantRow, PaymentIssueRow } from '../ports';
 import { aiIncludedModels, aiIncludedModelsFor, FREE_AI_MODELS } from './ai-models';
 import type { OperatorEntitlementRow } from './operator-access';
+import type { AccessRow } from './effective-access';
 
 vi.mock('../deps', () => ({ getBillingDeps: vi.fn(() => { throw new Error('Inject billing deps'); }) }));
 
@@ -32,7 +33,7 @@ const operatorGrant = (): OperatorEntitlementRow => ({ ref: 'osg-00000000-0000-4
 const renewal = () => subscription({ status: 'past_due', currentPeriodStart: ago(2 * DAY), currentPeriodEnd: new Date(NOW.getTime() + 28 * DAY) });
 
 /** The reads loadComputeBillingState makes, over fixed rows; every other store access is an error. */
-function deps(rows: { subs?: SubscriptionRow[]; grants?: GrantRow[]; paymentIssues?: PaymentIssueRow[]; operator?: OperatorEntitlementRow[] } = {},
+function deps(rows: { subs?: SubscriptionRow[]; grants?: GrantRow[]; paymentIssues?: PaymentIssueRow[]; operator?: AccessRow[] } = {},
     config = readBillingConfig({ BILLING_TAB_ENABLED: '1' })): BillingDeps {
     const methods = {
         subscriptionsFor: async () => rows.subs ?? [], operatorEntitlementsFor: async () => rows.operator ?? [],
@@ -92,6 +93,16 @@ describe('aiIncludedModels: Free includes a curated low-tier set (Flash first); 
     it('billing metering off still resolves the owner plan, including paid access', async () => {
         expect(await aiIncludedModelsFor(USER, () => deps({}, readBillingConfig({})))).toBe(FREE_AI_MODELS);
         expect(await aiIncludedModelsFor(USER, () => deps({ subs: [subscription()], grants: [grant()] }, readBillingConfig({})))).toBeNull();
+    });
+
+    it('an explicit access override decides compute only: it neither cuts nor widens the models (Stripe, else an ordinary grant)', async () => {
+        const override = (sku: 'free_v3' | 'premium_monthly_v3') => ({ ...operatorGrant(), ref: 'osg-00000000-0000-4000-8000-0000000000bb', sku, accessOverride: true });
+        // A Free override over a paying Standard subscriber keeps every model; a Premium override over Free keeps Free's.
+        expect(await aiIncludedModelsFor(USER, () => deps({ subs: [subscription()], grants: [grant()], operator: [override('free_v3')] }))).toBeNull();
+        expect(await aiIncludedModelsFor(USER, () => deps({ operator: [override('premium_monthly_v3')] }))).toBe(FREE_AI_MODELS);
+        // An ordinary grant still decides as before, under an override too.
+        expect(await aiIncludedModelsFor(USER, () => deps({ operator: [operatorGrant(), override('free_v3')] }))).toBeNull();
+        expect(await aiIncludedModelsFor(USER, () => deps({ operator: [operatorGrant()] }))).toBeNull();
     });
 
     it('a failed read or composition is unknown (undefined), never every model, and never throws', async () => {
