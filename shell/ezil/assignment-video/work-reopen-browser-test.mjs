@@ -4,7 +4,9 @@
 // Real: the OS shell bundle, its Code window, its dock, the exact-origin `ezil.assignment.work/v2` window and port
 // exchange, the folder bridge. Fixtures: the Universe parent (protocol only, no capture), the checkout, the editor
 // document, the assignment-video route (with production's `clock` report and its `editor-ready` answer), the computer's
-// own provider answer and the media bucket. Every request is intercepted.
+// own provider answer and the media bucket. Every request is intercepted, except in the pagehide run: there the Universe
+// page and the OS document come from a real HTTPS receiver on loopback (`loopback-receiver-test-support.mjs`), and the
+// checkpoint the OS document sends as it unloads must be received on that socket.
 //
 // What it proves, per run:
 //   - native X says nothing on the port or the window (no pause, no reopen, no state), asks the server nothing, and
@@ -15,7 +17,8 @@
 //   - one prepare, one begin, one first frame, one editor-ready, one editor-usable across the close and the reopen, and
 //     the assignment's own clock (`clock`, `unlock`'s `clock`, `editor-usable`) exactly as it was first answered;
 //   - a server pause with no Code window open still ends the phase at the pause's own time (`pause {reason:'paused'}`);
-//   - the explicit Stop still ends the phase at once, and so does the outer page going away with no Code window open;
+//   - the explicit Stop still ends the phase at once, and so does the outer page going away with no Code window open:
+//     its one exact checkpoint actually leaves the browser, after a same-path canary has already reached the socket;
 //   - a new share begun while no Code window is open brings that window back by itself (the document's own launch) and
 //     is an ordinary new capture: its own prepare, begin, first frame and open.
 //
@@ -25,6 +28,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import {createRequire} from 'node:module';
+import {startLoopbackReceiver} from './loopback-receiver-test-support.mjs';
 let chromium;
 try{({chromium}=createRequire(path.join(process.env.PLAYWRIGHT_REQUIRE_DIR||process.env.EZIL_PLAYWRIGHT_DIR||'/opt/ezil-testkit','p.cjs'))('playwright'));}
 catch{console.error('SKIP: playwright is not resolvable');process.exit(2);}
@@ -94,8 +98,24 @@ const parentPage='<!doctype html><html><head><title>Universe assignment</title><
     +'<p id="status" style="font:14px sans-serif;margin:8px">Universe work page</p>'
     +'<iframe id="os" src="'+entry.replace(/&/g,'&amp;')+'" style="width:100%;height:700px;border:0;display:block"></iframe><script>'+parentDriver+'</script></body></html>';
 
-const browser=await chromium.launch({headless:process.env.EZIL_CHROME_HEADED!=='1',
-    executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||'/usr/bin/google-chrome',args:['--disable-dev-shm-usage','--host-resolver-rules=MAP * ~NOTFOUND']});
+// Only these two exact hosts resolve, to this run's loopback receiver; every other host stays unresolvable. Chromium
+// accepts the receiver's certificate through its SPKI pin alone. Both documents of the pagehide run are loaded from it,
+// so the OS document and its parent are loopback documents and their requests to it stay within one address space.
+const canary='delivery-canary';
+const receiver=await startLoopbackReceiver({hosts:[new URL(origin).host,new URL(universe).host],respond:({method,host,path:at,json})=>{
+    const u=new URL(at,'https://'+host);
+    if(method==='GET'&&u.origin===universe&&u.pathname==='/assignment/work')return {status:200,type:'text/html',body:parentPage};
+    if(method==='GET'&&u.origin===origin&&u.pathname.startsWith('/app/'))return {status:200,type:'text/html',body:shellPage};
+    // Nothing reads this answer to the checkpoint: the document that sent it is gone.
+    if(method==='POST'&&u.origin===origin&&u.pathname==='/api/shell/assignment-video'&&[canary,'checkpoint'].includes(json?.action))
+        return {status:200,type:'application/json',body:JSON.stringify({received:json.action})};
+    return null;
+}});
+const browser=await (async()=>{try{
+    await receiver.check(new URL(origin).host);
+    return await chromium.launch({headless:process.env.EZIL_CHROME_HEADED!=='1',executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE||'/usr/bin/google-chrome',
+        args:['--disable-dev-shm-usage','--host-resolver-rules='+[...receiver.hostRules,'MAP * ~NOTFOUND'].join(','),'--ignore-certificate-errors-spki-list='+receiver.spki]});
+}catch(error){await receiver.close();throw error;}})();
 
 /**
  * `signed`: Universe signs `editorReadySupported` (a managed preparation; the editor then waits for its mounted
@@ -105,6 +125,11 @@ async function run({signed,ending}){
     const events=[],mints=[],errors=[],consoleLines=[];let seeded=false,released=false,editorClock,pausedAt=null,revision=0,os,page,minted=0,release=()=>{};
     let reopenHeld=new Promise(r=>release=r);
     let armed=null,armedReadBack=null;
+    // The pagehide run loads both documents from the loopback receiver. Once its outer page is leaving, a checkpoint the
+    // route still sees is passed on to that socket too: the route's count is reported, the socket's is asserted.
+    const real=ending==='pagehide',socketFrom=receiver.received.length,faultFrom=receiver.faults.length,routed=[];
+    let leaving=false,delivery=null;
+    const pass=(route,action)=>route.continue().then(()=>routed.push(action),error=>routed.push(action+' not continued: '+String(error?.message).slice(0,120)));
     const context=await browser.newContext({viewport:{width:1200,height:780}});
     // What the browser itself reports for the assignment-video route, beside what the route fixture answered: a keepalive
     // request sent while the OS frame unloads may leave without reaching the fixture. Diagnostics only; nothing asserts it.
@@ -114,7 +139,7 @@ async function run({signed,ending}){
         const u=new URL(request.url());
         if(u.origin!==origin||u.pathname!=='/api/shell/assignment-video')return;
         let action=null;try{action=request.postDataJSON()?.action??null;}catch{/* body not reported */}
-        if(action===null||['checkpoint','finalize'].includes(action))
+        if(action===null||['checkpoint','finalize',canary].includes(action))
             reported.push({kind,action,method:request.method(),failure:request.failure()?.errorText??null});
     }catch{/* not this route */}};
     for(const kind of ['request','requestfailed','requestfinished'])context.on(kind,request=>note(kind,request));
@@ -140,6 +165,14 @@ async function run({signed,ending}){
             if(event.isTrusted)window.assignmentNativeEvents[type]++;
         },true);
     });
+    // The OS document's record, read under the same structure as the run (a Universe page framing an OS document); the read
+    // counts only if it also sees this run's sentinel.
+    const readProbe=async()=>{const reader=await context.newPage();
+        try{await reader.goto(universe+'/probe-host');
+            const frame=reader.frames().find(f=>{try{return new URL(f.url()).origin===origin;}catch{return false;}});
+            const entries=frame?JSON.parse(await frame.evaluate(()=>localStorage.getItem('ezil-probe'))||'null'):'no OS frame';
+            return {entries,readerSeesArmed:armed!==null&&Array.isArray(entries)&&entries.some(e=>e.type==='armed'&&e.sentinel===armed)};}
+        finally{await reader.close();}};
     const fixed={startedAt:new Date(Date.now()-1000).toISOString(),deadlineAt:new Date(Date.now()+1800000).toISOString(),
         acceptedMediaCutoff:new Date(Date.now()+3800000).toISOString()};
     try{
@@ -148,6 +181,7 @@ async function run({signed,ending}){
             const json=(body,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(body)});
             const html=body=>route.fulfill({contentType:'text/html',body});
             if(u.origin===universe&&u.pathname==='/probe-host')return html('<!doctype html><title>probe host</title><iframe src="'+origin+'/probe"></iframe>');
+            if(real&&u.origin===universe&&u.pathname==='/assignment/work')return pass(route,'universe document');
             if(u.origin===universe)return u.pathname==='/left'?html('<!doctype html><title>Elsewhere</title><p>Left the assignment</p>'):html(parentPage);
             if(u.origin===editor)return html(editorPage);
             if(u.origin===storage&&req.method()==='PUT')return route.fulfill({status:200,headers:{'Access-Control-Allow-Origin':origin},body:''});
@@ -155,7 +189,7 @@ async function run({signed,ending}){
             if(u.origin!==origin)return route.abort();
             // A blank OS-origin page, opened only to read the diagnostics record after a failure.
             if(u.pathname==='/probe')return html('<!doctype html><title>probe</title>');
-            if(u.pathname.startsWith('/app/'))return html(shellPage);
+            if(u.pathname.startsWith('/app/'))return real?pass(route,'os document'):html(shellPage);
             if(u.pathname.startsWith('/os/')){
                 const file=path.join(assets,path.basename(u.pathname));
                 return fs.existsSync(file)?route.fulfill({contentType:file.endsWith('.css')?'text/css':'text/javascript',body:fs.readFileSync(file)}):route.abort();
@@ -175,7 +209,11 @@ async function run({signed,ending}){
                 return json({ok:true,repository,codePreviewUrl:editor+'/?folder='+encodeURIComponent(workspaceFolder)+'&ezil_mint='+String(++minted).repeat(22),assignmentOpen:{attemptId,proof}});
             }
             if(u.pathname==='/api/shell/assignment-video'){
-                const d=post();events.push(d.action);
+                const d=post();
+                // The receiver's own canary is never the fixture's to answer.
+                if(real&&d.action===canary)return pass(route,canary);
+                events.push(d.action);
+                if(real&&leaving&&d.action==='checkpoint')return pass(route,'checkpoint');
                 const now=Date.now(),same={recordingId,captureSessionId:d.captureSessionId??session};
                 if(d.action==='preflight')return json({status:'eligible',attemptId,repositoryUrl:repo,expiresAt:fixed.deadlineAt,windowStartedAt:null,deadlineAt:null,...(signed?{editorReadySupported:true}:{})});
                 // A new capture: its own first frame and its own first open.
@@ -379,23 +417,47 @@ async function run({signed,ending}){
                 all.push({type:'armed',sentinel,at:Date.now()});localStorage.setItem('ezil-probe',JSON.stringify(all));
                 return JSON.parse(localStorage.getItem('ezil-probe')).some(e=>e.type==='armed'&&e.sentinel===sentinel);}catch{return false;}},armed)
                 .catch(e=>'unavailable: '+String(e?.message).slice(0,120));
+            // ── The same path through the real socket, before the outer page leaves: a fetch from this OS document, made as its
+            //    exit checkpoint is, is received there (host mapping, certificate pin, address space and the route's hand-off) ──
+            const nonce=crypto.randomUUID();
+            const sent=await os.evaluate(([action,nonce])=>fetch('/api/shell/assignment-video',{method:'POST',credentials:'same-origin',redirect:'error',
+                cache:'no-store',keepalive:true,headers:{'Content-Type':'application/json','X-Ezil-Assignment-Video':'1'},body:JSON.stringify({action,nonce})})
+                .then(r=>r.status,e=>'failed: '+String(e?.message).slice(0,120)),[canary,nonce]);
+            const atSocket=()=>receiver.received.slice(socketFrom);
+            const received=action=>atSocket().filter(e=>e.method==='POST'&&e.host===new URL(origin).host&&e.path==='/api/shell/assignment-video'&&e.json?.action===action);
+            const shape=e=>({json:e.json,contentType:e.headers['content-type'],marker:e.headers['x-ezil-assignment-video']});
+            assert.equal(sent,200,'the same-path canary is answered by the loopback receiver');
+            assert.deepEqual(received(canary).map(shape),[{json:{action:canary,nonce},contentType:'application/json',marker:'1'}]);
+            const documents=atSocket().filter(e=>e.method==='GET').map(e=>e.host+String(e.path).split('?')[0]);
+            assert.deepEqual(['universe.ezil.work/assignment/work','os.ezil.work/app/code'].map(d=>documents.filter(x=>x===d).length),[1,1],
+                'both documents came from the socket');
+            assert.deepEqual(received('checkpoint'),[],'no checkpoint reached the socket before the outer page left');
+            leaving=true;const leftAt=Date.now();
             await page.goto(universe+'/left');
-            for(let i=0;i<100&&count('checkpoint')===0;i++)await wait(50);
-            assert.ok(count('checkpoint')>=1,'pagehide checkpoints the accepted footage');
+            for(let i=0;i<100&&received('checkpoint').length===0;i++)await wait(50);
+            // Long enough for a second checkpoint to arrive.
+            await wait(500);
+            // Only the socket counts: the route may never see a request sent while its document unloads.
+            const delivered=received('checkpoint');
+            assert.equal(delivered.length,1,'pagehide checkpoints the accepted footage');
+            assert.deepEqual(shape(delivered[0]),{json:{action:'checkpoint',attemptId,captureSessionId:session,reason:'connection_lost'},contentType:'application/json',marker:'1'});
+            assert.ok(received(canary)[0].at<=leftAt&&delivered[0].at>=leftAt,'the canary before the outer page left, the checkpoint after');
+            const calls=await readProbe().then(p=>Array.isArray(p.entries)?p.entries.filter(e=>e.type==='fetch-checkpoint'):p.entries,
+                e=>'probe unavailable: '+String(e?.message).slice(0,120));
+            delivery={call:calls,router:count('checkpoint'),socket:delivered.length,routed,servername:delivered[0].servername,
+                origin:delivered[0].headers.origin,site:delivered[0].headers['sec-fetch-site']};
         }
         for(const line of consoleLines)assert.ok(![attemptId,session,repo,proof,boot.user.id,recordingId].some(secret=>line.includes(secret)),'a diagnostic names no identifier: '+line);
         assert.deepEqual(errors,[]);
-        return {signed,ending,mints:events.filter(e=>e.startsWith('mint:')),port:before.port,states:before.states,begin:count('begin'),editorReady:count('editor-ready'),checkpoint:count('checkpoint')};
+        return {signed,ending,mints:events.filter(e=>e.startsWith('mint:')),port:before.port,states:before.states,begin:count('begin'),editorReady:count('editor-ready'),checkpoint:count('checkpoint'),
+            ...(delivery?{delivery}:{})};
     }catch(error){
-        // Read under the same structure as the run (a Universe page framing an OS document), and count the read only if it
-        // also sees this run's sentinel.
-        const probe=await (async()=>{const reader=await context.newPage();
-            try{await reader.goto(universe+'/probe-host');
-                const frame=reader.frames().find(f=>{try{return new URL(f.url()).origin===origin;}catch{return false;}});
-                const entries=frame?JSON.parse(await frame.evaluate(()=>localStorage.getItem('ezil-probe'))||'null'):'no OS frame';
-                return {entries,readerSeesArmed:armed!==null&&Array.isArray(entries)&&entries.some(e=>e.type==='armed'&&e.sentinel===armed)};}
-            finally{await reader.close();}})().catch(e=>'probe unavailable: '+String(e?.message).slice(0,160));
-        console.error(JSON.stringify({failure:String(error?.message).slice(0,700),signed,ending,events,errors,consoleLines,reported,armedReadBack,probe,browser:browser.version(),
+        const probe=await readProbe().catch(e=>'probe unavailable: '+String(e?.message).slice(0,160));
+        // What the loopback receiver saw during this run (query strings dropped), beside the route's and the document's own record.
+        const socket=receiver.received.slice(socketFrom).map(e=>({at:e.at,method:e.method,host:e.host,servername:e.servername,
+            path:String(e.path).split('?')[0],action:e.json?.action??null,headers:e.headers}));
+        console.error(JSON.stringify({failure:String(error?.message).slice(0,700),signed,ending,events,errors,consoleLines,reported,armedReadBack,probe,
+            socket,socketFaults:receiver.faults.slice(faultFrom),routed,browser:browser.version(),
             drive:await page?.evaluate(()=>({states:window.drive?.states,port:window.drive?.port})).catch(()=>null)}));
         throw error;
     }finally{release();await context.close();}
@@ -404,4 +466,4 @@ try{
     const results=[];
     for(const scenario of [{signed:true,ending:'stop'},{signed:true,ending:'pagehide'},{signed:true,ending:'paused'},{signed:true,ending:'reshare'},{signed:false,ending:'stop'}])results.push(await run(scenario));
     console.log(JSON.stringify({result:'pass',runs:results}));
-}finally{await browser.close();}
+}finally{try{await browser.close();}finally{await receiver.close();}}
