@@ -23,7 +23,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { readFileSync, existsSync, statSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import { createRequire, registerHooks } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // The return-URL rules are TypeScript. Node 24 strips types by default; the
@@ -39,7 +39,13 @@ let checks = 0;
 for (const name of ['equal', 'deepEqual', 'ok', 'match']) { const original = assert[name]; assert[name] = (...args) => { checks += 1; return original(...args); }; }
 let chromium;
 try { ({ chromium } = require('playwright')); } catch { console.log('SKIP playwright not resolvable (set PLAYWRIGHT_REQUIRE_DIR)'); process.exit(2); }
-// The app's own rules, not a copy (Node strips the types).
+// The app's own rules, not a copy (Node strips the types). They import extensionless TypeScript, which the app's
+// bundler resolves; resolve those relative imports the same way. A missing loader is a broken runtime, never a skip.
+if (typeof registerHooks !== 'function') { console.error('FAIL this Node lacks module.registerHooks (needs >= 22.15)'); process.exit(1); }
+registerHooks({ resolve (specifier, context, next) {
+    if (/^\.\.?\//.test(specifier) && context.parentURL?.endsWith('.ts') && !path.extname(specifier)) specifier += '.ts';
+    return next(specifier, context);
+} });
 const { isShellAppId, returnUrlFor, shellAppRoute, getReturnUrlQueryParam, safeReturnUrl, Routes } =
     await import(new URL('../../app/src/utils/constants.ts', import.meta.url).href);
 const assets = process.env.EZIL_SHELL_OUT_DIR || fileURLToPath(new URL('../../app/public/os/', import.meta.url));

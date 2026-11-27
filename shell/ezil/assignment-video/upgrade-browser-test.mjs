@@ -312,7 +312,7 @@ try {
         await page.getByRole('link',{name:'Open assignment editor'}).click();
         await page.waitForURL(url => url.origin === os && url.pathname === '/app/code');
         await page.waitForFunction(() => typeof window.ezil?.boot === 'function');
-        await page.evaluate(() => window.ezil.boot());
+        await page.evaluate(() => { window.ezil.boot(); });
         await share.waitFor();
         assert.equal(assignment.clockStarted, null);
         assert.deepEqual(assignment.confirmed, []);
@@ -398,7 +398,7 @@ try {
             const oldPhase = assignment.phase;
             const priorEvidence = assignment.confirmed.length;
             await page.reload();
-            await page.evaluate(() => window.ezil.boot());
+            await page.evaluate(() => { window.ezil.boot(); });
             assert.equal(assignment.clockStarted, originalStart);
             assert.equal(assignment.deadline, deadline);
             await check('server clock is visible after reload before new consent',async () => await timer.isVisible());
@@ -413,7 +413,7 @@ try {
             assert.equal(assignment.deadline,deadline);
             await page.goto(entry);
             await page.waitForFunction(() => typeof window.ezil?.boot === 'function');
-            await page.evaluate(() => window.ezil.boot());
+            await page.evaluate(() => { window.ezil.boot(); });
             await check('reopening closed editor restores the running timer',async () => await timer.isVisible());
             assert.equal(assignment.clockStarted,originalStart);
             assert.equal(assignment.deadline,deadline);
