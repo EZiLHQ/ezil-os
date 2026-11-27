@@ -137,6 +137,8 @@ async function run({signed,ending}){
     // A request whose body the browser does not report is kept too (action null).
     const note=(kind,request)=>{try{
         const u=new URL(request.url());
+        // A document the pagehide run could not load from the loopback receiver says why (resolution, certificate, address space).
+        if(real&&kind==='requestfailed'&&request.isNavigationRequest()){reported.push({kind,document:u.origin+u.pathname,failure:request.failure()?.errorText??null});return;}
         if(u.origin!==origin||u.pathname!=='/api/shell/assignment-video')return;
         let action=null;try{action=request.postDataJSON()?.action??null;}catch{/* body not reported */}
         if(action===null||['checkpoint','finalize',canary].includes(action))
