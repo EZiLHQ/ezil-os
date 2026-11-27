@@ -194,7 +194,8 @@ async function run({signed,ending}){
         page.on('pageerror',e=>errors.push(e.message.slice(0,160)));
         page.on('console',m=>{if(m.text().startsWith('assignment.workspace.'))consoleLines.push(m.text());});
         await page.goto(universe+'/assignment/work');
-        os=page.frames().find(f=>f.url().startsWith(origin))??await page.waitForEvent('framenavigated',f=>f.url().startsWith(origin));
+        const atOs=f=>{try{return new URL(f.url()).origin===origin;}catch{return false;}};
+        os=page.frames().find(atOs)??await page.waitForEvent('framenavigated',atOs);
         const codeWindow=os.locator('.window[data-app="code"]');
         const editorFrame=os.frameLocator('.window[data-app="code"] .window-app-iframe');
         const drive=(fn,arg)=>page.evaluate(fn,arg);
