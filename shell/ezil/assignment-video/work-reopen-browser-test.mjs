@@ -104,6 +104,7 @@ const browser=await chromium.launch({headless:process.env.EZIL_CHROME_HEADED!=='
 async function run({signed,ending}){
     const events=[],mints=[],errors=[],consoleLines=[];let seeded=false,released=false,editorClock,pausedAt=null,revision=0,os,page,minted=0,release=()=>{};
     let reopenHeld=new Promise(r=>release=r);
+    let armed=null,armedReadBack=null;
     const context=await browser.newContext({viewport:{width:1200,height:780}});
     // What the browser itself reports for the assignment-video route, beside what the route fixture answered: a keepalive
     // request sent while the OS frame unloads may leave without reaching the fixture. Diagnostics only; nothing asserts it.
@@ -146,6 +147,7 @@ async function run({signed,ending}){
             const req=route.request(),u=new URL(req.url()),post=()=>req.postDataJSON()||{};
             const json=(body,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(body)});
             const html=body=>route.fulfill({contentType:'text/html',body});
+            if(u.origin===universe&&u.pathname==='/probe-host')return html('<!doctype html><title>probe host</title><iframe src="'+origin+'/probe"></iframe>');
             if(u.origin===universe)return u.pathname==='/left'?html('<!doctype html><title>Elsewhere</title><p>Left the assignment</p>'):html(parentPage);
             if(u.origin===editor)return html(editorPage);
             if(u.origin===storage&&req.method()==='PUT')return route.fulfill({status:200,headers:{'Access-Control-Allow-Origin':origin},body:''});
@@ -370,6 +372,13 @@ async function run({signed,ending}){
             await os.waitForFunction(()=>document.querySelectorAll('.window[data-app="code"]').length===0);
             await wait(400);
             assert.equal(count('checkpoint'),0);assert.deepEqual(await wire(),before);
+            // Diagnostics: a unique sentinel written and read back by this embedded OS document itself, so a record that
+            // later lacks pagehide is falsifiable (the same storage was writable and is read). Not asserted.
+            armed=crypto.randomUUID();
+            armedReadBack=await os.evaluate(sentinel=>{try{const all=JSON.parse(localStorage.getItem('ezil-probe')||'[]');
+                all.push({type:'armed',sentinel,at:Date.now()});localStorage.setItem('ezil-probe',JSON.stringify(all));
+                return JSON.parse(localStorage.getItem('ezil-probe')).some(e=>e.type==='armed'&&e.sentinel===sentinel);}catch{return false;}},armed)
+                .catch(e=>'unavailable: '+String(e?.message).slice(0,120));
             await page.goto(universe+'/left');
             for(let i=0;i<100&&count('checkpoint')===0;i++)await wait(50);
             assert.ok(count('checkpoint')>=1,'pagehide checkpoints the accepted footage');
@@ -378,10 +387,15 @@ async function run({signed,ending}){
         assert.deepEqual(errors,[]);
         return {signed,ending,mints:events.filter(e=>e.startsWith('mint:')),port:before.port,states:before.states,begin:count('begin'),editorReady:count('editor-ready'),checkpoint:count('checkpoint')};
     }catch(error){
+        // Read under the same structure as the run (a Universe page framing an OS document), and count the read only if it
+        // also sees this run's sentinel.
         const probe=await (async()=>{const reader=await context.newPage();
-            try{await reader.goto(origin+'/probe');return JSON.parse(await reader.evaluate(()=>localStorage.getItem('ezil-probe'))||'null');}
+            try{await reader.goto(universe+'/probe-host');
+                const frame=reader.frames().find(f=>{try{return new URL(f.url()).origin===origin;}catch{return false;}});
+                const entries=frame?JSON.parse(await frame.evaluate(()=>localStorage.getItem('ezil-probe'))||'null'):'no OS frame';
+                return {entries,readerSeesArmed:armed!==null&&Array.isArray(entries)&&entries.some(e=>e.type==='armed'&&e.sentinel===armed)};}
             finally{await reader.close();}})().catch(e=>'probe unavailable: '+String(e?.message).slice(0,160));
-        console.error(JSON.stringify({failure:String(error?.message).slice(0,700),signed,ending,events,errors,consoleLines,reported,probe,browser:browser.version(),
+        console.error(JSON.stringify({failure:String(error?.message).slice(0,700),signed,ending,events,errors,consoleLines,reported,armedReadBack,probe,browser:browser.version(),
             drive:await page?.evaluate(()=>({states:window.drive?.states,port:window.drive?.port})).catch(()=>null)}));
         throw error;
     }finally{release();await context.close();}
