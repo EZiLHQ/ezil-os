@@ -50,6 +50,15 @@ afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(
 function begin(path = query(), headers: Record<string, string> = frame, host = os) {
     return startWorkAuth(new Request(host + path, { headers }));
 }
+/** Extract the single canonical inline script from our generated response, for exact content/CSP assertions. */
+function inlineScript(html: string) {
+    const opening = html.split('<script>');
+    expect(opening).toHaveLength(2);
+    const closing = opening[1]!.split('</script>');
+    expect(closing).toHaveLength(2);
+    expect(closing[1]).toBe('</body></html>');
+    return closing[0]!;
+}
 /** A started transaction: its cookie pair, its state and the decoded payload. */
 function started(path = query()) {
     const response = begin(path);
@@ -162,7 +171,7 @@ describe('the callback answer: success', () => {
         const response = await callback({ state, code: 'private-code' }, jar);
         const policy = response.headers.get('content-security-policy')!;
         const html = await response.text();
-        const script = /<script>([\s\S]*)<\/script>/.exec(html)![1]!;
+        const script = inlineScript(html);
         expect(script).toBe(WORK_AUTH_SCRIPT);
         expect(policy).toBe(`default-src 'none'; script-src 'sha256-${createHash('sha256').update(script).digest('base64')}'; base-uri 'none'; form-action 'none'; frame-ancestors ${os} ${universe}`);
         expect(policy).not.toContain('*');
@@ -398,7 +407,7 @@ describe('production: the same flow on os.ezil.work inside universe.ezil.work, a
         const html = await inert(response);
         expect(outcomeOf(html)).toBe('signed_in');
         expect(stub.exchangeCode).toHaveBeenCalledWith('private-code', { origin: prodOs, codeVerifier: tx.codeVerifier });
-        const script = /<script>([\s\S]*)<\/script>/.exec(html)![1]!;
+        const script = inlineScript(html);
         expect(script).toBe(workAuthScript({ os: prodOs, universe: prodUniverse }));
         expect(script).not.toContain('staging');
         expect(policy).toBe(`default-src 'none'; script-src 'sha256-${createHash('sha256').update(script).digest('base64')}'; base-uri 'none'; form-action 'none'; frame-ancestors ${prodOs} ${prodUniverse}`);

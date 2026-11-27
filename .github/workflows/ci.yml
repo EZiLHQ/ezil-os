@@ -283,7 +283,12 @@ jobs:
                    shell/ezil/ui/full-view-test.mjs \
                    shell/ezil/ui/feedback/capture-test.mjs \
                    shell/ezil/ui/feedback/app-failures-test.mjs \
-                   shell/ezil/ui/feedback/feedback-test.mjs; do
+                   shell/ezil/ui/feedback/feedback-test.mjs \
+                   shell/ezil/assignment-video/embed-gate-test.mjs \
+                   shell/ezil/assignment-video/transport.test.mjs \
+                   shell/ezil/assignment-video/transport-clock-test.mjs \
+                   shell/ezil/assignment-video/transport-editor-ready.test.mjs \
+                   shell/ezil/assignment-video/work-gate.test.mjs; do
             echo "── $t"
             # feedback-test.mjs imports app/src/server/feedback/types.ts (the
             # wire schema). Node 22 needs the flag to strip types; Node 24
@@ -301,6 +306,11 @@ jobs:
                    shell/ezil/context-menu-stack-browser-test.mjs \
                    shell/ezil/app-link-browser-test.mjs \
                    shell/ezil/browser-route-browser-test.mjs \
+                   shell/ezil/assignment-video/tab-browser-test.mjs \
+                   shell/ezil/assignment-video/wrong-tab-browser-test.mjs \
+                   shell/ezil/assignment-video/work-reopen-browser-test.mjs \
+                   shell/ezil/assignment-video/upgrade-browser-test.mjs \
+                   shell/ezil/assignment-video/work-embed-browser-test.mjs \
                    shell/ezil/apps/code-history-browser-test.mjs \
                    shell/ezil/apps/code-auth-recovery-browser-test.mjs \
                    shell/ezil/launcher-toggle-browser-test.mjs \
@@ -334,7 +344,8 @@ jobs:
                    shell/ezil/apps/overlay-paint-browser-test.mjs \
                    shell/ezil/display-notice-browser-test.mjs \
                    shell/ezil/apps/resize-test.mjs \
-                   shell/ezil/apps/code-full-view-browser-test.mjs; do
+                   shell/ezil/apps/code-full-view-browser-test.mjs \
+                   shell/ezil/assignment-video/status-control-browser-test.mjs; do
             echo "── $t"
             node "$t"
           done
