@@ -377,7 +377,7 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     };
     const loadGrant = async () => {
         const { grantForStandaloneGit, GitAccessError } = await import('@/server/git/access');
-        try { return await grantForStandaloneGit(identity!, parsed.canonicalURL, { signal: deadline }); }
+        try { return await grantForStandaloneGit(identity!, parsed.canonicalURL, { signal: deadline, recover: true, onRetry: why => console.warn('[shell] code-preview-url standalone Git retrying once', { why }) }); }
         catch (error) {
             const code = error instanceof GitAccessError ? error.code : 'unavailable';
             console.warn('[shell] code-preview-url standalone Git refused', { code });

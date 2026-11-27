@@ -407,6 +407,40 @@ describe('standalone EZiL Git URL open', () => {
         const worker = s.requests.find(r => r.url.origin === WORKER)!;
         expect(JSON.parse(String(worker.init.body)).privatePacket.git.scope).toBe('read');
     });
+    it('one transient gateway 503 is recovered once with the same identity, address and scope; the Worker is asked once', async () => {
+        const { repositoryIdFor } = await import('@/server/git/repo-url');
+        const checkout = repositoryIdFor(EZIL_URL);
+        let asks = 0;
+        s.gateway = scope => ++asks === 1 ? new Response(JSON.stringify({ git: { token: PRIVATE_GIT_TOKEN } }), { status: 503 }) : Response.json(standalonePacket(scope));
+        s.worker = body => Response.json({ ok: true, folder: `/workspace/projects/${JSON.parse(body).repositoryId}` });
+        const response = await openUrl(EZIL_URL);
+        expect(response.status).toBe(200);
+        const asked = s.requests.filter(r => r.url.origin === 'https://github.ezil.work');
+        expect(asked.map(r => JSON.parse(String(r.init.body)))).toEqual([{ repoURL: EZIL_URL, scope: 'write' }, { repoURL: EZIL_URL, scope: 'write' }]);
+        expect(asked.map(r => new Headers(r.init.headers).get('authorization'))).toEqual([`Bearer ${ID_TOKEN}`, `Bearer ${ID_TOKEN}`]);
+        expect(s.order).toEqual(['computer.get', 'target', 'identity', 'gateway', 'gateway', 'identity', 'codePreviewUrl', 'identity', 'target', 'worker']);
+        expect(s.requests.filter(r => r.url.origin === WORKER)).toHaveLength(1);
+        expect(new URL((await response.clone().json()).codePreviewUrl).searchParams.getAll('folder')).toEqual([`/workspace/projects/${checkout}`]);
+        expect(JSON.stringify(logs.flatMap(l => l.mock.calls))).toContain('standalone Git retrying once');
+        await expectNoSecrets(response);
+    });
+    it('a persistent gateway 503 is exactly one retry and then the same 503; Code is never woken', async () => {
+        s.gateway = () => new Response('busy', { status: 503 });
+        const response = await openUrl(EZIL_URL);
+        expect(response.status).toBe(503);
+        expect((await response.json()).error.code).toBe('repo_url_unavailable');
+        expect(s.requests.filter(r => r.url.origin === 'https://github.ezil.work')).toHaveLength(2);
+        expect(s.order).not.toContain('codePreviewUrl');
+        expect(s.requests.some(r => r.url.origin === WORKER)).toBe(false);
+    });
+    it.each([[403, 404, 'repo_not_found'], [429, 503, 'repo_url_unavailable'], [500, 503, 'repo_url_unavailable']] as const)(
+        'a gateway %s is never asked again', async (answer, status, code) => {
+            s.gateway = () => new Response(null, { status: answer });
+            const response = await openUrl(EZIL_URL);
+            expect(response.status).toBe(status);
+            expect((await response.json()).error.code).toBe(code);
+            expect(s.requests.filter(r => r.url.origin === 'https://github.ezil.work').length).toBeLessThanOrEqual(answer === 403 ? 2 : 1);
+        });
     it('a 401 requests OAuth refresh before Code wakes; an unowned computer reaches no grant', async () => {
         s.gateway = () => new Response(null, { status: 401 });
         const response = await openUrl(EZIL_URL);
