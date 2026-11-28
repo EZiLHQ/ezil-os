@@ -161,6 +161,39 @@ async function open ({ width, height, coarse, preflight = false }) {
     return { context, page, errors };
 }
 
+function observe_editor_viewport (page) {
+    return page.evaluate(sel => {
+        const frame = document.querySelector(`${sel} .window-app-iframe`);
+        const editor = frame.contentWindow;
+        const size = () => [editor.innerWidth, editor.innerHeight];
+        const sizes = [];
+        editor.addEventListener('resize', () => sizes.push(size()));
+        window.__editorViewport = { frame, document: editor.document, size, sizes };
+        return size();
+    }, CODE);
+}
+
+function editor_viewport (page) {
+    return page.evaluate(sel => {
+        const { frame, document: original, size, sizes } = window.__editorViewport;
+        return {
+            sameDocument: document.querySelector(`${sel} .window-app-iframe`) === frame && frame.contentDocument === original,
+            size: size(), sizes,
+        };
+    }, CODE);
+}
+
+async function wait_window_transition (page, minimized) {
+    await page.waitForFunction(({ sel, minimized }) => {
+        const w = document.querySelector(sel);
+        const state = ['1', 'true'].includes(w?.getAttribute('data-is_minimized'));
+        const frame = w?.querySelector('.window-app-iframe');
+        return w && state === minimized && ! window.$(w).is(':animated') && w.getAnimations().length === 0
+            && (minimized || (frame.style.width === '' && frame.style.height === ''));
+    }, { sel: CODE, minimized });
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+}
+
 const launchCode = page => page.evaluate(async () => {
     const p = window.__EZIL_BOOT__;
     await window.ezil.registry.launch('code', { payload: p, computer: p.computer, desktopState: p.desktopState, view: 'full' });
@@ -399,18 +432,70 @@ try {
                 const strip = (await measure(page)).strip;
                 push(`${L} 🔴 Code full over the full-bleed Browser: the icon moves into Code's strip, outlined`,
                     Math.abs(codeFront.y + codeFront.h / 2 - strip / 2) <= 0.5 && codeFront.look === 'outline', JSON.stringify({ codeFront, strip }));
+                const fullSize = await observe_editor_viewport(page);
                 await page.focus(`${CODE} > .ezil-app-drawer .dashboard-app-drawer-toggle`);
                 await page.locator(`${CODE} > .ezil-app-drawer .dashboard-app-drawer-minimize`).click();
-                await page.waitForFunction(sel => ['true', '1'].includes(document.querySelector(sel).getAttribute('data-is_minimized')), CODE);
+                await wait_window_transition(page, true);
                 await page.waitForFunction(() => document.querySelector('button.ezil-feedback-chip').getBoundingClientRect().y === 9.5);
                 const backToBrowser = await chipNow();
                 push(`${L} 🔴 Code minimised: the icon is back in the Browser's strip with the Browser's look`,
                     backToBrowser.y === 9.5 && backToBrowser.look === null && backToBrowser.bg === 'rgba(24, 24, 28, 0.62)', JSON.stringify(backToBrowser));
+                await launchCode(page);
+                await settle(page);
+                await wait_window_transition(page, false);
+                const fullRestored = await editor_viewport(page);
+                push(`${L} full Code keeps its iframe viewport across minimize, Browser, and restore`,
+                    fullRestored.sameDocument && fullRestored.sizes.length === 0
+                    && JSON.stringify(fullRestored.size) === JSON.stringify(fullSize), JSON.stringify(fullRestored));
+
+                await page.setViewportSize({ width: 1340, height: 850 });
+                await page.waitForFunction(() => window.__editorViewport.size()[0] === 1340
+                    && window.__editorViewport.size()[1] > 0 && window.__editorViewport.size()[1] < 850);
+                await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+                const resized = await editor_viewport(page);
+                push(`${L} a genuine browser resize still resizes the restored editor viewport`,
+                    resized.sameDocument && resized.size[0] === 1340 && resized.sizes.some(([width]) => width === 1340), JSON.stringify(resized));
             }
         } catch ( err ) {
             push(`${L} completed without throwing`, false, String(err?.message ?? err).split('\n')[0]);
         }
         push(`${L} no page errors`, errors.length === 0, JSON.stringify(errors));
+        await context.close();
+    }
+
+    const { context, page, errors } = await open({ width: 1440, height: 900, coarse: false });
+    try {
+        const launch = (app, view) => page.evaluate(async ({ app, view }) => {
+            const p = window.__EZIL_BOOT__;
+            await window.ezil.registry.launch(app, { payload: p, computer: p.computer, desktopState: p.desktopState, view });
+        }, { app, view });
+        await launch('code', 'window');
+        await page.waitForFunction(sel => !! document.querySelector(`${sel} .window-app-iframe`)?.contentDocument?.querySelector('#row1'), CODE);
+        await wait_window_transition(page, false);
+        const initial = await observe_editor_viewport(page);
+
+        for ( let cycle = 0; cycle < 3; cycle++ ) {
+            await page.locator(`${CODE} > .window-head > .window-minimize-btn`).click();
+            await wait_window_transition(page, true);
+            await launch('desktop');
+            const browser = '.window[data-app="desktop"]';
+            await page.waitForSelector(browser);
+            // Close the simulated Browser after bringing it forward so the next
+            // cycle starts with the same windowed desktop chrome.
+            await page.evaluate(sel => window.$(sel).close(), browser);
+            await page.waitForFunction(sel => ! document.querySelector(sel), browser);
+            await launch('code', 'window');
+            await wait_window_transition(page, false);
+        }
+        const restored = await editor_viewport(page);
+        push('windowed Code keeps one iframe viewport across three minimize, Browser, and restore cycles',
+            restored.sameDocument && restored.sizes.length === 0
+            && JSON.stringify(restored.size) === JSON.stringify(initial), JSON.stringify(restored));
+
+    } catch ( err ) {
+        push('Code viewport regression completed without throwing', false, String(err?.stack ?? err));
+    } finally {
+        push('Code viewport regression has no page errors', errors.length === 0, JSON.stringify(errors));
         await context.close();
     }
 } catch ( err ) {

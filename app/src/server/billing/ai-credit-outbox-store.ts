@@ -168,7 +168,13 @@ export function createAiCreditOutboxStore(db: Database, fundingUrl?: string): Ai
                 or suspended.payload->'expiresAt' is distinct from pending.payload->'expiresAt'
                 or suspended.payload->'reversal' is distinct from pending.payload->'reversal'
                 or pending.event_key is distinct from (pending.payload->>'entitlementId') || ':restore:' || (pending.payload->'reversal'->>'causeId'))`;
-            const rows = await db.execute<AiCreditOutboxRow & Record<string, unknown>>(sql`
+            // A paid top-up's scope (`soleReceipt`): the row is claimed only while no other receipt names its
+            // entitlement or its payment. In the claim statement itself, so the decision and the lease are one write.
+            const soleReceipt = scope?.soleReceipt ? sql`and not exists (select 1 from ezil_billing_outbox sibling
+                where sibling.id <> pending.id and sibling.payload->>'protocol' = ${AI_CREDIT_PROTOCOL}
+                    and (sibling.payload->>'entitlementId' = pending.payload->>'entitlementId'
+                        or sibling.payload->>'paymentIntentId' = pending.payload->>'paymentIntentId'))` : sql``;
+            const claimWith = (executor: Pick<Database, 'execute'>) => executor.execute<AiCreditOutboxRow & Record<string, unknown>>(sql`
                 with candidate as (
                     select pending.id, pending.attempts,
                         coalesce((pending.payload->'delivery'->>'dependencyWaits')::integer, 0) as dependency_waits,
@@ -180,6 +186,7 @@ export function createAiCreditOutboxStore(db: Database, fundingUrl?: string): Ai
                         and (pending.kind <> 'ai_restore' or suspended.delivered_at is not null or (${restoreConflict}) or (${restoreDisposition}) is not null)
                         and pending.delivered_at is null
                         ${scope ? sql`and pending.user_id = ${scope.userId}::uuid and pending.event_key = ${scope.eventKey} and pending.kind = ${scope.kind}` : sql``}
+                        ${soleReceipt}
                         and coalesce(pending.payload->'delivery'->>'status', 'pending') in ('pending', 'retry', 'processing')
                         and coalesce((pending.payload->'delivery'->>'nextAttemptAt')::bigint, 0) <= ${now}
                         and (pending.attempts - coalesce((pending.payload->'delivery'->>'dependencyWaits')::integer, 0) < ${AI_CREDIT_MAX_ATTEMPTS}
@@ -195,7 +202,20 @@ export function createAiCreditOutboxStore(db: Database, fundingUrl?: string): Ai
                 returning o.id, o.event_key as "eventKey", o.user_id as "userId", o.kind, o.payload, o.attempts,
                     c.dependency_waits as "dependencyWaits", c.restore_conflict as "restoreConflict", c.restore_disposition as "restoreDisposition", c.attempts - c.dependency_waits >= ${AI_CREDIT_MAX_ATTEMPTS} as exhausted
             `);
-            return rows[0] ?? null;
+            if (!scope?.soleReceipt) return (await claimWith(db))[0] ?? null;
+            // Every reversal is written under its entitlement's root lock (`recordAiReversal`), and the account pin takes
+            // it too. Holding it for the claim orders the claim against them: a reversal that committed first is seen by
+            // the statement above (no claim), and one still in flight holds the lock (no claim, never a wait: the request
+            // retries after its backoff). A reversal that starts after this commit is a later event, delivered after the
+            // grant as it always was. The key is the grant's own event key without its `:grant` suffix (`topupScope`).
+            const root = scope.eventKey.endsWith(':grant') ? scope.eventKey.slice(0, -':grant'.length) : '';
+            if (!root) return null;
+            return db.transaction(async tx => {
+                const [lock] = await tx.execute<{ held: boolean }>(
+                    sql`select pg_try_advisory_xact_lock(hashtextextended(${`billing:ai_root:${root}`}, 0)) as held`);
+                if (lock?.held !== true) return null;
+                return (await claimWith(tx))[0] ?? null;
+            });
         },
         async accountFor(row) {
             // A revoke uses the original grant's frozen mapping, even if Works has changed since.
@@ -242,6 +262,31 @@ export function createAiCreditOutboxStore(db: Database, fundingUrl?: string): Ai
         },
         requeueFailed: input => requeueFailedAiCredits(db, input),
         enrollFor: enrollWithStoredSubject,
+        async topupScope({ paymentIntentId, userId }) {
+            if (!/^pi_[A-Za-z0-9_]+$/.test(paymentIntentId)) return null;
+            // The owner is the stored row's, never the caller's word: `userId` only narrows. Two rows (limit 2) is a
+            // conflict `recordAiTopup` already refuses, so it is no scope here either.
+            const rows = await db.execute<{ userId: string; eventKey: string }>(sql`
+                select receipt.user_id::text as "userId", receipt.event_key as "eventKey" from ezil_billing_outbox receipt
+                where receipt.kind = 'ai_grant' and receipt.payload->>'protocol' = ${AI_CREDIT_PROTOCOL}
+                    and receipt.payload->>'paymentIntentId' = ${paymentIntentId}
+                    and receipt.payload->>'action' = 'grant' and receipt.delivered_at is null
+                    and coalesce(receipt.payload->'delivery'->>'status', 'pending') <> 'failed'
+                    and left(receipt.payload->>'entitlementId', 17) = 'ezil-os:v1:topup:'
+                    and receipt.event_key = (receipt.payload->>'entitlementId') || ':grant'
+                    ${userId === undefined ? sql`` : sql`and receipt.user_id = ${userId}::uuid`}
+                    and exists (select 1 from ezil_billing_grants paid where paid.source_type = 'payment_intent'
+                        and paid.source_id = ${paymentIntentId} and paid.kind = 'topup' and paid.meter = 'ai_usd_micro'
+                        and paid.user_id = receipt.user_id and paid.amount > 0)
+                    and not exists (select 1 from ezil_billing_outbox other where other.id <> receipt.id
+                        and other.payload->>'protocol' = ${AI_CREDIT_PROTOCOL}
+                        and (other.payload->>'entitlementId' = receipt.payload->>'entitlementId'
+                            or other.payload->>'paymentIntentId' = ${paymentIntentId}))
+                limit 2`);
+            const row = rows.length === 1 ? rows[0]! : null;
+            return row && typeof row.userId === 'string' && typeof row.eventKey === 'string'
+                ? { userId: row.userId, eventKey: row.eventKey, kind: 'ai_grant', soleReceipt: true } : null;
+        },
         async receiptsFor(userId) {
             const rows = await db.execute<{ entitlementId: unknown; credits: unknown; expiresAt: unknown; deliveredAt: unknown; failed: unknown }>(sql`
                 select payload->>'entitlementId' as "entitlementId", payload->'credits' as credits,

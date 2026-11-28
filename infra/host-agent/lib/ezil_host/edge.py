@@ -38,10 +38,12 @@ import hashlib
 import hmac
 import json
 import os
+import posixpath
 import re
 import socket
 import threading
 import time
+from urllib.parse import unquote
 
 from . import agent as agentmod
 from . import desktop
@@ -472,10 +474,20 @@ class Edge:
             self._ice(client, head, m.group(1), query)
             return
         m = PROXY_RE.match(path)
-        if not m or int(m.group(1)) not in self.ports:
+        if not m:
             _reply(client, 404, {"ok": False, "error": "not_found"})
             return
-        self._proxy(client, head, int(m.group(1)), (m.group(2) or "/") + query)
+        port = int(m.group(1))
+        target = m.group(2) or "/"
+        code_proxy = None
+        if port == 8443:
+            normalized = "/" + unquote(target).replace(chr(92), "/").lstrip("/")
+            code_proxy = re.match(r"^/(?:preview(?:-ws)?/)?(?:absproxy|proxy)/(\d+)(?:/|$)",
+                                  posixpath.normpath(normalized))
+        if port == 5679 or port not in self.ports or (code_proxy and int(code_proxy.group(1)) == 5679):
+            _reply(client, 404, {"ok": False, "error": "not_found"})
+            return
+        self._proxy(client, head, port, target + query)
 
     def _control(self, client, head, m):
         if head.method != "POST":
@@ -620,9 +632,21 @@ class Edge:
             item = result["result"]
             valid = isinstance(item, dict)
             if valid and item.get("ok") is True:
-                valid = (set(item) == {"ok", "folder", "status"} and isinstance(item["folder"], str)
+                legacy_keys = {"ok", "folder", "status"}
+                assignment_keys = legacy_keys | {"checkoutFolder", "assignmentPreload"}
+                valid = (set(item) in (legacy_keys, assignment_keys) and isinstance(item["folder"], str)
                          and re.fullmatch(r"/workspace/projects/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", item["folder"])
                          and item["status"] in ("cloned", "fetched"))
+                if valid and set(item) == assignment_keys:
+                    checkout, ack = item["checkoutFolder"], item["assignmentPreload"]
+                    valid = (isinstance(checkout, str)
+                             and re.fullmatch(re.escape(item["folder"]) + r"/u-[a-f0-9]{16}-a-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", checkout)
+                             and isinstance(ack, dict) and set(ack) == {"eventId", "nonce", "port", "status"}
+                             and isinstance(ack["eventId"], str)
+                             and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", ack["eventId"])
+                             and isinstance(ack["nonce"], str) and standalone_git.HEX64.fullmatch(ack["nonce"])
+                             and type(ack["port"]) is int and ack["port"] == 5679
+                             and ack["status"] == "acknowledged")
             elif valid:
                 keys = set(item)
                 reason = item.get("diagnosticReason")
@@ -635,6 +659,10 @@ class Edge:
             if valid:
                 if item["ok"] is True:
                     answer["result"] = {"ok": True, "folder": item["folder"], "status": item["status"]}
+                    if "assignmentPreload" in item:
+                        ack = item["assignmentPreload"]
+                        answer["result"]["checkoutFolder"] = item["checkoutFolder"]
+                        answer["result"]["assignmentPreload"] = {key: ack[key] for key in ("eventId", "nonce", "port", "status")}
                 else:
                     # Copy only validated primitives; do not forward the agent object or extra diagnostics.
                     answer["result"] = {"ok": False, "error": item["error"]}

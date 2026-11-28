@@ -146,16 +146,14 @@ describe('/computers survives the move of computer management into the OS', () =
         expect(copy.body.length).toBeGreaterThan(0);
     });
 
-    it('both fallback routes are still in the production build', () => {
-        // `/computer/[id]` is the other half of the fallback: `/computers`
-        // lists them, this opens one. Both are named in the standing rules as
-        // things that must keep working.
+    it('the fallback route is in the production build, and the removed /computer/[id] is not', () => {
+        // `/computers` lists a person's computer and is the fallback that must
+        // keep working. `/computer/[id]` used to open one outside the shell; it
+        // was removed on 2026-11-25 and a row now loads the shell's Browser app
+        // (`computerViewerRoute`). Nothing under `/computer` may come back.
         //
-        // Asserted against the BUILD OUTPUT rather than by importing the page
-        // module: `/computer/[id]/page` reaches `@/trpc/server` -> the drizzle
-        // client -> `env.ts`, which throws without a real
-        // `SUPABASE_DATABASE_URL`. A route that Next actually emitted is
-        // better evidence than a module that happened to import anyway.
+        // Asserted against the BUILD OUTPUT: a route that Next actually
+        // emitted (or did not) is better evidence than a module import.
         const manifestPath = path.resolve(appRoot, '.next/app-path-routes-manifest.json');
         expect(
             fs.existsSync(manifestPath),
@@ -164,7 +162,9 @@ describe('/computers survives the move of computer management into the OS', () =
         const routes: Record<string, string> = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
         const emitted = Object.values(routes);
         expect(emitted).toContain('/computers');
-        expect(emitted).toContain('/computer/[id]');
+        expect(emitted).toContain('/os');
+        expect(emitted).toContain('/app/[appId]');
+        expect(emitted.filter(route => route === '/computer' || route.startsWith('/computer/'))).toEqual([]);
     });
 
     it('the page and its parts are all still on disk where the route expects them', () => {

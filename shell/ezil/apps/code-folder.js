@@ -34,6 +34,17 @@
 // can keep `/app/code?folder=` on the address bar and give each switch its own
 // history entry (docs/APP-ROUTES.md §5 "Code's folder").
 //
+// Workbench readiness (2026-11-26): a folder report is read from the document's ADDRESS by a script that runs
+// before any workbench script, so it names the document and proves no editor. A binding that asks
+// (`workbench: true`; only the signed assignment preparation does) adds `workbenchReady: true` and its mint id to
+// every hello, and hears `ezil.code.workbench` {v:1, nonce, mint, kind:'folder', path} from the editor once its
+// workbench is really mounted (`onWorkbench`). No other binding sends or hears either.
+//
+// Managed checkout (2026-11-26): a repository opened from its address has no ids, so it shares its owner's record on
+// this computer. A verified assignment preview's mint carries the server's folder pair (`tagFolderMint` `checkout`);
+// the signed preparation's binding, on a first document at one of the two, says nothing about a record that is a bare
+// `/workspace/projects/<uuid>` or one of that pair. Every other record is still said; the record is written as before.
+//
 // Why sessionStorage and not history.state: Code is single-instance per tab,
 // the folder belongs to the window rather than to a history entry,
 // Back/Forward never re-mints an open window (app-history.js), and a Code
@@ -52,6 +63,8 @@ const MAX_SEGMENTS = 64;
 const TOKEN_RE = /^[A-Za-z0-9_-]{22}$/;
 const OUTCOME_RE = /^[a-z_]{1,32}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** A bare platform project folder: the wrapper the platform makes for a repository, and nothing below it. */
+const PROJECT_WRAPPER_RE = /^\/workspace\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Server outcomes that opened something other than the asked folder (codes only; never a path). */
 const FALLBACKS = new Set(['missing', 'not_directory', 'symlink', 'outside', 'not_allowed', 'invalid', 'unverified', 'too_long', 'error']);
 /**
@@ -172,18 +185,30 @@ function token () {
     return btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-// mint id -> folder ask, outcome and optional repo presentation. Read once, by the binding of that mint.
+// mint id -> folder ask, outcome, optional repo presentation and optional managed checkout pair. Read once, by the
+// binding of that mint.
 const mints = new Map();
+
+/** A managed checkout's folder pair, or null: two plain normalised paths, the checkout a direct child of the workspace. */
+function checkoutPair (value) {
+    const workspace = value?.workspaceFolder, checkout = value?.checkoutFolder;
+    if ( typeof workspace !== 'string' || typeof checkout !== 'string' || workspace === '/'
+        || plainFolderPath(workspace) !== workspace || plainFolderPath(checkout) !== checkout ) return null;
+    const name = checkout.startsWith(`${workspace}/`) ? checkout.slice(workspace.length + 1) : '';
+    return name !== '' && ! name.includes('/') ? { workspace, checkout } : null;
+}
 
 /**
  * Tag a successful mint: the URL to put in the iframe (the minted one plus
  * `ezil_mint=<id>`), remembering what was asked and answered for it. A server
  * that answered no outcome to an ask is an older one (`unsupported_server`).
+ * `checkout`: the server's `{workspaceFolder, checkoutFolder}` of a verified assignment preview, and of no other mint.
  */
-export function tagFolderMint (url, { asked, answer, repositoryFocus } = {}) {
+export function tagFolderMint (url, { asked, answer, repositoryFocus, checkout } = {}) {
     const id = token();
     const outcome = typeof answer?.outcome === 'string' && OUTCOME_RE.test(answer.outcome) ? answer.outcome : null;
-    mints.set(id, { asked: asked?.path ?? null, outcome: asked && ! outcome ? 'unsupported_server' : outcome, repositoryFocus });
+    mints.set(id, { asked: asked?.path ?? null, outcome: asked && ! outcome ? 'unsupported_server' : outcome, repositoryFocus,
+        checkout: checkoutPair(checkout) });
     while ( mints.size > 8 ) mints.delete(mints.keys().next().value);
     try {
         const u = new URL(url);
@@ -268,6 +293,19 @@ export function detachFolderBridge (iframe) { bridges.get(iframe)?.detach(); }
  *     (`ezil.code.leaving`, its beforeunload): a navigation is under way, so the
  *     window must not start one of its own.
  *
+ * Workbench readiness (`workbench: true`, a minted binding only):
+ *   - every hello then carries `workbenchReady: true` and `mint: <this mint's id>`, which is what asks the editor;
+ *   - `onWorkbench({kind: 'folder', path})` hears `ezil.code.workbench` only when ALL of this holds: the same
+ *     source, origin and unchanged frame URL as any report; `nonce` is the LATEST hello's; that same hello's
+ *     folder report already counted as this mint's first document on a plain folder, with no fallback; `mint` is
+ *     this mint's id; `kind` is `folder` and `path` is exactly that reported folder. Once per hello.
+ *   - Re-arming: every new hello (attach, the iframe's `load`, a new document's `ezil.code.ready`) forgets the
+ *     hello before it, and so does `ezil.code.leaving`. A workbench message carrying an earlier nonce, one from a
+ *     document the frame has left, or one that precedes its hello's folder report is dropped; the editor answers
+ *     the latest hello again once (or as soon as) its workbench is mounted. A document the person navigated to
+ *     (`mint: null`) never counts.
+ *   - A binding that did not ask ignores the message: an ordinary Code window behaves byte for byte as before.
+ *
  * 🔴 Nothing here may tear the editor down by itself. Chrome keeps a frame's
  * document per joint history entry; F2 (Back after an in-frame Open Folder
  * reloaded the editor at the mint's first folder) is closed by folder-url-sync
@@ -279,7 +317,7 @@ export function detachFolderBridge (iframe) { bridges.get(iframe)?.detach(); }
  * that until the editor can confirm its backups are durable and editing has
  * stopped. A delay or a generic ready message is not that confirmation.
  */
-export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFolder, onRoot, onOpen, onLeaving, continued = false }) {
+export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFolder, onRoot, onOpen, onLeaving, onWorkbench, workbench = false, continued = false }) {
     bridges.get(iframe)?.detach();
     let origin, mintId;
     try {
@@ -294,13 +332,24 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFold
     let firstSeen = continued;
     let last = null; // the last folder/empty report, so onUserFolder hears changes only
     let fallbackShown = false; // the first document answers each hello (attach, ready, load): one notice per mint
+    // Workbench readiness is asked only by a minted binding that wants it; `armed` is the latest hello's nonce and
+    // the folder its mint-driven report named, kept until that document's workbench answers or a new hello is sent.
+    const asksWorkbench = workbench === true && mintId !== null;
+    let armed = null;
+    // Managed checkout: a bare project wrapper or one of the server's pair left in the shared record is not a child
+    // opened by hand, once this mint's first document shows one of the pair. Anything deeper or elsewhere is said.
+    const pair = asksWorkbench ? mint.checkout ?? null : null;
+    const staleManagedRecord = (prev, path) => pair !== null && (path === pair.workspace || path === pair.checkout)
+        && (PROJECT_WRAPPER_RE.test(prev) || prev === pair.workspace || prev === pair.checkout);
     const live = () => iframe.isConnected && iframe.src === frameUrl;
     const hello = () => {
         if ( ! live() ) { detach(); return; }
         nonce = token();
+        armed = null; // nothing an earlier hello (or an earlier document) was told can answer this one
         // Only the document with this mint and folder can apply the presentation hint.
         const focus = mint.repositoryFocus ? { mint: mintId, repositoryFocus: mint.repositoryFocus } : {};
-        try { iframe.contentWindow?.postMessage({ type: 'ezil.code.hello', v: 1, nonce, ...focus }, origin); } catch { /* gone */ }
+        const ready = asksWorkbench ? { workbenchReady: true, mint: mintId } : {};
+        try { iframe.contentWindow?.postMessage({ type: 'ezil.code.hello', v: 1, nonce, ...ready, ...focus }, origin); } catch { /* gone */ }
     };
     // What a report or an open request says the editor shows (or will): a plain folder, the empty window, or
     // anything Code cannot name in an address (a workspace, another scheme, a path the grammar refuses).
@@ -320,7 +369,19 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFold
         const d = ev.data;
         if ( ! d || typeof d !== 'object' || d.v !== 1 ) return;
         if ( d.type === 'ezil.code.ready' ) { hello(); return; }
-        if ( d.type === 'ezil.code.leaving' ) { try { onLeaving?.(); } catch { /* as above */ } return; }
+        // A document on its way out can no longer be the one whose workbench answers.
+        if ( d.type === 'ezil.code.leaving' ) { armed = null; try { onLeaving?.(); } catch { /* as above */ } return; }
+        if ( d.type === 'ezil.code.workbench' ) {
+            // The mounted workbench of this mint's first document, answering the latest hello, on the folder that
+            // hello's own report named. Anything else (an earlier nonce, another mint or folder, a binding that
+            // never asked, a message ahead of its folder report) is dropped without a word and changes nothing.
+            if ( ! armed || d.nonce !== armed.nonce || d.mint !== mintId || d.kind !== 'folder'
+                || plainFolderPath(d.path) !== armed.path ) return;
+            const root = { kind: 'folder', path: armed.path };
+            armed = null; // once per hello
+            try { onWorkbench?.(root); } catch { /* the window's own fault, never the bridge's */ }
+            return;
+        }
         if ( d.type === 'ezil.code.open' ) {
             // The editor is about to switch folder in this frame. Only a document this binding has heard from may
             // ask (a stale one of an earlier mint is about to be replaced anyway): the window adds the entry, then
@@ -361,9 +422,10 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFold
                 // r32: a project reopens at its repository folder; a child opened by hand is not reopened as the
                 // root (the repository's own config stays inert). Say so once, then follow what is on screen.
                 const prev = readFolderRecord(bind);
-                if ( prev?.kind === 'folder' && prev.path !== path ) notice?.projectChild?.(prev.path);
+                if ( prev?.kind === 'folder' && prev.path !== path && ! staleManagedRecord(prev.path, path) ) notice?.projectChild?.(prev.path);
             }
             putFolderRecord(bind, { kind: 'folder', path });
+            if ( asksWorkbench && mintDriven ) armed = { nonce: d.nonce, path };
             changed(mintDriven, `folder:${path}`, { kind: 'folder', path, base: d.base });
         } else if ( d.kind === 'empty' ) {
             if ( ! mintDriven ) putFolderRecord(bind, null); // Close Folder: the tab has no folder now

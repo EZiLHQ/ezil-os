@@ -7,7 +7,7 @@ The Next.js half of EZiL-OS: authentication, the "your computers" list, and the
 
 ## What lives here
 
-- **`src/app/`** — routes. `/login`, `/computers`, `/computer/[id]`, `/os`,
+- **`src/app/`** — routes. `/login`, `/computers`, `/os`, `/app/[appId]`,
   `/admin/telemetry`, plus the JSON transports under `/api/shell/*`, the
   scheduled jobs under `/api/cron/*`, and `/api/trpc/[trpc]`.
 - **`src/server/api/`** — the tRPC routers (`computer`, `cloudflareGuacamole`).

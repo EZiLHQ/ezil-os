@@ -154,19 +154,6 @@ describe('the policy is actually wired in', () => {
         expect(text).toMatch(/retry:\s*retryTransientOnly\(\)/);
     });
 
-    it('governs the desktop preview query, and no bare retry count survives there', () => {
-        const text = src('components/desktop/cloudflare-guacamole-canvas.tsx');
-        expect(text).toMatch(/retry:\s*retryTransientOnly\(DESKTOP_PREVIEW_RETRIES\)/);
-        // The exact defect: a blanket count that retried deterministic
-        // errors. Anchored to a line-leading option (prose about the old
-        // `retry: 2` is allowed to survive in comments; the option is not).
-        expect(text).not.toMatch(/^\s*retry:\s*\d/m);
-    });
-
-    it('leaves the 2s status poll on retry:false — the next poll IS the retry', () => {
-        expect(src('components/desktop/cloudflare-guacamole-canvas.tsx')).toMatch(/retry:\s*false/);
-    });
-
     it('lets the preview router surface a non-retryable Worker failure as a value, never a throw', () => {
         // A returned result cannot be retried by construction; a thrown
         // TRPCError is the only thing TanStack Query retries.

@@ -1,5 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 
+import { assignmentEmbedFramePolicy } from '@/utils/assignment-work-auth';
+import { publicOrigin } from '@/utils/forwarded';
 import { isCrossOriginWrite, isDocumentNavigation } from '@/utils/request-origin';
 import { updateSession } from '@/utils/supabase/middleware';
 
@@ -21,7 +23,12 @@ export async function proxy(request: NextRequest) {
               })
             : NextResponse.json({ error: 'cross_origin_request_refused' }, { status: 403 });
     }
-    return updateSession(request);
+    const response = await updateSession(request);
+    // The Universe assignment workspace frames its own assignment's Code. Only a request made to the exact paired OS
+    // origin is given this policy: no other host, path or query gains or loses a header here.
+    const framing = assignmentEmbedFramePolicy(publicOrigin(request.headers, request.url), request.nextUrl);
+    if (framing) response.headers.set('Content-Security-Policy', framing);
+    return response;
 }
 
 export const config = {

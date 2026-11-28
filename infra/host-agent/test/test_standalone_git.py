@@ -1,12 +1,12 @@
 """Offline standalone Git gates: no Docker, hosts, AWS or external network."""
-import copy, hashlib, json, os, subprocess, sys, tempfile, threading, time, unittest
+import copy, hashlib, hmac, json, os, runpy, subprocess, sys, tempfile, threading, time, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "lib"))
-from ezil_host import standalone_git as sg, standalone_git_runtime as rt, agent, desktop
+from ezil_host import standalone_git as sg, standalone_git_runtime as rt, agent, desktop, edge
 
 NOW = 1794430000.0
 CID = "11111111-1111-4111-8111-111111111111"
@@ -26,6 +26,25 @@ def output(r, **changes):
     return json.dumps({"canonicalUrl":p["repository"]["canonicalURL"],"folder":"/workspace/projects/"+RID+"/fixture",
                        "repository":p["repository"],"identity":p["identity"],"status":"reused",**changes}).encode()
 
+def assigned():
+    r = fresh()
+    owner = hashlib.sha256(r["privatePacket"]["identity"]["subject"].encode()).hexdigest()
+    attempt = "22222222-2222-4222-8222-222222222222"
+    event = "33333333-3333-4333-8333-333333333333"
+    canonical = f"https://github.ezil.work/default/u-{owner[:16]}-a-{attempt}.git"
+    identifier = list(hashlib.sha256(f"ezil-os/repo-url/v1|{canonical}".encode()).hexdigest()[:32])
+    identifier[12] = "8"
+    identifier[16] = "89ab"[int(identifier[16], 16) & 3]
+    hx = "".join(identifier)
+    repository = f"{hx[:8]}-{hx[8:12]}-{hx[12:16]}-{hx[16:20]}-{hx[20:]}"
+    r["repositoryId"] = repository
+    r["privatePacket"]["repository"]["canonicalURL"] = canonical
+    r["assignmentPreload"] = {"eventId": event, "attemptId": attempt, "ownerSha256": owner, "canonicalURL": canonical,
+                              "repositoryId": repository, "ref": "refs/heads/main", "manifestSha256": "c" * 64, "nonce": "d" * 64}
+    folder = f"/workspace/projects/{repository}/{canonical.rsplit('/', 1)[1][:-4]}"
+    return r, folder
+
+
 class Packet(unittest.TestCase):
     def test_optional_author_and_renewal_metadata_are_closed(self):
         r={**fresh(),"gitAuthor":{"name":"Contact","email":"contact@ezil.work"},"refreshOnly":True}
@@ -37,6 +56,19 @@ class Packet(unittest.TestCase):
         legacy=output(r,folder="/workspace/projects/"+RID+"/repository")
         self.assertIsNotNone(sg.validate_output(legacy,r))
         self.assertIsNone(sg.validate_output(legacy,fresh()))
+
+    def test_assignment_preload_is_closed_to_the_canonical_subject_checkout(self):
+        r, checkout = assigned()
+        self.assertTrue(sg.valid_request(r,NOW*1000))
+        self.assertEqual(sg.validate_output(output(r, folder=checkout), r)["checkoutFolder"], checkout)
+        for key, value in {"nonce": "wrong", "eventId": RID.replace("-8444-", "-7444-"),
+                           "ownerSha256": "a" * 64, "repositoryId": RID, "ref": "refs/heads/other"}.items():
+            changed = copy.deepcopy(r)
+            changed["assignmentPreload"][key] = value
+            self.assertFalse(sg.valid_request(changed,NOW*1000), key)
+        self.assertFalse(sg.valid_request({**r, "refreshOnly": True},NOW*1000))
+        r["privatePacket"]["git"]["scope"] = "read"
+        self.assertFalse(sg.valid_request(r,NOW*1000))
 
     def test_native_read_write_and_closed_scope_identity_url_ref_expiry(self):
         r=fresh()
@@ -74,11 +106,108 @@ class Packet(unittest.TestCase):
 
     def test_public_assets_exact_reviewed_cloudflare_sources(self):
         root=HERE.parents[2]
-        for name in ("stage.py","supervise.py"):
-            self.assertEqual((rt.ASSETS/name).read_bytes(),(root/"worker/repo-open"/name).read_bytes())
+        self.assertEqual((rt.ASSETS/"stage.py").read_bytes(),(root/"worker/repo-open/stage.py").read_bytes())
+        # The app source and the staging Worker have separate release revisions.
+        for name, reviewed_sha in {
+            "supervise.py": "a820cdc20fb1336ee778b7e19115d5802b7317f2cd1499ed8294449b9182ccbc",
+            "assignment-preload.py": "e3d06237dcd0c628d22def148dae0f72226438e0a6dea79c148e8ce0784ffdab",
+        }.items():
+            self.assertEqual(hashlib.sha256((rt.ASSETS/name).read_bytes()).hexdigest(), reviewed_sha)
         pin,argv=rt.runtime_command()
         self.assertEqual(pin["cliSha256"],"add3f83cef4b35e8a65f43af3d4ad8ed745c5fa25b6d728b21ad8f0500d63049")
         self.assertNotIn(SECRET,repr(argv))
+
+class AssignmentEdge(unittest.TestCase):
+    def response(self, path, result):
+        binding = {"computerId": CID, "generation": 1, "leaseEpoch": 2}
+        key = b"k" * 32
+        digest = hmac.new(key, edge.gateway_payload(binding, int(NOW), "GET", path).encode("ascii"), hashlib.sha256).hexdigest()
+        head = SimpleNamespace(
+            target=path, method="GET", rest=b"",
+            get=lambda name: [f"gw1.{int(NOW)}.{digest}"] if name == edge.GW_HEADER else [],
+        )
+        service = object.__new__(edge.Edge)
+        service.key, service.binding, service.clock = key, binding, lambda: NOW
+        service.ports = (8443, 5679)
+        service.seq = SimpleNamespace(send=mock.Mock(return_value=result), presence=mock.Mock())
+        service._proxy = mock.Mock()
+        with mock.patch.object(edge, "read_head", return_value=head), mock.patch.object(edge, "_reply") as reply:
+            service.handle(SimpleNamespace(settimeout=lambda _: None))
+        return reply.call_args.args[1:] if reply.called else None, service._proxy
+
+    def test_signed_status_exposes_only_the_legacy_or_exact_assignment_shape(self):
+        request, checkout = assigned()
+        witness = request["assignmentPreload"]
+        path = "/__ezil/control/standalone-repo-open-status/" + request["jobId"]
+        legacy = {"ok": True, "folder": f"/workspace/projects/{request['repositoryId']}", "status": "fetched"}
+        ack = {"eventId": witness["eventId"], "nonce": witness["nonce"], "port": 5679, "status": "acknowledged"}
+        assignment = {**legacy, "checkoutFolder": checkout, "assignmentPreload": ack}
+
+        def completed(result):
+            return {"ok": True, "state": "done", "result": result}
+
+        for result in (legacy, assignment):
+            with self.subTest(result=set(result)):
+                result_wrapper = completed(result)
+                self.assertEqual(self.response(path, result_wrapper)[0], (200, result_wrapper))
+        for malformed in (
+            {**legacy, "checkoutFolder": checkout},
+            {**assignment, "checkoutFolder": legacy["folder"] + "/../other"},
+            {**assignment, "assignmentPreload": {**ack, "port": 5679.0}},
+            {**assignment, "assignmentPreload": {**ack, "nonce": "q" * 64}},
+            {**assignment, "assignmentPreload": {**ack, "secret": SECRET}},
+        ):
+            with self.subTest(keys=set(malformed)):
+                self.assertEqual(self.response(path, completed(malformed))[0], (503, {"ok": False, "error": "agent_unavailable"}))
+
+    def test_private_assignment_port_cannot_be_opened_via_public_edge_proxy(self):
+        for path in (
+            "/__p/5679/",
+            "/__p/8443/proxy/5679/",
+            "/__p/8443/preview-ws//absproxy/5679/",
+            "/__p/8443/%2fproxy%2f%35%36%37%39/",
+        ):
+            with self.subTest(path=path):
+                reply, forward = self.response(path, None)
+                self.assertEqual(reply, (404, {"ok": False, "error": "not_found"}))
+                forward.assert_not_called()
+        reply, forward = self.response("/__p/8443/proxy/5678/", None)
+        self.assertIsNone(reply)
+        self.assertEqual(forward.call_args.args[2:], (8443, "/proxy/5678/"))
+
+
+class AssignmentSupervisor(unittest.TestCase):
+    def test_reopen_allows_only_the_exact_platform_terminal_settings(self):
+        reviewed = runpy.run_path(str(rt.ASSETS / "supervise.py"))
+        checked = reviewed["checked_assignment_terminal"]
+        _, checkout = assigned()
+        name = Path(checkout).name
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            setting_dir = folder / ".vscode"
+            self.assertFalse(checked(directory, name))
+            setting_dir.mkdir()
+            settings = setting_dir / "settings.json"
+            value = {"terminal.integrated.cwd": str(folder / name), "terminal.integrated.splitCwd": "initial"}
+            expected = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            settings.write_bytes(expected)
+            self.assertTrue(checked(directory, name))
+            self.assertFalse(checked(directory, "ordinary-checkout"))
+            settings.chmod(0o755)
+            self.assertFalse(checked(directory, name))
+            settings.chmod(0o644)
+            extra = setting_dir / "tasks.json"
+            extra.touch()
+            self.assertFalse(checked(directory, name))
+            extra.unlink()
+            settings.write_bytes(expected + b" ")
+            self.assertFalse(checked(directory, name))
+            settings.unlink()
+            other = folder / "other.json"
+            other.write_bytes(expected)
+            settings.symlink_to(other)
+            self.assertFalse(checked(directory, name))
+
 
 class Runtime(unittest.TestCase):
     def test_only_fd_bootstrap_is_decorated_not_the_gateway_packet(self):
@@ -94,6 +223,31 @@ class Runtime(unittest.TestCase):
         self.assertNotIn("gitAuthor",r["privatePacket"])
         self.assertNotIn("contact@ezil.work",repr(calls[1][0]))
         self.assertIn("--repo-refresh",calls[1][0])
+
+    def test_assignment_preload_runs_after_checkout_without_grant_and_requires_ack(self):
+        r, checkout = assigned()
+        witness = r["assignmentPreload"]
+        calls = []
+        def run(cfg, argv, **kwargs):
+            calls.append((argv, kwargs))
+            answer = [b"ezil-cli-bootstrap:ok", output(r, folder=checkout), b"ezil-assignment-preload:ack\n"][len(calls) - 1]
+            return subprocess.CompletedProcess(argv, 0, answer)
+        with mock.patch.object(desktop, "exec_", side_effect=run):
+            result, uncertain = rt.execute(None, {}, r, ready=lambda *args: True, clock=lambda: 0, wall=lambda: NOW)
+        self.assertFalse(uncertain)
+        self.assertEqual(result["assignmentPreload"], {"eventId": witness["eventId"], "nonce": witness["nonce"],
+                                                        "port": 5679, "status": "acknowledged"})
+        self.assertEqual(calls[2][0][-1], checkout)
+        self.assertEqual(json.loads(calls[2][1]["input"]), witness)
+        self.assertNotIn(SECRET, repr(calls[2]))
+        self.assertNotIn(witness["nonce"], repr(calls[2][0]))
+        rejected = [subprocess.CompletedProcess([], 0, answer)
+                    for answer in (b"ezil-cli-bootstrap:ok", output(r, folder=checkout), b"wrong")]
+        with mock.patch.object(desktop, "exec_", side_effect=rejected):
+            result, uncertain = rt.execute(None, {}, r, ready=lambda *args: True, clock=lambda: 0, wall=lambda: NOW)
+        self.assertFalse(uncertain)
+        self.assertEqual(result["diagnosticReason"], "invalid_result")
+        self.assertNotIn("assignmentPreload", result)
 
     def test_supervisor_refusal_has_no_uncertain_writer_or_quarantine(self):
         for reason in ("repo_open_workspace_unavailable","repo_open_folder_conflict"):
@@ -250,7 +404,7 @@ class InstalledLayout(unittest.TestCase):
             got=json.loads(subprocess.check_output([sys.executable,"-I","-c",public,str(installed/"lib")],cwd=directory))
             self.assertEqual(got["cli"],"add3f83cef4b35e8a65f43af3d4ad8ed745c5fa25b6d728b21ad8f0500d63049")
             self.assertEqual(got["stage"],hashlib.sha256((root/"worker/repo-open/stage.py").read_bytes()).hexdigest())
-            self.assertEqual(got["supervisor"],hashlib.sha256((root/"worker/repo-open/supervise.py").read_bytes()).hexdigest())
+            self.assertEqual(got["supervisor"],hashlib.sha256((rt.ASSETS/"supervise.py").read_bytes()).hexdigest())
 
 class SupervisorCancellation(unittest.TestCase):
     def test_real_reviewed_supervisor_reaps_escaped_child_and_suppresses_success(self):

@@ -51,6 +51,16 @@ describe('computer.systemInfo', () => {
         expect(h.readSystemInfo).not.toHaveBeenCalled();
     });
 
+    it('checks assignment host compatibility only for the authenticated live computer', async () => {
+        const db = dbOwning(true);
+        await computerRouter.createCaller({ user: { id: OWNER }, db } as never).systemInfo({ computerId: C1, assignmentSession: true });
+        expect(h.readSystemInfo).toHaveBeenCalledWith(db, { computerId: C1, userId: OWNER, assignmentSession: true });
+        h.readSystemInfo.mockClear();
+        await expect(computerRouter.createCaller({ user: { id: OWNER }, db: dbOwning(false) } as never)
+            .systemInfo({ computerId: C1, assignmentSession: true })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+        expect(h.readSystemInfo).not.toHaveBeenCalled();
+    });
+
     it("a placement recorded for another owner (reader returns null): NOT_FOUND", async () => {
         h.readSystemInfo.mockResolvedValue(null);
         const call = computerRouter.createCaller({ user: { id: OWNER }, db: dbOwning(true) } as never).systemInfo({ computerId: C1 });

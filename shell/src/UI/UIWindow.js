@@ -383,7 +383,10 @@ async function UIWindow (options) {
         const btn_attrs = (cls, label) =>
             `class="window-action-btn ${cls}" role="button" tabindex="0" aria-label="${html_encode(label)}" title="${html_encode(label)}"`;
         // Minimize button, only if window is resizable and not embedded
-        if ( options.is_resizable && options.show_minimize_button && !window.is_embedded )
+        // MODIFIED BY EZIL 2026-11-26: `minimize_when_embedded` (default absent). A framed shell still has no minimise,
+        // except a window that asks for it by name: the assignment's Code window inside its own Universe work page,
+        // whose desktop is a working one. Every other embed and every other window is as before.
+        if ( options.is_resizable && options.show_minimize_button && (!window.is_embedded || options.minimize_when_embedded === true) )
         {
             h += `<span ${btn_attrs('window-minimize-btn', i18n('minimize'))}><img src="${html_encode(window.icons['minimize.svg'])}" draggable="false"></span>`;
         }
@@ -4343,6 +4346,7 @@ $.fn.showWindow = async function (options) {
                     if ( ! morphed && was_hidden ) $(el_window).hide();
                 }
                 if ( ! morphed ) $(el_window).fadeIn(150);
+                el_window._ezil_restore_frame_viewport?.();
                 // Restores come back with the control drawer collapsed —
                 // whatever state it was minimized in (headless dashboard
                 // windows only; no-op otherwise).
@@ -4400,6 +4404,7 @@ $.fn.showWindow = async function (options) {
                 setTimeout(() => {
                     $(el_window).css('transition', 'none');
                 }, 250);
+                el_window._ezil_restore_frame_viewport?.();
             }
         }
     });
@@ -5259,6 +5264,7 @@ $.fn.hideWindow = async function (options) {
     $(this).each(async function () {
         if ( $(this).hasClass('window') ) {
             window.dispatchEvent(new CustomEvent('ezil:native-composition', { detail: { window: this, visible: false } }));
+            this._ezil_preserve_frame_viewport?.();
             // get taskbar item location
             let taskbar_item_pos = $(`.taskbar .taskbar-item[data-app="${$(this).attr('data-app')}"]`).position();
 

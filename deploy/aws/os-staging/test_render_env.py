@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -240,6 +241,62 @@ class ProductionEnvironmentTests(unittest.TestCase):
         self.assertEqual(renderer.validate(dict(self.values), "production"), self.values)
         renderer.validate({**self.values, "STRIPE_SECRET": "rk_live_synthetic",
                            "SUPABASE_DATABASE_URL": PRODUCTION_DB.replace("postgres://", "postgresql://")}, "production")
+
+    def assignment_values(self):
+        return {
+            **self.values,
+            "BILLING_FUNDING_URL": "https://ai.ezil.work",
+            "UNIVERSE_PROJECT_REPO_ORIGIN": "https://universe.ezil.work",
+            renderer.ASSIGNMENT_GATE: "1",
+            renderer.ASSIGNMENT_SIGNER: "synthetic-signing-key-" + "x" * 20,
+        }
+
+    def test_assignment_gate_and_origin_are_exact(self):
+        values = self.assignment_values()
+        self.assertEqual(renderer.validate(values, "production"), values)
+        for key, refusers in {
+            renderer.ASSIGNMENT_GATE: ["true", "enabled", "0"],
+            renderer.ASSIGNMENT_SIGNER: ["x" * 31],
+            "BILLING_FUNDING_URL": ["https://ai.ezil.work/", "https://ai-staging.ezil.work"],
+            "UNIVERSE_PROJECT_REPO_ORIGIN": ["https://universe.ezil.work/", "https://universe-staging.ezil.work",
+                                             "https://universe.ezil.work.example.invalid"],
+        }.items():
+            for value in [None, *refusers]:
+                with self.subTest(key=key, value=value), self.assertRaises(renderer.RenderError):
+                    renderer.validate(({**values, key: value} if value is not None
+                                       else {name: val for name, val in values.items() if name != key}), "production")
+        disabled = {**self.values, renderer.ASSIGNMENT_GATE: "0"}
+        self.assertEqual(renderer.validate(disabled, "production"), disabled)
+        self.assertEqual(renderer.validate(self.values, "production"), self.values)
+
+    def test_assignment_keys_require_the_production_realm(self):
+        stage = {key: "synthetic-value-never-log-1234567890" for key in renderer.REQUIRED}
+        for key in renderer.PRODUCTION_ASSIGNMENT:
+            self.assertRefused({**stage, key: "synthetic"}, "Unknown key refused", "staging")
+        for key in (renderer.ASSIGNMENT_SIGNER, renderer.ASSIGNMENT_CA):
+            self.assertRefused({**self.values, key: "synthetic"}, "require the enabled gate")
+
+    def test_assignment_ca_is_one_real_certificate_and_one_raw_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = ["openssl", "req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+                      "-nodes", "-x509", "-days", "1", "-subj", "/CN=Synthetic Assignment Test"]
+            pem_path = Path(directory) / "public.pem"
+            for is_ca in (False, True):
+                subprocess.run([*prefix, "-addext", f"basicConstraints=critical,CA:{str(is_ca).upper()}",
+                                "-out", str(pem_path), "-keyout", str(Path(directory) / "key.pem")],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                pem = pem_path.read_text()
+                if not is_ca:
+                    self.assertRefused({**self.assignment_values(), renderer.ASSIGNMENT_CA: pem}, "valid CA")
+            values = self.assignment_values()
+            escaped = pem.replace("\n", r"\n")
+            for valid in (pem, pem.replace("\n", "\r\n"), escaped):
+                normalized = renderer.validate({**values, renderer.ASSIGNMENT_CA: valid}, "production")
+                self.assertEqual(normalized[renderer.ASSIGNMENT_CA], escaped)
+                self.assertNotIn("\n", normalized[renderer.ASSIGNMENT_CA])
+            for invalid in (pem + pem, pem + "\nFORGED_KEY=synthetic", pem.replace("CERTIFICATE", "PRIVATE KEY"),
+                            "-----BEGIN CERTIFICATE-----\nYQ==\n-----END CERTIFICATE-----\n", "x" * 16385):
+                self.assertRefused({**values, renderer.ASSIGNMENT_CA: invalid}, "valid CA")
 
     def test_native_keys_are_explicit_and_production_only(self):
         native = {key: "synthetic-pin" for key in renderer.PRODUCTION_NATIVE}
