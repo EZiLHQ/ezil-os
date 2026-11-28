@@ -1,3 +1,4 @@
+import {openWithAssignmentConsent, confirmAssignmentFolder} from '../assignment-video/shell.js';
 import { ai_trace_collector } from '../ui/ai-traces.js';
 import { attachCodeAuthRecovery, resetOriginRecovery } from './code-auth-recovery.js';
 import { createGitAccessRenewal } from './code-git-access.js';
@@ -150,7 +151,7 @@ import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js
 import AppSpinner from '../ui/app-spinner.js';
 import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
 import attach_app_drawer from '../ui/app-drawer.js';
-import { createFullView } from '../ui/full-view.js';
+import { createFullView, is_minimized } from '../ui/full-view.js';
 import { appUrl } from '../app-history.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
@@ -197,6 +198,13 @@ const PROJECT_REFUSALS = {
     repo_url_moved: 'repo_url_moved',
     repo_url_empty: 'repo_url_empty',
     repo_url_unavailable: 'repo_url_unavailable',
+    // A reserved assignment repository (`../assignment-video/shell.js`). The first two are the route's refusals and are
+    // terminal (`session.js` TERMINAL_ERROR_CODES); the server's `assignment_checkout_unverified` is the gate's
+    // `assigned_checkout_unverified`. `assignment_open_unavailable` is a failed Universe call: retryable.
+    assignment_recording_required: 'assignment_recording_required',
+    assignment_checkout_unverified: 'assigned_checkout_unverified',
+    assignment_open_unavailable: 'assignment_open_unavailable',
+    assignment_aws_unverified: 'assignment_aws_unverified',
 };
 const PROJECT_FAILURE_COPY = {
     project_not_authorized: {
@@ -243,6 +251,22 @@ const PROJECT_FAILURE_COPY = {
     repo_url_unavailable: {
         title: "Couldn't reach this repository",
         body: 'Something went wrong while checking the repository. Try again in a moment.',
+    },
+    assignment_recording_required: {
+        title: 'Open this assignment from its recorded tab',
+        body: 'Code opens an assignment repository only while this EZiL OS tab is shared and recording. Open the assignment from Universe, then share this tab.',
+    },
+    assigned_checkout_unverified: {
+        title: "Couldn't verify the assignment checkout",
+        body: 'The protected assignment checkout could not be verified. Share this OS tab again to retry.',
+    },
+    assignment_aws_unverified: {
+        title: "Couldn't verify this AWS computer for the assignment",
+        body: 'Universe has no matching record of this assignment on this computer. Reopen it from Universe on the computer you started with, or select a Cloudflare computer you own.',
+    },
+    assignment_open_unavailable: {
+        title: "Couldn't reach Universe",
+        body: "EZiL OS couldn't check this assignment with Universe just now. Try again in a moment.",
     },
 };
 /** A repository address as `../app-link.js` accepts it: https only; the server decides what it may name. */
@@ -300,7 +324,12 @@ function opensRepository (url, project, data) {
     if ( typeof id !== 'string' || ! PROJECT_UUID.test(id) ) return false;
     try {
         const folders = new URL(url).searchParams.getAll('folder');
-        return folders.length === 1 && folders[0].endsWith(`/projects/${id}`);
+        if (folders.length !== 1) return false;
+        if (folders[0].endsWith(`/projects/${id}`)) return true;
+        const workspace = data?.repository?.workspaceFolder, checkout = data?.repository?.checkoutFolder;
+        const name = project.repoUrl?.split('/').at(-1)?.replace(/\.git$/, '');
+        return typeof workspace === 'string' && workspace.endsWith(`/projects/${id}`) && name
+            && checkout === workspace+'/'+name && folders[0] === checkout;
     } catch {
         return false;
     }
@@ -311,7 +340,12 @@ function projectReturnUrl (project) {
     const params = project.repoUrl ? [['repo', project.repoUrl]] : [['project', project.projectId], ['repo', project.repoId]];
     if ( project.path ) params.push(['path', project.path]);
     try {
-        const computers = new URLSearchParams(window.location.search).getAll('computer');
+        const query = new URLSearchParams(window.location.search);
+        const assignment = query.get('assignment');
+        if (assignment && query.get('repo') === project.repoUrl && project.repoUrl?.endsWith('-a-'+assignment+'.git')
+            && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(assignment))
+            params.push(['assignment',assignment]);
+        const computers = query.getAll('computer');
         if ( computers.length === 1 ) params.push(['computer', computers[0]]);
     } catch { /* no page computer */ }
     return appUrl('code', params);
@@ -441,7 +475,7 @@ const CODE_UNREACHABLE_COPY = {
  * @returns {Promise<{ok: true, url: string, expiresAt?: number, repository?: string|null, repositoryFolder?: string|null}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-async function mintCodePreviewUrl (computerId, signal, project = null, folder = null) {
+async function mintCodePreviewUrl (computerId, signal, project = null, folder = null, assignment) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
     }
@@ -457,7 +491,7 @@ async function mintCodePreviewUrl (computerId, signal, project = null, folder = 
     // asking after its window closed (Stop closes it first) and re-provisioned the
     // computer 0.23 s after the stop. `signal` is the window's, aborted on close;
     // Stop also reaches it through `session.cancelComputerOpens`.
-    return session.cancellableWake(computerId, 'codePreviewUrl', (s) => mintCodePreviewUrlOnce(computerId, s, project, folder), { signal });
+    return session.cancellableWake(computerId, 'codePreviewUrl', (s) => mintCodePreviewUrlOnce(computerId, s, project, folder, assignment), { signal });
 }
 
 /** The request's signal: its timeout and, when given, the loop's cancel. */
@@ -468,7 +502,7 @@ function mintSignal (cancel) {
 }
 
 /** One `POST /api/shell/code-preview-url`. The loop that may call it more than once is above. */
-async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = null) {
+async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = null, assignment) {
     const started = await session.ensureLocalDesktop(computerId);
     if ( ! started.ok ) return started;
     const endpoint = session.payload()?.desktopState?.endpoints?.codePreviewUrl
@@ -489,7 +523,7 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
             // only an ask that says so may start moving a held computer's files. An older server ignores the field.
             // Lane O2: the project rides along only when there is one, as its two ids and nothing else.
             // A repository address rides as `{url}` and nothing else; the server decides what it names.
-            body: JSON.stringify(project?.repoUrl ? { computerId, intent: 'open', repository: { url: project.repoUrl } }
+            body: JSON.stringify(project?.repoUrl ? { computerId, intent: 'open', repository: { url: project.repoUrl }, ...(assignment ? {assignment} : {}) }
                 : project ? { computerId, intent: 'open', project: { projectId: project.projectId, repoId: project.repoId } }
                     : { computerId, intent: 'open', ...(folder_ask ? { codeFolder: folder_ask } : {}) }),
             signal: mintSignal(cancel),
@@ -544,6 +578,11 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
     }
 
     if ( data?.ok !== true ) return session.pendingOrRefused(data);
+    if (assignment?.phase === 'prepare') {
+        if (data.codePreviewUrl || data.url || !data.assignmentOpen || !data.repository)
+            return {ok:false,errorCode:'assigned_checkout_unverified'};
+        return {ok:true,assignmentOpen:data.assignmentOpen,repository:data.repository};
+    }
     if ( typeof data.codePreviewUrl !== 'string' || data.codePreviewUrl === '' ) {
         // Reported success with nothing to show. Loud, not silent — same rule
         // `session.js`'s `previewUrl()` follows for `appPreviewUrl`.
@@ -572,7 +611,7 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
     const repositoryFocus = project?.repoUrl?.startsWith('https://github.ezil.work/') && repository && repositoryFolder
         ? { name: repository, folder: repositoryFolder } : undefined;
     const url = tagFolderMint(data.codePreviewUrl, { asked: folder_ask, answer: data.codeFolder, repositoryFocus });
-    return { ok: true, url, expiresAt: data.expiresAt, ...(project ? { repository, repositoryFolder } : {}) };
+    return { ok: true, url, expiresAt: data.expiresAt, assignmentOpen: data.assignmentOpen, ...(project ? { repository, repositoryFolder } : {}) };
 }
 
 /**
@@ -678,6 +717,8 @@ export async function openCodeWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    let assignmentGate;
+    let assignmentGeneration=0;
     let git_access = null;
     let git_access_notice = null;
     /** The current attempt's mint loop: aborted by the next attempt and by close (hotfix r5). */
@@ -703,6 +744,7 @@ export async function openCodeWindow (ctx = {}) {
         : ctx.folderRejected === 'with_repository' ? 'with_repository' : 'link_invalid';
     /** The folder the server opened this window's project at (its mint URL's `folder`), never named in the address. */
     let repository_folder = null;
+    let assignment_open;
     /** What the editor shows, from its last report: `{kind: 'folder', path, base?}`, `{kind: 'empty'}`, `{kind: 'unsupported'}`. */
     let editor_root = null;
     /** Every folder this window's editor has shown (walked by a mint, or opened by the person in Code). */
@@ -933,8 +975,8 @@ export async function openCodeWindow (ctx = {}) {
         el_state.hidden = true;
         delete el_state.dataset.state;
         return_probe_retry = null;
-        el_iframe.inert = false;
-        el_iframe.removeAttribute('aria-hidden');
+        el_iframe.inert = assignmentGate?.locked() === true;
+        if (!el_iframe.inert) el_iframe.removeAttribute('aria-hidden');
     };
     const show_state = (kind) => {
         if ( disposed ) return;
@@ -966,11 +1008,14 @@ export async function openCodeWindow (ctx = {}) {
     const show_unavailable = () => { hide_state(); progress.el.hidden = true; el_unavailable.hidden = false; };
 
     async function start_boot () {
+        const assignment = assignmentGate?.access();
+        if (assignmentGate && !assignment) return;
         last_failure = null;
         last_progress = null; generic_timeout = null;
         if ( disposed ) return;
         git_access?.reset();
         repository_folder = null;
+        assignment_open = undefined;
         const my_attempt = ++attempt;
         stop_timers();
         show_panel();
@@ -1016,13 +1061,16 @@ export async function openCodeWindow (ctx = {}) {
         mint_ctl?.abort();
         mint_ctl = new AbortController();
         const asked = project;
-        const res = await (nativeSurface ? nativeSurface.open(ctx.previewPort) : mintCodePreviewUrl(computer.id, mint_ctl.signal, asked, wanted_folder));
+        const res = await (nativeSurface ? nativeSurface.open(ctx.previewPort) : mintCodePreviewUrl(computer.id, mint_ctl.signal, asked, wanted_folder, assignment));
 
         if ( disposed || my_attempt !== attempt ) return;
         stop_timers();
 
         if ( ! res.ok ) {
             last_failure = res;
+            // An assignment's open-phase mint failed: the gate says so now, with the real cause, instead of waiting out
+            // its editor timeout behind this panel (which it covers). A cancelled mint is a stop, never a failure.
+            if ( res.errorCode !== 'cancelled' ) assignmentGate?.fail(res);
             if (nativeFailureCopy) Object.assign(nativeFailureCopy, editorFailureCopy(res.errorCode));
             // `code_preview_unavailable` is the one code that means "this
             // deployment/container cannot serve code-server at all" — the
@@ -1100,6 +1148,7 @@ export async function openCodeWindow (ctx = {}) {
         console.info(`[${PHASE}] mint resolved in ${Math.round(performance.now() - t0)}ms`);
         trace.step('mint_ok');
         repository_folder = asked ? (res.repositoryFolder ?? null) : null;
+        assignment_open = res.assignmentOpen;
         if ( asked ) {
             // Lane O2: the repository is open, so a later refresh may happen again; the window is named after it.
             forgetIdentityRefresh();
@@ -1229,7 +1278,14 @@ export async function openCodeWindow (ctx = {}) {
                         // origin, answering this binding's hello nonce with this mint's id. The server's HTTP
                         // confirmation above is not that (the 502 recovery page installs no bridge), so a probe that
                         // answers while the frame still shows that page cannot re-arm the automatic reopen.
-                        onRoot: (root, how) => { resetOriginRecovery(); on_root(root, how); },
+                        onRoot: (root, how) => {
+                            resetOriginRecovery();
+                            if (how.mintDriven && !how.fallback && root.kind === 'folder' && (root.path === repository_folder || assignmentGate)) {
+                                confirmAssignmentFolder(project, assignment_open, el_iframe, frame_url, root.path);
+                                assignment_open = undefined;
+                            }
+                            on_root(root, how);
+                        },
                         onOpen: on_open, onLeaving: on_leaving,
                     });
                     if ( link_folder_problem ) { folder_notice.fallback(link_folder_problem, null); link_folder_problem = null; }
@@ -1462,6 +1518,21 @@ export async function openCodeWindow (ctx = {}) {
     // Visual values are provisional — see `docs/APP-CODE-FULL-VIEW.md` §3.
     const full_view = createFullView(el_window);
 
+    // Dock transitions resize the outer window, but those intermediate sizes must
+    // never reach the editor's pane layout. Freeze the frame's real layout box,
+    // including during the full-view chrome change, and release it on restore.
+    let frame_box = null;
+    let restore_timer = null;
+    function preserve_frame_viewport () {
+        clearTimeout(restore_timer);
+        if ( frame_box || ! el_iframe.clientWidth || ! el_iframe.clientHeight ) return;
+        const measured = getComputedStyle(el_iframe);
+        const { width, height } = measured;
+        frame_box = { width: el_iframe.style.width, height: el_iframe.style.height };
+        Object.assign(el_iframe.style, { width, height });
+    }
+    if ( ! nativeSurface ) el_window._ezil_preserve_frame_viewport = preserve_frame_viewport;
+
     // The control drawer: the Browser's tray, centred in the strip as the
     // Browser's is. Its expanded tray carries the title and every window
     // action. "Show desktop" is the one minimise: until G3 the top bar also
@@ -1472,7 +1543,10 @@ export async function openCodeWindow (ctx = {}) {
         icon: ctx.icon,
         flash_on_attach: false,
         actions: [
-            { id: 'minimize', label: 'Show desktop', svg: MINIMISE_SVG, onClick: () => { full_view.minimise(); } },
+            { id: 'minimize', label: 'Show desktop', svg: MINIMISE_SVG, onClick: () => {
+                el_window._ezil_preserve_frame_viewport?.();
+                full_view.minimise();
+            } },
             { id: 'restore', label: 'Restore window', svg: RESTORE_SVG, onClick: () => { set_view('window', { remember: true }); } },
         ],
     });
@@ -1581,17 +1655,26 @@ export async function openCodeWindow (ctx = {}) {
         project = next;
         if ( same ) return;
         set_title(title);
-        void start_boot();
+        launchWithConsent();
     };
     // Back from the taskbar: full view again if still wanted, else the
     // windowed bounds a minimise-from-full left stashed. After `showWindow`'s
     // 0.2s geometry transition, as the Browser does, and re-checked then.
-    const restore_observer = full_view.watch_restore(() => {
-        setTimeout(() => {
-            if ( disposed ) return;
+    function restore_frame_viewport () {
+        clearTimeout(restore_timer);
+        restore_timer = setTimeout(() => {
+            if ( disposed || is_minimized(el_window) ) return;
             if ( full_view.wants ) full_view.enter(); else full_view.settle();
+            if ( frame_box ) {
+                Object.assign(el_iframe.style, frame_box);
+                frame_box = null;
+            }
         }, 220);
-    });
+    }
+    // Hosted restores come from showWindow so even an immediate hide/show pair
+    // releases the frame. Native Code keeps its existing minimized-state observer.
+    if ( ! nativeSurface ) el_window._ezil_restore_frame_viewport = restore_frame_viewport;
+    const restore_observer = nativeSurface ? full_view.watch_restore(restore_frame_viewport) : null;
 
     const launch_view = ctx.view === 'full' || ctx.view === 'window' ? ctx.view : remembered_view();
     if ( launch_view === 'full' ) full_view.enter();
@@ -1601,10 +1684,12 @@ export async function openCodeWindow (ctx = {}) {
         progress.dispose();
         if (disposed) return;
         disposed = true;
+        void assignmentGate?.close();
         git_access?.dispose();
         git_access_notice?.remove(); git_access_notice = null;
         hide_state();
-        restore_observer.disconnect();
+        restore_observer?.disconnect();
+        clearTimeout(restore_timer);
         // A closed window stops asking: no ask after close can reach ensure() (hotfix r5).
         mint_ctl?.abort();
         window.removeEventListener('ezil:desktop-restarted', on_restarted);
@@ -1649,7 +1734,57 @@ export async function openCodeWindow (ctx = {}) {
     window.addEventListener('ezil:desktop-restarted', on_restarted);
     window.addEventListener(TRANSITION_EVENT, on_transition);
 
-    void start_boot();
+    function launchWithConsent() {
+        const generation=++assignmentGeneration;
+        const requestedProject=project;
+        const stillHere=()=>!disposed && generation===assignmentGeneration;
+        void assignmentGate?.close();
+        assignmentGate = null;
+        assignmentGate = openWithAssignmentConsent({project:requestedProject, computerId:computer.id, actor:()=>session.payload()?.user?.id,
+            body:el_body,
+            park(locked) {
+                if(!stillHere())return;
+                el_body.classList.toggle('ezil-assignment-work-locked',locked);
+                el_iframe.inert = locked;
+                if (locked) {
+                    if (document.activeElement === el_iframe) el_iframe.blur();
+                    el_iframe.setAttribute('aria-hidden','true');
+                } else el_iframe.removeAttribute('aria-hidden');
+            },
+            async computerInfo() {
+                const path = desktop_state.endpoints?.system;
+                if (path !== '/api/shell/system') return null;
+                const response = await fetch(path + '?' + new URLSearchParams({computerId:computer.id, assignmentSession:'1'}), {
+                    cache:'no-store', credentials:'same-origin', redirect:'error', signal:AbortSignal.timeout(7000),
+                });
+                if (!response.ok) return null;
+                const result = await response.json();
+                return result?.ok === true ? result.info : null;
+            },
+            async prepare(attemptId, {signal}={}) {
+                if (!stillHere()) throw Object.assign(new Error('closed'),{code:'workspace_disconnected'});
+                // A share that already ended never starts (or aborts) a mint: the next share may own `mint_ctl` by now.
+                if (signal?.aborted) throw Object.assign(new Error('cancelled'),{code:'cancelled'});
+                mint_ctl?.abort();
+                const ctl = mint_ctl = new AbortController();
+                // The gate's stop reaches this call's mint only, never a later share's.
+                const cancel = () => ctl.abort();
+                signal?.addEventListener('abort',cancel,{once:true});
+                let result;
+                try { result = await mintCodePreviewUrl(computer.id,ctl.signal,requestedProject,null,{attemptId,phase:'prepare'}); }
+                finally { signal?.removeEventListener('abort',cancel); if (mint_ctl === ctl) mint_ctl = null; }
+                if(!stillHere())throw Object.assign(new Error('closed'),{code:'workspace_disconnected'});
+                if (!result.ok) throw Object.assign(new Error('prepare_failed'),{code:result.errorCode,
+                    ...failureFields({reason:result.reason,correlationId:result.correlationId})});
+                return result;
+            },
+            open:()=>{if (stillHere()) void start_boot();}});
+        if (!assignmentGate) {
+            el_body.classList.remove('ezil-assignment-work-locked');
+            el_iframe.inert=false; el_iframe.removeAttribute('aria-hidden');
+        }
+    }
+    launchWithConsent();
     return el_window;
 }
 

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -73,6 +74,15 @@ EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR_SHA256 EZIL_
 EZIL_NATIVE_GATEWAY_POLICY_ID EZIL_NATIVE_GATEWAY_SERVICE_CREDENTIAL EZIL_NATIVE_GATEWAY_SERVICE_EXPIRES_AT
 EZIL_NATIVE_QUALIFICATION_TARGET
 """.split())
+ASSIGNMENT_GATE = "EZIL_ASSIGNMENT_PRODUCTION_ENABLED"
+ASSIGNMENT_SIGNER = "UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET"
+ASSIGNMENT_CA = "UNIVERSE_ASSIGNMENT_API_CA_PEM"
+PRODUCTION_ASSIGNMENT = frozenset((ASSIGNMENT_GATE, ASSIGNMENT_SIGNER, ASSIGNMENT_CA))
+PRODUCTION_UNIVERSE_ORIGIN = "https://universe.ezil.work"
+ASSIGNMENT_CA_MAX_LENGTH = 16384
+ASSIGNMENT_CA_PEM = re.compile(
+    r"-----BEGIN CERTIFICATE-----\n([A-Za-z0-9+/=\n]+)\n-----END CERTIFICATE-----\n?"
+)
 PRODUCTION_BROWSER_GATE = "EZIL_DELEGATED_BROWSER_PROD_CANARY"
 PRODUCTION_BROWSER_PINS = (
     "EZIL_BROWSER_PROD_CANARY_USER_ID", "EZIL_BROWSER_PROD_CANARY_COMPUTER_ID",
@@ -110,12 +120,16 @@ class RenderError(Exception):
 def validate(values, environment="staging"):
     if not isinstance(values, dict):
         raise RenderError("Expected a JSON object")
-    allowed = REQUIRED | OPTIONAL | ((PRODUCTION_NATIVE | PRODUCTION_BROWSER) if environment == "production" else frozenset())
+    allowed = REQUIRED | OPTIONAL
+    if environment == "production":
+        allowed |= PRODUCTION_NATIVE | PRODUCTION_BROWSER | PRODUCTION_ASSIGNMENT
     if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):
         raise RenderError("Unknown key refused")
     if REQUIRED - values.keys():
         raise RenderError("Missing required key")
-    for value in values.values():
+    for key, value in values.items():
+        if key == ASSIGNMENT_CA and isinstance(value, str) and value:
+            continue  # The production CA validator below handles complete PEM input.
         if not isinstance(value, str) or not value or value != value.strip():
             raise RenderError("Expected nonempty strings without surrounding whitespace")
         if any(c in value for c in "\r\n\0"):
@@ -125,6 +139,7 @@ def validate(values, environment="staging"):
     validate_delegation(values, environment)
     if environment == "production":
         validate_production(values)
+        return validate_production_assignment(values)
     elif any(marker in value for value in values.values() for marker in PRODUCTION_MARKERS):
         raise RenderError("Staging refuses production API or database values")
     elif any(value.startswith(LIVE_STRIPE) for value in values.values()):
@@ -229,6 +244,47 @@ def validate_production_browser(values):
         or not values.get("CLOUDFLARE_GUACAMOLE_HMAC_SECRET")
     ):
         raise RenderError("Production Browser canary requires the canonical connector, OS and Cloudflare Worker pins")
+
+
+def assignment_ca_env_value(raw):
+    """Parse one public trust anchor and pack the canonical PEM into one raw Compose line."""
+    if len(raw) > ASSIGNMENT_CA_MAX_LENGTH:
+        raise RenderError("Production assignment ingress requires one valid CA certificate")
+    pem = raw.replace("\r\n", "\n").replace(r"\r\n", "\n").replace(r"\n", "\n")
+    match = ASSIGNMENT_CA_PEM.fullmatch(pem)
+    try:
+        if not match:
+            raise ValueError
+        der = base64.b64decode(match[1].replace("\n", ""), validate=True)
+        pem = ssl.DER_cert_to_PEM_cert(der)
+        trust = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        trust.load_verify_locations(cadata=pem)
+        if trust.get_ca_certs(binary_form=True) != [der]:
+            raise ValueError
+        packed = pem.replace("\n", r"\n")
+        if len(packed) > ASSIGNMENT_CA_MAX_LENGTH:
+            raise ValueError
+        return packed
+    except (ValueError, ssl.SSLError):
+        raise RenderError("Production assignment ingress requires one valid CA certificate") from None
+
+
+def validate_production_assignment(values):
+    gate = values.get(ASSIGNMENT_GATE)
+    if gate not in (None, "0", "1"):
+        raise RenderError("Production assignment gate must be exactly 0 or 1")
+    if gate != "1":
+        if ASSIGNMENT_SIGNER in values or ASSIGNMENT_CA in values:
+            raise RenderError("Production assignment credentials require the enabled gate")
+        return values
+    if values.get("UNIVERSE_PROJECT_REPO_ORIGIN") != PRODUCTION_UNIVERSE_ORIGIN \
+            or values.get("BILLING_FUNDING_URL") != PRODUCTION_FUNDING_URL:
+        raise RenderError("Production assignments require the canonical Universe and funding origins")
+    if len(values.get(ASSIGNMENT_SIGNER, "")) < 32:
+        raise RenderError("Production assignment signer requires at least 32 characters")
+    if ASSIGNMENT_CA not in values:
+        return values
+    return {**values, ASSIGNMENT_CA: assignment_ca_env_value(values[ASSIGNMENT_CA])}
 
 
 def validate_production(values):

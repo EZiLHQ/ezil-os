@@ -337,7 +337,7 @@ class StandaloneHostAbiTests(unittest.TestCase):
 
 
 HOST_ABI_FIXTURE = HERE / 'host-abi-predecessors.json'
-HOST_ABI_FIXTURE_TREES = 11
+HOST_ABI_FIXTURE_TREES = 12
 HOST_ABI_FIXTURE_MAX_FILES = 256
 HOST_ABI_PATH_PART = re.compile(r'[A-Za-z0-9._-]{1,128}')
 HOST_ABI_ENTRY = re.compile(r'(100644|100755) ([0-9a-f]{40})')
@@ -388,8 +388,8 @@ class DirectedHostAbiTests(unittest.TestCase):
 
     The predecessor host trees come from host-abi-predecessors.json (exact path/mode/blob manifests), rebuilt with
     `git mktree --missing` in a private bare repository and checked against their known tree ids, so no private
-    commit history or blob payload is needed. The final tree is this checkout's actual HEAD host tree. The private
-    repository borrows this checkout's objects through alternates (read-only) and writes its own fixture objects."""
+    commit history or blob payload is needed. The historical production target is pinned in the same fixture.
+    The private repository borrows this checkout's objects through alternates and writes its own fixture objects."""
     PREVIOUS = '96ff8e224443e0d684cb99e808a903235f2def11'
     DIAGNOSTICS = 'b7700d49c946157cd75c862bce867caf7fd08810'
     NATIVE_BASE = '82228b6e31dfcfedb116c3c6649ae78281b0d799'
@@ -429,22 +429,8 @@ class DirectedHostAbiTests(unittest.TestCase):
                    GIT_AUTHOR_DATE='2026-11-16T00:00:00Z', GIT_COMMITTER_DATE='2026-11-16T00:00:00Z')
         return subprocess.run(['git', '-C', str(self.repo), *args], input=data, check=True, capture_output=True, env=env).stdout
 
-    def head_files(self):
-        """{path: 'mode blob'} for this checkout's actual HEAD host tree, which must be the final TARGET."""
-        head = git(REPO, 'rev-parse', 'HEAD')
-        self.assertEqual(release.host_agent_tree_id(head, REPO), self.TARGET)
-        result = {}
-        for entry in self.run_git('ls-tree', '-r', '-z', self.TARGET).decode().split('\0')[:-1]:
-            meta, name = entry.split('\t', 1)
-            mode, kind, blob = meta.split(' ')
-            self.assertEqual(kind, 'blob')
-            result[name] = mode + ' ' + blob
-        return result
-
     def files(self, tree):
-        """{path: 'mode blob'} for a reviewed host tree: its fixture manifest, or HEAD for the final TARGET."""
-        if tree == self.TARGET:
-            return self.head_files()
+        """{path: 'mode blob'} for a reviewed host tree from its pinned fixture manifest."""
         self.assertIn(tree, self.fixture)
         return dict(self.fixture[tree])
 
@@ -477,11 +463,11 @@ class DirectedHostAbiTests(unittest.TestCase):
         return [(source, target, delta) for source, target, delta in release.HOST_AGENT_DIRECTED_EXCEPTIONS]
 
     def test_fixture_rebuilds_every_reviewed_predecessor_tree_exactly(self):
-        self.assertEqual(set(self.fixture), {*self.PREDECESSORS, *HostAbiTests.LEGACY.values()})
+        self.assertEqual(set(self.fixture), {*self.PREDECESSORS, *HostAbiTests.LEGACY.values(), self.TARGET})
         for tree, files in self.fixture.items():
             with self.subTest(tree=tree):
                 self.assertEqual(self.tree(files), tree)
-        # Every directed map's source and target is a rebuilt predecessor or this checkout's actual HEAD tree.
+        # Every directed map binds two known, rebuilt host trees.
         self.assertEqual({tree for source, target, _ in self.maps() for tree in (source, target)}, {*self.PREDECESSORS, self.TARGET})
 
     def test_reviewed_directed_maps_are_exact_from_the_rebuilt_trees(self):
@@ -568,15 +554,14 @@ class DirectedHostAbiTests(unittest.TestCase):
                 with self.subTest(target=name, source=source), self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
                     release.require_host_abi(self.commit(self.files(source)), baked, self.repo)
 
-    def test_checked_in_head_is_the_target_from_every_reviewed_predecessor(self):
-        # HEAD is reached only through explicit forward maps. Historical predecessor targets keep their pins.
-        head = self.commit(self.head_files())
-        self.assertEqual(release.host_agent_tree_id(head, self.repo), self.TARGET)
+    def test_reviewed_targets_are_reached_only_from_their_pinned_predecessors(self):
+        production_target = self.commit(self.files(self.TARGET))
+        self.assertEqual(release.host_agent_tree_id(production_target, self.repo), self.TARGET)
         anchors = {self.PREVIOUS: self.commit(self.files(self.PREVIOUS)),
                    self.DIAGNOSTICS: self.commit(self.files(self.DIAGNOSTICS)),
                    self.NATIVE_BASE: self.commit(self.files(self.NATIVE_BASE)),
                    self.PRODUCTION_R156: self.commit(self.files(self.PRODUCTION_R156)),
-                   self.EMPTY_REPOSITORY_PIN: self.commit(self.files(self.EMPTY_REPOSITORY_PIN)), self.TARGET: head}
+                   self.EMPTY_REPOSITORY_PIN: self.commit(self.files(self.EMPTY_REPOSITORY_PIN)), self.TARGET: production_target}
         for source, target, delta in self.maps():
             baked, deployed = anchors[target], self.commit(self.files(source))
             with self.subTest(source=source, target=target):
@@ -605,7 +590,7 @@ class HostAbiFixtureTests(unittest.TestCase):
 
     def test_checked_in_fixture_parses(self):
         parsed = self.load(self.value)
-        self.assertEqual(set(parsed), {*DirectedHostAbiTests.PREDECESSORS, *HostAbiTests.LEGACY.values()})
+        self.assertEqual(set(parsed), {*DirectedHostAbiTests.PREDECESSORS, *HostAbiTests.LEGACY.values(), DirectedHostAbiTests.TARGET})
         self.assertEqual(load_host_abi_fixture(HOST_ABI_FIXTURE.read_text()), parsed)
 
     def test_duplicate_keys_refused(self):

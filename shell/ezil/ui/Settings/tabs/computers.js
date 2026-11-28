@@ -1189,7 +1189,7 @@ export function confirmCopy (kind, { target = null, current = null, data = summa
     return { title: 'Stop your computer?', confirmLabel: 'Stop', busyLabel: 'Stopping…', lines: [
         'Open apps close; save your work first.',
         'Your files stay on your disk.',
-        'Start it again any time with Open desktop.',
+        'Wait until the status says Stopped before choosing Open desktop.',
     ] };
 }
 

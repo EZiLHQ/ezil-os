@@ -1,11 +1,12 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
-    context: vi.fn(), get: vi.fn(), defaultComputer: vi.fn(), provider: vi.fn(), payload: vi.fn(), redirect: vi.fn(), notFound: vi.fn(),
+    headers:vi.fn(), stage:vi.fn(), context: vi.fn(), get: vi.fn(), defaultComputer: vi.fn(), provider: vi.fn(), payload: vi.fn(), redirect: vi.fn(), notFound: vi.fn(),
 }));
 // The page reads `env` at import for the per-user shell feature flags (round-3 feedback port); keep the test env-free.
 vi.mock('@/env', () => ({ env: {} }));
-vi.mock('next/headers', () => ({ headers: async () => new Headers() }));
+vi.mock('next/headers', () => ({ headers: mocks.headers }));
+vi.mock('@/server/git/assignment-enrollment',()=>({assignmentEnrollmentEnabled:mocks.stage}));
 vi.mock('next/navigation', () => ({ redirect: mocks.redirect, notFound: mocks.notFound }));
 vi.mock('@/server/api/trpc', () => ({ createTRPCContext: mocks.context }));
 vi.mock('@/server/api/root', () => ({ appRouter: { createCaller: () => ({ computer: { get: mocks.get, getOrCreateDefault: mocks.defaultComputer }, cloudflareGuacamole: { isConfigured: mocks.provider } }) } }));
@@ -21,6 +22,8 @@ import { routeLaunchContext } from '../../../../shell/ezil/app-history.js';
 const id = '11111111-1111-4111-8111-111111111111';
 beforeEach(() => {
     vi.clearAllMocks();
+    mocks.headers.mockResolvedValue(new Headers());
+    mocks.stage.mockReturnValue(true);
     mocks.context.mockResolvedValue({ user: { id: 'owner' } });
     mocks.get.mockResolvedValue({ id, name: 'Chosen computer' });
     mocks.defaultComputer.mockResolvedValue({ computer: { id: 'default' }, created: false });
@@ -29,6 +32,20 @@ beforeEach(() => {
     mocks.notFound.mockImplementation(() => { throw Error('NEXT_NOT_FOUND'); });
 });
 describe('OS entry URL', () => {
+    it('keeps an unauthenticated embedded Code assignment off the identity-provider frame path',async()=>{
+        mocks.context.mockResolvedValue({user:null});
+        mocks.headers.mockResolvedValue(new Headers({'sec-fetch-dest':'iframe'}));
+        const params={appId:'code'};
+        const searchParams={assignment:id,repo:'https://github.ezil.work/default/u-0123456789abcdef-a-'+id+'.git'};
+        const call=(query:Record<string,string>)=>AppPage({params:Promise.resolve(params),searchParams:Promise.resolve(query)});
+        const html=renderToStaticMarkup(await call(searchParams));
+        expect(html).toContain('Continue to EZiL OS sign-in from your Universe assignment tab');
+        expect(mocks.redirect).not.toHaveBeenCalled();
+        expect(mocks.defaultComputer).not.toHaveBeenCalled();
+        await expect(call({...searchParams,repo:'https://github.com/example/other.git'})).rejects.toThrow('/login?');
+        mocks.headers.mockResolvedValue(new Headers({'sec-fetch-dest':'document'}));
+        await expect(call(searchParams)).rejects.toThrow('/login?');
+    });
     it.each(['code', 'browser', 'settings'])('retains %s target and relative app parameters through the sign-in gate', async app => {
         mocks.context.mockResolvedValue({ user: null });
         let destination = '';

@@ -46,6 +46,20 @@ describe('migration orchestration', () => {
         expect(f.deps.commit).toHaveBeenCalledWith(expect.anything(), { targetProvider: 'aws-ec2', expectedEtag: 'source', expectedSystemEtag: null });
         await f.advance(); expect(f.calls).toHaveLength(8); expect(f.deps.store.readById).toHaveBeenCalledTimes(11);
     });
+    it('waits to migrate a fenced source until the assignment clock pause is acknowledged', async () => {
+        const f = fixture();
+        const flush = vi.fn(async () => true).mockResolvedValueOnce(false);
+        f.deps.assignmentClock = { flush, pendingCompletions: async () => [] };
+        await f.advance();
+        expect(f.get().state).toBe('fenced');
+        expect(flush).not.toHaveBeenCalled();
+        await f.advance();
+        expect(f.get().state).toBe('fenced');
+        expect(f.deps.head).not.toHaveBeenCalled();
+        await f.advance();
+        expect(f.get().state).toBe('exported');
+        expect(flush).toHaveBeenCalledTimes(2);
+    });
     it.each(['begin', 'export', 'provision', 'restore', 'flip', 'commit', 'stop'] as const)('compensates %s failure', async step => {
         const states = { begin: 'requested', export: 'fenced', provision: 'exported', restore: 'provisioning', flip: 'restored', commit: 'restored', stop: 'restored' } as const;
         const key = { begin: 'begin', export: 'head', provision: 'provision', restore: 'restored', flip: 'flip', commit: 'commit', stop: 'stopCloudflare' } as const;
