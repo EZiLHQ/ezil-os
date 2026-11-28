@@ -364,6 +364,7 @@ PORTABLE_SUITES=(
     "shell/ezil/ui/Settings/billing-layout-browser-test.mjs"
     "shell/ezil/ui/Settings/billing-trial-browser-test.mjs"
     "shell/ezil/ui/Settings/credits-real-shape-browser-test.mjs"
+    "shell/ezil/ui/Settings/framed-topup-browser-test.mjs"
     "shell/ezil/ui/feedback-browser-test.mjs"
     "shell/ezil/ui/feedback/capture-browser-test.mjs"
 )
