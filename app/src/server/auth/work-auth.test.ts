@@ -17,10 +17,6 @@ import { isWorkAuthCallback, settleWorkAuth, startWorkAuth, WORK_AUTH_COOKIE, wo
 const os = 'https://os-staging.ezil.work', universe = 'https://universe-staging.ezil.work';
 const prodOs = 'https://os.ezil.work', prodUniverse = 'https://universe.ezil.work';
 const WORK_AUTH_SCRIPT = workAuthScript({ os, universe });
-/** The page's one inline script, read by position: the page is ours and carries exactly one. */
-const inlineScript = (html: string) => { const open = '<script>', start = html.indexOf(open), end = html.lastIndexOf('</script>');
-    expect(start).toBeGreaterThan(-1); expect(end).toBeGreaterThan(start); expect(html.indexOf(open, start + 1)).toBe(-1);
-    return html.slice(start + open.length, end); };
 const stageEnv = () => { vi.stubEnv('BILLING_FUNDING_URL', 'https://ai-staging.ezil.work'); vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED', '');
     vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', universe); };
 const productionEnv = () => { vi.stubEnv('BILLING_FUNDING_URL', 'https://ai.ezil.work'); vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED', '1');
